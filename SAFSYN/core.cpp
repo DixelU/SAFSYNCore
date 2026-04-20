@@ -708,12 +708,233 @@ bool load_sfz(const char* path, Soundfont& sf)
 //  Core API stubs (synthesis goes here)
 // ============================================================
 
-void consume_short_msg(uint32_t /*msg*/)
-{
+SynthState g_synth;
 
+// ------------------------------------------------------------
+//  init()
+// ------------------------------------------------------------
+void init(uint32_t sample_rate)
+{
+	g_synth.sample_rate = sample_rate;
+
+	// TODO: zero out all voice states
+	for (auto& v : g_synth.voices)
+		v = {};
+
+	// TODO: reset per-channel MIDI state to GM defaults
+	//   channel_volume[*]     = 1.0f  (CC7 default = 100/127)
+	//   channel_expression[*] = 1.0f
+	//   channel_pan[*]        = 0.0f
+	//   pitch_bend[*]         = 0.0f
+	//   sustain_pedal[*]      = false
+
+	// TODO: if an audio backend handle exists, start the render thread here
+	//       (or let dllmain call render_audio from its own thread)
 }
 
-void init()
-{
+// ------------------------------------------------------------
+//  Voice helpers
+// ------------------------------------------------------------
 
+// TODO: implement voice allocation (round-robin + oldest-voice steal)
+static Voice* alloc_voice()
+{
+	// 1. Find a Voice with stage == Stage::Off
+	// 2. If none, steal the voice with the lowest envelope level in Release
+	// 3. If still none, steal the oldest active voice (lowest pos/furthest through sample)
+	return nullptr; // placeholder
+}
+
+// TODO: compute the sample-position increment for a given note / region / sample_rate
+//   inc = (2^((note - root_key + coarse_tune) / 12.0 + fine_tune/1200.0))
+//         * (scale_tuning/100.0)
+//         * (region->sample_rate / (double)g_synth.sample_rate)
+//         * pitch_bend_factor(channel)
+static double compute_inc(const SampleRegion& r, uint8_t note, float bend_semitones)
+{
+	(void)r; (void)note; (void)bend_semitones;
+	return 1.0; // placeholder
+}
+
+// TODO: convert note velocity [1..127] to linear gain (SF2 spec: vel/127, or velocity curve)
+static float vel_to_gain(uint8_t vel)
+{
+	return vel / 127.0f; // placeholder — add optional concave/convex curve
+}
+
+// TODO: apply pan law to derive L/R gains from region->pan and channel pan
+//   common choice: constant-power  L = cos(a), R = sin(a),  a = (pan+1)*pi/4
+static void compute_gains(const SampleRegion& r, uint8_t ch, float vel_gain,
+                           float& out_l, float& out_r)
+{
+	(void)r; (void)ch; (void)vel_gain;
+	out_l = out_r = 0.5f; // placeholder
+}
+
+// ------------------------------------------------------------
+//  note_on() — triggered by consume_short_msg for status 0x9n vel>0
+// ------------------------------------------------------------
+static void note_on(uint8_t ch, uint8_t note, uint8_t vel)
+{
+	if (!g_synth.soundfont) return;
+
+	// TODO: look up matching SampleRegion(s) — a note may trigger multiple
+	//       layers (e.g. SF2 has multi-layer presets).
+	//   for (auto& r : g_synth.soundfont->regions)
+	//     if (r.lo_key <= note && note <= r.hi_key &&
+	//         r.lo_vel <= vel  && vel  <= r.hi_vel) { ... }
+
+	// TODO: for each matching region:
+	//   1. If r.exclusive_class != 0, send quick-release to all voices
+	//      that share the same exclusive_class on this channel.
+	//   2. Allocate a voice via alloc_voice().
+	//   3. Set voice fields: region, note, velocity, channel.
+	//   4. pos = 0.0,  inc = compute_inc(r, note, g_synth.pitch_bend[ch])
+	//   5. gain_l/gain_r via compute_gains()
+	//   6. Start Attack stage:
+	//        if r.attack < 1 sample → skip straight to Hold/Decay
+	//        else env = 0, env_inc = 1.0f / (r.attack * sample_rate)
+	//   7. hold_samples_left = (uint32_t)(r.hold * sample_rate)
+	//   8. note_off_pending = false
+}
+
+// ------------------------------------------------------------
+//  note_off() — triggered by 0x8n or 0x9n vel==0
+// ------------------------------------------------------------
+static void note_off(uint8_t ch, uint8_t note)
+{
+	// TODO: find the most recently triggered voice matching ch+note
+	//       (scan voices[] in reverse or track a serial number)
+	// TODO: if sustain pedal is held (g_synth.sustain_pedal[ch]),
+	//       set voice.note_off_pending = true and return.
+	// TODO: otherwise transition voice to Release stage:
+	//         env_inc = -env / (region->release * sample_rate)  [from current level]
+}
+
+// ------------------------------------------------------------
+//  handle_cc() — CC messages
+// ------------------------------------------------------------
+static void handle_cc(uint8_t ch, uint8_t cc, uint8_t val)
+{
+	switch (cc)
+	{
+	case 7:   // channel volume
+		// TODO: g_synth.channel_volume[ch] = val / 127.0f;
+		break;
+	case 10:  // pan
+		// TODO: g_synth.channel_pan[ch] = (val - 64) / 63.0f;
+		//       clamp to [-1, 1]
+		break;
+	case 11:  // expression
+		// TODO: g_synth.channel_expression[ch] = val / 127.0f;
+		break;
+	case 64:  // sustain pedal
+		// TODO: g_synth.sustain_pedal[ch] = (val >= 64);
+		//       if pedal just released, send note_off to all pending voices on ch
+		break;
+	case 121: // reset all controllers
+		// TODO: restore defaults for this channel
+		break;
+	case 123: // all notes off
+		// TODO: trigger release on every active voice on ch
+		break;
+	default:
+		break;
+	}
+}
+
+// ------------------------------------------------------------
+//  consume_short_msg()
+// ------------------------------------------------------------
+void consume_short_msg(uint32_t msg)
+{
+	// Windows MMS packed format: [status | (data1 << 8) | (data2 << 16)]
+	const uint8_t status = msg & 0xFF;
+	const uint8_t d1     = (msg >>  8) & 0x7F;
+	const uint8_t d2     = (msg >> 16) & 0x7F;
+	const uint8_t ch     = status & 0x0F;
+
+	switch (status & 0xF0)
+	{
+	case 0x80:  // note off
+		note_off(ch, d1);
+		break;
+	case 0x90:  // note on (vel==0 treated as note off per MIDI spec)
+		if (d2 == 0) note_off(ch, d1);
+		else         note_on(ch, d1, d2);
+		break;
+	case 0xA0:  // aftertouch (per-key pressure)
+		// TODO: route to LFO depth or envelope if desired
+		break;
+	case 0xB0:  // control change
+		handle_cc(ch, d1, d2);
+		break;
+	case 0xC0:  // program change
+		// TODO: select preset d1 from the loaded soundfont
+		break;
+	case 0xD0:  // channel pressure
+		// TODO: same routing options as per-key aftertouch
+		break;
+	case 0xE0:  // pitch bend  [d1 = LSB, d2 = MSB, centre = 0x2000]
+		// TODO: g_synth.pitch_bend[ch] = ((d2 << 7 | d1) - 8192) / 8192.0f * bend_range;
+		//       then update inc for all active voices on ch
+		break;
+	default:
+		break;
+	}
+}
+
+// ------------------------------------------------------------
+//  render_audio()  — called from the audio thread, must be RT-safe
+// ------------------------------------------------------------
+void render_audio(float* out, uint32_t frames)
+{
+	// TODO: zero the output buffer first
+	//   std::fill(out, out + frames * 2, 0.0f);
+
+	// TODO: for each active voice:
+	for (auto& v : g_synth.voices)
+	{
+		if (!v.active()) continue;
+		const SampleRegion& r = *v.region;
+
+		for (uint32_t i = 0; i < frames; ++i)
+		{
+			// --- Envelope ---
+			// TODO: advance envelope state machine:
+			//   Attack:  env += env_inc; if env >= 1.0f → Hold or Decay
+			//   Hold:    countdown hold_samples_left; when 0 → Decay
+			//   Decay:   env -= env_inc; if env <= sustain → Sustain
+			//   Sustain: env = region->sustain (hold until note_off)
+			//   Release: env += env_inc (negative); if env <= 0 → Off, break
+			float env = v.env; // placeholder
+
+			// --- Sample read (linear interpolation) ---
+			// TODO: read PCM at fractional pos with linear interpolation
+			//   uint32_t idx = (uint32_t)v.pos;
+			//   float    frac = (float)(v.pos - idx);
+			//   int16_t s0_l, s0_r, s1_l, s1_r;  // handle mono→stereo expansion
+			//   ... clamp idx to [0, pcm_len-1]
+			//   float samp_l = (s0_l + frac*(s1_l - s0_l)) / 32768.0f;
+			//   float samp_r = (s0_r + frac*(s1_r - s0_r)) / 32768.0f;
+			float samp_l = 0.0f, samp_r = 0.0f; // placeholder
+
+			// --- Mix into output ---
+			out[i * 2    ] += samp_l * v.gain_l * env;
+			out[i * 2 + 1] += samp_r * v.gain_r * env;
+
+			// --- Advance sample position ---
+			// TODO: v.pos += v.inc;
+			// TODO: handle loop boundaries:
+			//   LoopMode::None      → if pos >= pcm_len, stage = Off, break
+			//   LoopMode::Forward   → if pos >= loop_end, pos -= (loop_end - loop_start)
+			//   LoopMode::PingPong  → bounce direction at loop_start / loop_end
+			//   LoopMode::OneShot   → play to end regardless of note_off, then Off
+		}
+
+		// TODO: after the inner loop, check if voice transitioned to Off
+		//       and clear voice.region = nullptr so alloc_voice() can reuse it
+	}
+
+	// TODO: apply master volume / limiter / soft-clip if needed
 }
