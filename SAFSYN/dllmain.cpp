@@ -1,5 +1,5 @@
 // dllmain.cpp : Windows-specific wiring — WASAPI audio output + WinMM driver surface.
-// Everything here is WinAPI; synthesis logic lives in core.cpp.
+// Everything here is WinAPI; synthesis logic lives in engine.cpp.
 #include "pch.h"
 #include "core.h"
 
@@ -19,6 +19,7 @@
 //   static HANDLE               g_render_thread = nullptr;
 //   static HANDLE               g_render_event  = nullptr;   // event-driven mode
 //   static volatile bool        g_render_running = false;
+//   static std::unique_ptr<safsyn::SynthEngine> g_engine;
 
 // TODO: implement audio_render_thread()
 //   Called on a dedicated high-priority thread. Must NOT allocate or block.
@@ -40,7 +41,7 @@
 //
 //           BYTE* data = nullptr;
 //           g_render_client->GetBuffer(avail, &data);
-//           render_audio(reinterpret_cast<float*>(data), avail);  // core.cpp
+//           g_engine->render_audio(reinterpret_cast<float*>(data), avail);
 //           g_render_client->ReleaseBuffer(avail, 0);
 //       }
 //       return 0;
@@ -55,7 +56,7 @@
 //   6. g_audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, ...)
 //   7. g_audio_client->SetEventHandle(g_render_event)
 //   8. g_audio_client->GetService(IID_IAudioRenderClient, ...) → g_render_client
-//   9. init(sample_rate)  ← call core init with the actual sample rate
+//   9. Construct a SynthEngine with the actual sample rate and desired capacity
 //  10. g_audio_client->Start()
 //  11. CreateThread(..., audio_render_thread, ...) → g_render_thread
 
@@ -88,8 +89,8 @@
 //
 //       case MODM_GETDEVCAPS:
 //           // Fill MIDIOUTCAPS at (MIDIOUTCAPS*)param1
-//           // Set wTechnology = MOD_SWSYNTH, wVoices = MAX_VOICES,
-//           //     wNotes = MAX_VOICES, wChannelMask = 0xFFFF, dwSupport = 0
+//           // Set wTechnology = MOD_SWSYNTH, wVoices/wNotes from
+//           // g_engine->voice_capacity(), wChannelMask = 0xFFFF, dwSupport = 0
 //           return MMSYSERR_NOERROR;
 //
 //       case MODM_OPEN:
@@ -104,7 +105,7 @@
 //
 //       case MODM_DATA:
 //           // param1 = packed short MIDI message → forward directly
-//           consume_short_msg((uint32_t)param1);
+//           g_engine->consume_short_message((uint32_t)param1);
 //           return MMSYSERR_NOERROR;
 //
 //       case MODM_LONGDATA:
@@ -114,7 +115,7 @@
 //       case MODM_RESET:
 //           // All notes off on all channels, reset controllers
 //           for (uint8_t ch = 0; ch < 16; ++ch)
-//               consume_short_msg(0x00B0 | ch | (123 << 8));  // CC 123 = all notes off
+//               g_engine->control_change(ch, 123, 0);
 //           return MMSYSERR_NOERROR;
 //
 //       case MODM_SETVOLUME:
