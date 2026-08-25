@@ -31,7 +31,14 @@ size_t SynthEngine::active_voice_count() const noexcept
 void SynthEngine::set_soundfont(const Soundfont* soundfont) noexcept
 {
 	silence_all();
+	phase_processor_.clear();
 	soundfont_ = soundfont;
+}
+
+void SynthEngine::set_phase_settings(const PhaseSettings& settings) noexcept
+{
+	silence_all();
+	phase_processor_.configure(settings);
 }
 
 void SynthEngine::reset() noexcept
@@ -214,8 +221,9 @@ void SynthEngine::note_on(uint8_t channel, uint8_t note, uint8_t velocity) noexc
 		(static_cast<uint16_t>(channel_state.bank_msb) << 7) | channel_state.bank_lsb);
 	const auto& render_regions = all_regions_mode_ && !soundfont_->stress_regions.empty()
 		? soundfont_->stress_regions : soundfont_->regions;
-	for (const auto& region : render_regions)
+	for (size_t region_id = 0; region_id < render_regions.size(); ++region_id)
 	{
+		const auto& region = render_regions[region_id];
 		if (!region.pcm || region.pcm_len == 0 || region.channels < 1 || region.channels > 2 ||
 			(!all_regions_mode_ && (region.preset_bank != selected_bank ||
 				region.preset_program != channel_state.program)) ||
@@ -237,6 +245,7 @@ void SynthEngine::note_on(uint8_t channel, uint8_t note, uint8_t velocity) noexc
 		voice->channel = channel;
 		voice->inc = compute_increment(region, note, channels_[channel].pitch_bend_semitones);
 		voice->serial = serial;
+		voice->phase = phase_processor_.assign(region, region_id, serial, channel, note);
 		compute_gains(region, channel, velocity, voice->gain_l, voice->gain_r);
 		begin_envelope(*voice);
 		++stats_.started_voices;
@@ -433,16 +442,26 @@ void SynthEngine::render_audio(float* out, uint32_t frames) noexcept
 				static_cast<size_t>(index0) * region.channels;
 			const size_t offset1 = region.pcm_right ? index1 :
 				static_cast<size_t>(index1) * region.channels;
-			const float source_l0 = pcm_to_float(region.pcm[offset0]);
-			const float source_l1 = pcm_to_float(region.pcm[offset1]);
+			float source_l0 = pcm_to_float(region.pcm[offset0]);
+			float source_l1 = pcm_to_float(region.pcm[offset1]);
+			if (voice.phase.kind != PhaseVoiceState::Kind::Coherent)
+			{
+				source_l0 = voice.phase.apply(source_l0, index0, false);
+				source_l1 = voice.phase.apply(source_l1, index1, false);
+			}
 			const float sample_l = source_l0 + (source_l1 - source_l0) * fraction;
 			float sample_r = sample_l;
 			if (region.channels == 2)
 			{
-				const float source_r0 = pcm_to_float(region.pcm_right ?
+				float source_r0 = pcm_to_float(region.pcm_right ?
 					region.pcm_right[index0] : region.pcm[offset0 + 1]);
-				const float source_r1 = pcm_to_float(region.pcm_right ?
+				float source_r1 = pcm_to_float(region.pcm_right ?
 					region.pcm_right[index1] : region.pcm[offset1 + 1]);
+				if (voice.phase.kind != PhaseVoiceState::Kind::Coherent)
+				{
+					source_r0 = voice.phase.apply(source_r0, index0, true);
+					source_r1 = voice.phase.apply(source_r1, index1, true);
+				}
 				sample_r = source_r0 + (source_r1 - source_r0) * fraction;
 			}
 

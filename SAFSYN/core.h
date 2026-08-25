@@ -1,5 +1,7 @@
 #pragma once
 
+#include "phase.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -12,6 +14,8 @@ enum class LoopMode : uint8_t { None, Forward, Sustain, PingPong, OneShot };
 
 struct SampleRegion
 {
+	// Stable within a loaded bank and used for deterministic phase-cache keys.
+	uint64_t logical_sample_id = 0;
 	// SFZ regions use the General MIDI default preset (bank 0/program 0).
 	// SF2 regions retain the preset identity resolved from the phdr table.
 	uint16_t preset_bank = 0;
@@ -102,6 +106,8 @@ public:
 	size_t voice_capacity() const noexcept { return voices_.size(); }
 	size_t active_voice_count() const noexcept;
 	const RenderStats& stats() const noexcept { return stats_; }
+	const PhaseSettings& phase_settings() const noexcept { return phase_processor_.settings(); }
+	PhaseCacheStats phase_cache_stats() const noexcept { return phase_processor_.stats(); }
 
 	// The caller owns the soundfont and must keep it alive and unmodified while
 	// it is attached. Replacing it immediately silences all current voices.
@@ -116,6 +122,7 @@ public:
 	void set_pitch_bend(uint8_t channel, uint16_t value14) noexcept;
 	void consume_short_message(uint32_t packed_message) noexcept;
 	void render_audio(float* interleaved_stereo, uint32_t frames) noexcept;
+	void set_phase_settings(const PhaseSettings& settings) noexcept;
 
 	// Explicit compatibility/stress path for reproducing the old flattened SF2
 	// behavior. Normal playback always selects the channel bank and program.
@@ -142,6 +149,7 @@ private:
 		float gain_r = 0.0f;
 		bool note_off_pending = false;
 		uint64_t serial = 0;
+		PhaseVoiceState phase;
 
 		bool active() const noexcept { return stage != Stage::Off; }
 	};
@@ -177,6 +185,7 @@ private:
 	uint32_t sample_rate_ = 48000;
 	uint64_t next_serial_ = 1;
 	bool all_regions_mode_ = false;
+	PhaseProcessor phase_processor_;
 	RenderStats stats_;
 };
 

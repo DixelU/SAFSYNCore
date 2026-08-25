@@ -1,9 +1,9 @@
 # SAFSYNCore
 
-SAFSYNCore is currently a deterministic, coherent, offline sample renderer. This
-foundation deliberately stops before Standard MIDI File parsing, phase
-decorrelation, normalization, limiting, and platform audio drivers so later DSP
-experiments have a reproducible baseline.
+SAFSYNCore is a deterministic offline sample renderer with a bit-exact coherent
+baseline and opt-in experimental phase-decorrelation modes. The project still
+deliberately stops before Standard MIDI File parsing, normalization, limiting,
+and platform audio drivers so DSP experiments retain a reproducible baseline.
 
 ## What is included
 
@@ -11,6 +11,7 @@ experiments have a reproducible baseline.
   instance-based synthesizer
 - `safsyn-render`: headless scripted-note renderer producing stereo float32 WAV
 - `safsyn-tests`: engine, MIDI-message, SFZ-loader, determinism, and WAV tests
+- `safsyn-phase-tests`: phase policy, determinism, pool, loop, and cache tests
 - `SAFSYN/dllmain.cpp`: preserved Windows driver sketch, excluded by default
 
 The coherent engine supports configurable preallocated polyphony, deterministic
@@ -48,8 +49,23 @@ Options are `--bank N`, `--program N`, `--sample-rate N`, and `--voices N`.
 not normal instrument playback. The command does not accept MIDI files yet; SMF
 scheduling is milestone 3.
 
+Run an opt-in phase experiment with the same scripted events:
+
+```text
+build/Release/safsyn-render piano.sf2 analytic.wav --bank 0 --program 0 --phase-mode analytic --phase-pool 64 --phase-seed 7
+build/Release/safsyn-render --demo repeated.wav --script repeated --repeat-hz 40 --repeat-count 128 --phase-mode analytic --phase-continuous
+```
+
+Available modes are `coherent`, `polarity`, `analytic`, `smooth-field`, and
+`independent-bins`. Phase controls are `--phase-strength 0..1`,
+`--phase-pool 1..64`, `--phase-continuous`, `--phase-seed N`,
+`--phase-correlation-hz N`, and `--phase-preserve-attack-ms N`. Coherent is the
+default, strength zero takes the exact coherent path, and no experimental mode
+has been selected as a production default.
+
 ## Project boundary
 
 `SAFSYN_BUILD_WINMM` defaults to `OFF`. Enabling it only compiles the preserved
 DLL shell; it does not claim a functioning WinMM/WASAPI backend. See
-`docs/DSP_CONTRACT.md` for the experimental contract and evidence requirements.
+`docs/DSP_CONTRACT.md` for the contract and `docs/PHASE_EXPERIMENT.md` for the
+phase architecture, measurements, and evidence boundaries.

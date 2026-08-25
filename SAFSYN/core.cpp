@@ -142,8 +142,31 @@ static std::string sf2_name(const char* name, size_t size)
 	return std::string(name, end);
 }
 
+static uint64_t stable_sample_identity(uint64_t first, uint64_t second,
+	uint64_t third, uint64_t fourth = 0) noexcept
+{
+	uint64_t hash = 1469598103934665603ULL;
+	for (uint64_t value : {first, second, third, fourth})
+	{
+		hash ^= value;
+		hash *= 1099511628211ULL;
+	}
+	return hash == 0 ? 1 : hash;
+}
+
+static uint64_t stable_string_identity(const std::string& value) noexcept
+{
+	uint64_t hash = 1469598103934665603ULL;
+	for (unsigned char ch : value)
+	{
+		hash ^= ch;
+		hash *= 1099511628211ULL;
+	}
+	return hash == 0 ? 1 : hash;
+}
+
 static bool build_seed_loader_region(const SF2Shdr& sh, const GenSet& generators,
-	Soundfont& sf, uint32_t smpl_frames, SampleRegion& r)
+	Soundfont& sf, uint32_t smpl_frames, uint64_t sample_id, SampleRegion& r)
 {
 	const int32_t s_ofs = generators.s16(GEN_StartAddrsOffset, 0) +
 		generators.s16(GEN_StartAddrsCoarse, 0) * 32768;
@@ -165,6 +188,7 @@ static bool build_seed_loader_region(const SF2Shdr& sh, const GenSet& generators
 	if (abs_s >= abs_e)
 		return false;
 
+	r.logical_sample_id = stable_sample_identity(sample_id, abs_s, abs_e);
 	r.lo_key = generators.lo(GEN_KeyRange, 0);
 	r.hi_key = generators.hi(GEN_KeyRange, 127);
 	r.lo_vel = generators.lo(GEN_VelRange, 0);
@@ -359,7 +383,8 @@ bool load_sf2(const char* path, Soundfont& sf)
 
 				izone.merge_defaults(inst_global);
 				SampleRegion seed_region;
-				if (build_seed_loader_region(*sh, izone, sf, smpl_frames, seed_region))
+				if (build_seed_loader_region(*sh, izone, sf, smpl_frames,
+					static_cast<uint64_t>(shdr_idx) + 1, seed_region))
 					sf.stress_regions.push_back(seed_region);
 
 				// Preset generator amounts are adjustments to instrument amounts.
@@ -381,6 +406,9 @@ bool load_sf2(const char* path, Soundfont& sf)
 				if (abs_s >= abs_e) continue;
 
 				SampleRegion r;
+				r.logical_sample_id = stable_sample_identity(
+					static_cast<uint64_t>(shdr_idx) + 1, abs_s, abs_e,
+					sample_type == 4 ? static_cast<uint64_t>(sh->sample_link) + 1 : 0);
 				r.preset_bank = preset.bank;
 				r.preset_program = preset.program;
 				r.lo_key = (std::max)(pzone.lo(GEN_KeyRange, 0), izone.lo(GEN_KeyRange, 0));
@@ -764,6 +792,7 @@ bool load_sfz(const char* path, Soundfont& sf)
 		}
 
 		SampleRegion r;
+		r.logical_sample_id = stable_string_identity(sample_path);
 		r.lo_key = (uint8_t)std::clamp(d.lo_key, 0, 127);
 		r.hi_key = (uint8_t)std::clamp(d.hi_key, 0, 127);
 		r.lo_vel = (uint8_t)std::clamp(d.lo_vel, 0, 127);

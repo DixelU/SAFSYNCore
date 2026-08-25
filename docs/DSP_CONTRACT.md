@@ -11,8 +11,8 @@ float32 stereo with no implicit normalization, limiter, or soft clipping.
 This baseline measures the phenomenon phase processing is intended to alter.
 For identical simultaneous voices with gains `g[k]` and source `x[n]`, coherent
 addition is `x[n] * sum(g[k])`; peak amplitude can therefore grow linearly with
-voice count. A future decorrelated mode should reduce that coherent addition
-without moving the scheduled note-on or note-off frames.
+voice count. The opt-in decorrelated modes are intended to reduce that coherent
+addition without moving scheduled note-on or note-off frames.
 
 ## Separate hypotheses
 
@@ -40,6 +40,21 @@ It must not be described or measured as phase-only processing.
 - Voice exhaustion prefers the quietest releasing voice, then the oldest voice.
 - SF2/SFZ sustain loops stop looping on note-off and then play their sample tail.
 - The audio loop allocates nothing and performs no I/O.
+- Phase identity is derived from the configured seed, event serial, MIDI
+  channel, note, and logical sample region. Voice slots are not identities.
+- Analytic quadrature and FFT phase variants are constructed outside
+  `render_audio` and cached by logical sample plus phase settings. FFT variants
+  are generated lazily when an event first selects them.
+- Finite phase pools accept 1–64 deterministic choices; the regression and
+  measurement fixtures cover 1, 8, 32, and 64. Continuous analytic mode derives
+  an angle directly from the stable event identity.
+- Stereo partners use the same analytic angle or FFT phase sheet.
+- Looping regions use separately transformed periodic loop bodies with a
+  bounded entry crossfade rather than wrapping an arbitrary transformed tail.
+- A protected attack is copied exactly, followed by a 10 ms smoothstep blend
+  into the transformed representation.
+- Coherent mode and every mode at strength zero bypass phase preprocessing and
+  retain the exact coherent sample path.
 - A sound bank is immutable while attached to an engine.
 - Output is IEEE float32 WAV; values outside `[-1, 1]` are retained as evidence.
 - MIDI bank select uses CC 0/32 and program changes use status `0xCn`.
@@ -83,20 +98,26 @@ The stress SHA also matches the pre-milestone seed-loader WAV. These WAV files
 remain unnormalized float output; neither peak is evidence of limiting or
 production loudness policy.
 
-## Required fixtures and measurements for the later phase milestone
+## Phase experiment status
 
-Keep reproducible fixtures for simultaneous identical notes, fixed-rate
-retriggers, fixed-rate chopped notes, dense mixed-pitch chords, real piano
-samples, and stereo samples. Compare 32-phase, 64-phase, and continuous phase
-distributions using:
+The experimental renderer now contains random-polarity, analytic-signal,
+smooth FFT phase-field, and independent FFT-bin modes. The current automated
+fixtures cover coherent pool-1 behavior, 8/32/64 pools, continuous analytic
+angles, FFT magnitude/DC/Nyquist preservation, attack blending, linked stereo,
+periodic loops, block-size determinism, stable voice stealing, unchanged event
+counts, and absence of phase-cache construction during rendering.
 
-- dispatch-frequency and harmonic energy
+The measurement harness reports:
+
+- direct dispatch-frequency energy
 - autocorrelation at the dispatch period
-- mean inter-voice coherence
-- peak, RMS, and crest factor
+- peak and stereo RMS
 - render time and memory
 - paired coherent/decorrelated WAV outputs
 
-The piano attack experiment must compare fully rotated playback with an
-unmodified attack crossfaded into rotation. No phase mode enters production
-until its output is deterministic across block size and thread count.
+`PHASE_EXPERIMENT.md` records the complete seven-mode piano and controlled
+retrigger matrices, hashes, metric definitions, cache costs, and conclusions.
+The same-executable block-size contract is tested; multithread execution and
+cross-platform numerical equivalence have not yet been exercised. No phase mode
+enters production until listening tests and those remaining evidence boundaries
+are addressed.

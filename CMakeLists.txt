@@ -7,6 +7,7 @@ option(SAFSYN_BUILD_WINMM "Build the experimental Windows DLL shell" OFF)
 add_library(safsyn STATIC
 	SAFSYN/core.cpp
 	SAFSYN/engine.cpp
+	SAFSYN/phase.cpp
 	SAFSYN/wav_writer.cpp
 )
 add_library(SAFSYN::safsyn ALIAS safsyn)
@@ -43,6 +44,13 @@ if(SAFSYN_BUILD_TESTS)
 		target_compile_options(safsyn-tests PRIVATE /EHsc)
 	endif()
 	add_test(NAME safsyn-core COMMAND safsyn-tests "${CMAKE_CURRENT_BINARY_DIR}/test-data")
+	add_executable(safsyn-phase-tests tests/phase_tests.cpp)
+	target_link_libraries(safsyn-phase-tests PRIVATE SAFSYN::safsyn)
+	target_compile_features(safsyn-phase-tests PRIVATE cxx_std_20)
+	if(MSVC)
+		target_compile_options(safsyn-phase-tests PRIVATE /EHsc)
+	endif()
+	add_test(NAME safsyn-phase COMMAND safsyn-phase-tests)
 	add_test(NAME safsyn-demo-render
 		COMMAND safsyn-render --demo "${CMAKE_CURRENT_BINARY_DIR}/coherent-demo.wav")
 endif()
