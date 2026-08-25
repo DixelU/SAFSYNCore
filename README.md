@@ -1,9 +1,9 @@
 # SAFSYNCore
 
 SAFSYNCore is a deterministic streaming Standard MIDI File renderer with a
-bit-exact coherent baseline and opt-in experimental phase-decorrelation modes.
-The project deliberately stops before normalization, limiting, realtime audio,
-and platform audio drivers so DSP experiments retain a reproducible baseline.
+bit-exact coherent baseline, opt-in experimental phase-decorrelation modes, and
+an optional post-mix mastering stage. Raw unclipped float output remains the
+default so DSP experiments retain a reproducible baseline.
 
 ## What is included
 
@@ -12,6 +12,7 @@ and platform audio drivers so DSP experiments retain a reproducible baseline.
 - `safsyn-render`: headless scripted-note renderer producing stereo float32 WAV
 - `safsyn-tests`: engine, MIDI-message, SFZ-loader, determinism, and WAV tests
 - `safsyn-phase-tests`: phase policy, determinism, pool, loop, and cache tests
+- `safsyn-mastering-tests`: gain, lookahead, stereo-link, and invariance tests
 - `safsyn-smf-tests`: SMF parsing, timing, merge, streaming, and RF64 tests
 - `SAFSYN/dllmain.cpp`: preserved Windows driver sketch, excluded by default
 
@@ -19,7 +20,8 @@ The coherent engine supports the preserved fixed individual-voice reference
 path plus dynamically growing exact onset cohorts for normal offline SMF
 rendering, deterministic safety-limit stealing, pitch and pitch bend, linear interpolation, AHDSR envelopes,
 note-off and sustain behavior, forward and ping-pong loops, stereo samples,
-constant-power panning, channel volume/expression, and unclipped float mixing.
+constant-power panning, 14-bit volume/pan/expression pairs, universal master
+volume, channel-mode messages, and unclipped float mixing.
 SF2 playback resolves preset zones through instruments to sample zones, combines
 the supported generator subset, intersects key/velocity ranges, and reconstructs
 linked left/right samples as one logical stereo region. MIDI bank select and
@@ -67,11 +69,12 @@ Or stream a bounded or complete render directly to RIFF/RF64 WAV:
 build/Release/safsyn-render input.mid piano.sf2 output.wav --bank 0 --program 0 --tail-seconds 2
 build/Release/safsyn-render input.mid piano.sf2 excerpt.wav --max-render-seconds 30 --phase-mode analytic --phase-continuous --phase-seed 7
 build/Release/safsyn-render input.mid piano.sf2 drained.wav --drain-tail --max-tail-seconds 30
+build/Release/safsyn-render input.mid piano.sf2 listening.wav --limiter --limiter-ceiling-db -1 --limiter-lookahead-ms 5 --limiter-release-ms 100
 ```
 
 SMF types 0 and 1, PPQN and SMPTE timing, running status, tempo changes,
-channel events, safely skipped SysEx/meta payloads, and deterministic multi-track
-merge are supported. Type 2 is rejected. Input bytes are buffered, but parser
+channel events, retained bounded SysEx/meta payloads, Universal Master Volume,
+and deterministic multi-track merge are supported. Type 2 is rejected. Input bytes are buffered, but parser
 and scheduler state is O(track count); audio output is streamed in fixed blocks.
 `--max-render-seconds` bounds both event dispatch and output, while
 `--tail-seconds` controls the fixed natural-end release tail. SMF rendering uses
@@ -97,6 +100,12 @@ has been selected as a production default.
 SMF analysis also reports identical-note group histograms, group locations,
 logical-note/cohort peak estimates, and onset compression. These are MIDI-only
 estimates; exact post-preset region/cohort statistics are reported by renders.
+It also reports a controller histogram and supports bounded controller traces.
+
+Optional mastering controls are `--output-gain-db`, `--limiter`,
+`--limiter-ceiling-db`, `--limiter-lookahead-ms`, and
+`--limiter-release-ms`. The stereo-linked limiter is a sample-peak listening
+stage after the raw float mix; it is not an oversampled true-peak meter.
 
 ## Project boundary
 
@@ -108,3 +117,5 @@ phase architecture, measurements, and evidence boundaries. See
 integration evidence.
 See `docs/BLACK_MIDI_COHORTS.md` for logical-note/cohort architecture, tail
 drain, validation, and the measured Hypernova compression limit.
+See `docs/CONTROLLERS_AND_MASTERING.md` for controller semantics, the Hypernova
+CC120 diagnosis, optional mastering, and current full-render evidence.

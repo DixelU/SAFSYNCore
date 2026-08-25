@@ -181,6 +181,7 @@ void print_smf_analysis(const safsyn::SmfAnalysis& analysis, uint32_t sample_rat
 		<< " note_offs=" << analysis.note_offs
 		<< " tempo_changes=" << analysis.tempo_changes
 		<< " sysex_events=" << analysis.sysex_events
+		<< " master_volume_sysex=" << analysis.universal_master_volume_events
 		<< " max_events_tick=" << analysis.maximum_events_same_tick
 		<< " max_events_tick_at=" << analysis.maximum_events_tick_location
 		<< " max_events_sample=" << analysis.maximum_events_same_sample
@@ -229,6 +230,34 @@ void print_smf_analysis(const safsyn::SmfAnalysis& analysis, uint32_t sample_rat
 	};
 	print_histogram("note_on_group_histogram", analysis.note_on_group_histogram);
 	print_histogram("note_off_group_histogram", analysis.note_off_group_histogram);
+	std::cout << "controller_histogram=";
+	for (size_t index = 0; index < analysis.controller_usage.size(); ++index)
+	{
+		if (index != 0) std::cout << ';';
+		const auto& usage = analysis.controller_usage[index];
+		std::cout << "ch" << static_cast<unsigned>(usage.channel + 1)
+			<< ":cc" << static_cast<unsigned>(usage.controller)
+			<< 'x' << usage.events << '[' << static_cast<unsigned>(usage.minimum_value)
+			<< ',' << static_cast<unsigned>(usage.maximum_value) << "]@"
+			<< usage.first_sample << '-' << usage.last_sample;
+	}
+	std::cout << '\n';
+	for (const auto& entry : analysis.controller_trace)
+		std::cout << "controller_trace"
+			<< " tick=" << entry.tick
+			<< " sample=" << entry.sample
+			<< " seconds=" << static_cast<double>(entry.sample) / sample_rate
+			<< " track=" << entry.track
+			<< " ordinal=" << entry.ordinal
+			<< " channel=" << static_cast<unsigned>(entry.channel + 1)
+			<< " cc=" << static_cast<unsigned>(entry.controller)
+			<< " value=" << static_cast<unsigned>(entry.value)
+			<< " volume14=" << entry.volume
+			<< " pan14=" << entry.pan
+			<< " expression14=" << entry.expression
+			<< " sustain=" << (entry.sustain ? "down" : "up")
+			<< " active_channel_notes_before=" << entry.active_channel_notes_before
+			<< " active_channel_notes=" << entry.active_channel_notes << '\n';
 }
 
 int run_smf(int argc, char** argv)
@@ -264,8 +293,13 @@ int run_smf(int argc, char** argv)
 		double maximum_tail_seconds = 30.0;
 		double maximum_seconds = 0.0;
 		bool maximum_set = false;
+		double controller_trace_seconds = 0.0;
+		double controller_trace_start_seconds = 0.0;
+		size_t controller_trace_limit = 512;
+		int controller_trace_controller = -1;
 		uint32_t block_frames = 256;
 		safsyn::PhaseSettings phase_settings;
+		safsyn::MasteringSettings mastering_settings;
 		for (int index = option_index; index < argc; ++index)
 		{
 			const std::string option = argv[index];
@@ -296,8 +330,26 @@ int run_smf(int argc, char** argv)
 				maximum_seconds = std::stod(argv[++index]);
 				maximum_set = true;
 			}
+			else if (option == "--controller-trace-seconds" && index + 1 < argc)
+				controller_trace_seconds = std::stod(argv[++index]);
+			else if (option == "--controller-trace-start-seconds" && index + 1 < argc)
+				controller_trace_start_seconds = std::stod(argv[++index]);
+			else if (option == "--controller-trace-limit" && index + 1 < argc)
+				controller_trace_limit = static_cast<size_t>(std::stoull(argv[++index]));
+			else if (option == "--controller-trace-cc" && index + 1 < argc)
+				controller_trace_controller = std::stoi(argv[++index]);
 			else if (option == "--block-size" && index + 1 < argc)
 				block_frames = static_cast<uint32_t>(std::stoul(argv[++index]));
+			else if (option == "--output-gain-db" && index + 1 < argc)
+				mastering_settings.output_gain_db = std::stod(argv[++index]);
+			else if (option == "--limiter")
+				mastering_settings.limiter_enabled = true;
+			else if (option == "--limiter-ceiling-db" && index + 1 < argc)
+				mastering_settings.limiter_ceiling_db = std::stod(argv[++index]);
+			else if (option == "--limiter-lookahead-ms" && index + 1 < argc)
+				mastering_settings.limiter_lookahead_ms = std::stod(argv[++index]);
+			else if (option == "--limiter-release-ms" && index + 1 < argc)
+				mastering_settings.limiter_release_ms = std::stod(argv[++index]);
 			else if (option == "--phase-mode" && index + 1 < argc)
 				phase_settings.mode = parse_phase_mode(argv[++index]);
 			else if (option == "--phase-strength" && index + 1 < argc)
@@ -318,6 +370,8 @@ int run_smf(int argc, char** argv)
 		uint64_t tail_frames = 0;
 		uint64_t maximum_tail_frames = 0;
 		uint64_t maximum_frames = 0;
+		uint64_t controller_trace_frames = 0;
+		uint64_t controller_trace_start_frame = 0;
 		if (sample_rate < 8000 || sample_rate > 384000 || voice_capacity == 0 ||
 			bank > 16383 || program > 127 || block_frames == 0 || block_frames > 1'048'576U ||
 			phase_settings.strength < 0.0f || phase_settings.strength > 1.0f ||
@@ -325,6 +379,12 @@ int run_smf(int argc, char** argv)
 			phase_settings.correlation_hz <= 0.0f || phase_settings.preserve_attack_ms < 0.0f ||
 			!seconds_to_frames(tail_seconds, sample_rate, tail_frames) ||
 			!seconds_to_frames(maximum_tail_seconds, sample_rate, maximum_tail_frames) ||
+			!seconds_to_frames(controller_trace_seconds, sample_rate, controller_trace_frames) ||
+			!seconds_to_frames(controller_trace_start_seconds, sample_rate,
+				controller_trace_start_frame) ||
+			(controller_trace_seconds > 0.0 && controller_trace_limit == 0) ||
+			controller_trace_controller < -1 || controller_trace_controller > 127 ||
+			!safsyn::mastering_settings_valid(mastering_settings) ||
 			(drain_tail && maximum_tail_frames == 0) ||
 			(maximum_set && (maximum_seconds <= 0.0 ||
 				!seconds_to_frames(maximum_seconds, sample_rate, maximum_frames) ||
@@ -345,6 +405,11 @@ int run_smf(int argc, char** argv)
 		analysis_options.initial_bank = static_cast<uint16_t>(bank);
 		analysis_options.initial_program = static_cast<uint8_t>(program);
 		analysis_options.tail_frames = drain_tail ? maximum_tail_frames : tail_frames;
+		analysis_options.controller_trace_frames = controller_trace_frames;
+		analysis_options.controller_trace_start_frame = controller_trace_start_frame;
+		analysis_options.controller_trace_limit = controller_trace_limit;
+		analysis_options.controller_trace_controller =
+			static_cast<int16_t>(controller_trace_controller);
 		safsyn::SmfAnalysis analysis;
 		const auto analysis_started = std::chrono::steady_clock::now();
 		const bool analyzed = safsyn::analyze_smf(midi, analysis_options, analysis);
@@ -382,6 +447,7 @@ int run_smf(int argc, char** argv)
 		render_options.block_frames = block_frames;
 		render_options.all_regions = all_regions;
 		render_options.phase = phase_settings;
+		render_options.mastering = mastering_settings;
 		safsyn::SmfRenderResult result;
 		const auto total_started = std::chrono::steady_clock::now();
 		const bool rendered = safsyn::render_smf_stream(midi, analysis, soundfont,
@@ -400,6 +466,8 @@ int run_smf(int argc, char** argv)
 			<< " frames=" << result.frames_written
 			<< " scheduled_events=" << result.scheduled_events
 			<< " dispatched_channel_events=" << result.dispatched_channel_events
+			<< " dispatched_sysex_events=" << result.dispatched_sysex_events
+			<< " master_volume_events=" << result.master_volume_events
 			<< " started_voices=" << result.engine.started_voices
 			<< " peak_active=" << result.engine.peak_active_voices
 			<< " active_end=" << result.active_voices_at_end
@@ -419,8 +487,15 @@ int run_smf(int argc, char** argv)
 			<< " max_cohort_multiplicity=" << result.engine.maximum_cohort_multiplicity
 			<< " tail_frames=" << result.tail_frames_written
 			<< " tail_ceiling_reached=" << (result.tail_ceiling_reached ? "yes" : "no")
+			<< " raw_peak=" << result.raw_peak
+			<< " raw_rms=" << result.raw_rms
 			<< " peak=" << result.peak
 			<< " rms=" << result.rms
+			<< " output_gain_db=" << mastering_settings.output_gain_db
+			<< " limiter=" << (mastering_settings.limiter_enabled ? "on" : "off")
+			<< " limiter_lookahead_frames=" << result.mastering.lookahead_frames
+			<< " limiter_limited_frames=" << result.mastering.limited_frames
+			<< " limiter_max_reduction_db=" << result.mastering.maximum_gain_reduction_db
 			<< " container=" << (result.container == safsyn::WavContainer::Rf64 ? "RF64" : "RIFF")
 			<< " truncated=" << (result.truncated ? "yes" : "no")
 			<< " phase_mode=" << phase_mode_name(phase_settings.mode)
@@ -509,6 +584,10 @@ void print_usage()
 		"  SMF: [--tail-seconds N] [--max-render-seconds N] [--analyze|--dry-run]\n"
 		"      [--block-size N] [--cohorts|--individual-voices] [--max-cohorts N]\n"
 		"      [--drain-tail] [--max-tail-seconds N]\n"
+		"      [--controller-trace-start-seconds N] [--controller-trace-seconds N]\n"
+		"      [--controller-trace-cc 0..127] [--controller-trace-limit N]\n"
+		"  Mastering: [--output-gain-db N] [--limiter] [--limiter-ceiling-db N]\n"
+		"      [--limiter-lookahead-ms N] [--limiter-release-ms N]\n"
 		"  Script: [--script chords|repeated] [--repeat-hz N] [--repeat-count N]\n";
 }
 }

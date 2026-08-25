@@ -267,6 +267,94 @@ void test_release_and_sustain()
 	check(engine.active_voice_count() == 0, "pedal-up completes the release envelope");
 }
 
+void test_controller_contract()
+{
+	auto bank = make_constant_bank();
+	{
+		safsyn::SynthEngine engine(1000, 8);
+		engine.set_soundfont(&bank);
+		engine.note_on(0, 60, 127);
+		std::array<float, 2> baseline{}, changed{};
+		engine.render_audio(baseline.data(), 1);
+		engine.control_change(0, 7, 64);
+		engine.control_change(0, 39, 127);
+		engine.render_audio(changed.data(), 1);
+		const double expected_volume_ratio = (8319.0 / 16383.0) / (100.0 / 127.0);
+		check(std::abs(changed[0] / baseline[0] - expected_volume_ratio) < 1e-5,
+			"CC7/39 form a 14-bit volume pair on an already-active voice");
+		const float volume_only = changed[0];
+		engine.control_change(0, 11, 64);
+		engine.control_change(0, 43, 127);
+		engine.render_audio(changed.data(), 1);
+		check(std::abs(changed[0] / volume_only - 8319.0 / 16383.0) < 1e-5,
+			"CC11/43 form a 14-bit expression pair on an already-active voice");
+		engine.control_change(0, 10, 127);
+		engine.control_change(0, 42, 127);
+		engine.render_audio(changed.data(), 1);
+		check(std::abs(changed[0]) < std::abs(changed[1]) * 1e-5f,
+			"CC10/42 apply full-resolution pan to active voices");
+	}
+	{
+		safsyn::SynthEngine engine(1000, 8);
+		engine.set_soundfont(&bank);
+		engine.note_on(0, 60, 127);
+		std::array<float, 2> before{}, after{};
+		engine.render_audio(before.data(), 1);
+		engine.set_master_volume(8192);
+		engine.render_audio(after.data(), 1);
+		check(std::abs(after[0] / before[0] - 8192.0 / 16383.0) < 1e-5,
+			"universal 14-bit master volume affects active voices");
+		engine.control_change(0, 7, 0);
+		engine.render_audio(after.data(), 1);
+		check(after[0] == 0.0f && after[1] == 0.0f,
+			"zero channel volume silences an active voice");
+		engine.control_change(0, 121, 0);
+		engine.render_audio(after.data(), 1);
+		check(after[0] != 0.0f || after[1] != 0.0f,
+			"CC121 restores the controller defaults without stopping held notes");
+	}
+	for (const uint8_t value : {uint8_t{0}, uint8_t{127}})
+	{
+		safsyn::SynthEngine engine(1000, 8);
+		engine.set_soundfont(&bank);
+		engine.note_on(0, 60, 127);
+		engine.control_change(0, 64, 127);
+		engine.control_change(0, 120, value);
+		std::array<float, 2> audio{};
+		engine.render_audio(audio.data(), 1);
+		check(engine.active_voice_count() == 0 && audio[0] == 0.0f && audio[1] == 0.0f,
+			"CC120 hard-silences the channel regardless of its data byte");
+	}
+	for (const uint8_t controller : {uint8_t{123}, uint8_t{124}, uint8_t{125},
+		uint8_t{126}, uint8_t{127}})
+	{
+		safsyn::SynthEngine engine(1000, 8);
+		engine.set_soundfont(&bank);
+		engine.note_on(0, 60, 127);
+		engine.control_change(0, controller, 0);
+		check(engine.active_voice_count() == 1,
+			"All Notes Off channel-mode CCs enter release instead of hard-killing");
+		std::array<float, 8> audio{};
+		engine.render_audio(audio.data(), 4);
+		check(engine.active_voice_count() == 0,
+			"All Notes Off channel-mode CCs complete the release envelope");
+	}
+	{
+		safsyn::SynthEngine engine(1000, 8);
+		engine.set_soundfont(&bank);
+		engine.note_on(0, 60, 127);
+		engine.control_change(0, 64, 127);
+		engine.control_change(0, 123, 0);
+		check(engine.active_voice_count() == 1,
+			"All Notes Off honors sustain pedal state");
+		engine.control_change(0, 64, 0);
+		std::array<float, 8> audio{};
+		engine.render_audio(audio.data(), 4);
+		check(engine.active_voice_count() == 0,
+			"pedal-up releases notes deferred by All Notes Off");
+	}
+}
+
 void test_determinism_and_block_invariance()
 {
 	auto bank = make_constant_bank();
@@ -492,6 +580,7 @@ int main(int argc, char** argv)
 	const std::filesystem::path test_directory = argc > 1 ? argv[1] : "test-data";
 	test_independent_instances();
 	test_release_and_sustain();
+	test_controller_contract();
 	test_determinism_and_block_invariance();
 	test_interpolation_pitch_and_stereo();
 	test_voice_stealing_and_midi_messages();

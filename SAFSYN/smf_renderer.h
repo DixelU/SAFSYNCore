@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core.h"
+#include "mastering.h"
 #include "smf.h"
 #include "wav_writer.h"
 
@@ -28,25 +29,32 @@ struct SmfRenderOptions
 	uint32_t block_frames = 256;
 	bool all_regions = false;
 	PhaseSettings phase;
+	MasteringSettings mastering;
 };
 
 struct SmfRenderResult
 {
 	uint64_t scheduled_events = 0;
 	uint64_t dispatched_channel_events = 0;
+	uint64_t dispatched_sysex_events = 0;
+	uint64_t master_volume_events = 0;
 	uint64_t frames_written = 0;
 	uint64_t metric_samples = 0;
+	uint64_t raw_metric_samples = 0;
 	size_t active_voices_at_end = 0;
 	size_t active_cohorts_at_end = 0;
 	uint64_t tail_frames_written = 0;
 	float peak = 0.0f;
 	double rms = 0.0;
+	float raw_peak = 0.0f;
+	double raw_rms = 0.0;
 	double render_ms = 0.0;
 	bool truncated = false;
 	bool tail_ceiling_reached = false;
 	WavContainer container = WavContainer::Riff;
 	RenderStats engine;
 	PhaseCacheStats phase;
+	MasteringStats mastering;
 	std::vector<SmfDiagnostic> diagnostics;
 };
 

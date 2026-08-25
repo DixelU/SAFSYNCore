@@ -2,7 +2,8 @@
 
 This milestone separates offline MIDI identity from physical sample rendering.
 It does not optimize the phase cache, add multithreading or SIMD, add filters,
-normalization, limiting, convolution, or change the coherent default.
+convolution, or change the coherent default. Optional post-mix mastering was
+added in the subsequent controller/mastering milestone.
 
 ## Representation
 
@@ -85,17 +86,17 @@ local and is not committed.
 | Largest compatible note-on group | 38 at frame 5,817,394 |
 | Compatible note-off groups | 29,437,779 |
 | Largest compatible note-off group | 317 at frame 5,802,681 |
-| Estimated peak active logical MIDI notes | 102,321 |
-| Conservative peak same-onset cohorts | 102,287 |
+| Estimated peak active logical MIDI notes | 55,088 |
+| Conservative peak same-onset cohorts | 55,054 |
 | Maximum events at one sample | 51,911 at frame 5,802,711 |
-| Supplemental analysis time | approximately 11.6 s |
-| Parser/heap state | 3,016 bytes |
+| Supplemental analysis time | approximately 11.8 s |
+| Parser/heap state | 3,432 bytes |
 
 The maximum event spike occurs at approximately 120.890 seconds and is mainly
-note-off traffic. It is not an enormous identical-note onset. Although the
-MIDI-only whole-file trigger count has a 1.50x grouping upper bound, compatible
-duplicates almost never overlap at the active peak: 102,287 estimated cohorts
-versus 102,321 logical notes.
+note-off traffic. It is not an enormous identical-note onset. Controller-aware
+lifetimes, especially CC120, reduce the earlier estimate substantially. Even
+then, compatible duplicates almost never overlap at the active peak: 55,054
+estimated cohorts versus 55,088 logical notes.
 
 The first-second coherent and continuous-analytic renders each start 210
 logical region voices, peak at 210 cohorts, merge zero voices, and steal zero.
@@ -148,8 +149,8 @@ ordering, already-released candidates, preset-region behavior, and capacity
 churn constrain which candidate cohorts still exist when later events at the
 same sample arrive. Most steals remain.
 
-An unlimited full cohort render was not dispatched. The analysis predicts an
-active physical peak near 102k rather than 512, so this design would increase
+An unlimited full cohort render was not dispatched. The corrected analysis
+predicts an active physical peak near 55k rather than 512, so this design would increase
 per-sample rendering work by roughly two orders of magnitude while eliminating
 steals. The densest validation window is near the end of the file and requires
 about 121 seconds of faithful warm-up. Running it would not be a practical
@@ -175,3 +176,6 @@ attack/decay note-offs; sustain; pitch bend and controllers; block sizes;
 deterministic seeds; dynamic growth; deterministic safety stealing; and
 one-shot playback. A synthetic 51,911-note same-sample fixture collapses to one
 onset cohort without stealing. Existing coherent SHA tests remain exact.
+
+Controller-correct full renders and optional limiter measurements supersede the
+listening artifacts above; see `CONTROLLERS_AND_MASTERING.md`.

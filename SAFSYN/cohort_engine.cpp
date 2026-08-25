@@ -900,13 +900,44 @@ struct CohortEngineState
 				if (!slot)
 					continue;
 				auto& batch = slot->batch;
-				const uint64_t count = batch.held + batch.sustained;
-				if (count != 0)
-					release_range(owner, batch, batch.first_serial, count);
-				retire_logical(handle);
+				if (owner.channels_[channel].sustain_pedal)
+				{
+					batch.sustained += batch.held;
+					batch.held = 0;
+				}
+				else
+				{
+					const uint64_t count = batch.held + batch.sustained;
+					if (count != 0)
+						release_range(owner, batch, batch.first_serial, count);
+					batch.held = 0;
+					batch.sustained = 0;
+					retire_logical(handle);
+				}
 			}
-			stack.clear();
+			if (!owner.channels_[channel].sustain_pedal)
+				stack.clear();
 		}
+	}
+
+	void all_sound_off(SynthEngine& owner, uint8_t channel)
+	{
+		if (channel >= 16)
+			return;
+		for (uint32_t index = 0; index < cohorts.size(); ++index)
+			if (cohorts[index].occupied && cohorts[index].cohort.channel == channel)
+				retire_cohort(owner, index, true);
+		for (uint32_t index = 0; index < logical_batches.size(); ++index)
+			if (logical_batches[index].occupied &&
+				logical_batches[index].batch.channel == channel)
+				retire_logical({index, logical_batches[index].generation});
+		for (uint16_t note = 0; note < 128; ++note)
+			note_stacks[note_index(channel, static_cast<uint8_t>(note))].clear();
+		for (auto it = onset_candidates.begin(); it != onset_candidates.end();)
+			if (it->first.channel == channel)
+				it = onset_candidates.erase(it);
+			else
+				++it;
 	}
 
 	void update_channel_gains(SynthEngine& owner, uint8_t channel) noexcept
@@ -981,7 +1012,8 @@ struct CohortEngineState
 					sample_r = source_r0 + (source_r1 - source_r0) * fraction;
 				}
 				const auto& channel = owner.channels_[cohort.channel];
-				const float amplitude = envelope * channel.volume * channel.expression;
+				const float amplitude = envelope * channel.volume * channel.expression *
+					owner.master_volume_;
 				out[static_cast<size_t>(frame) * 2] += sample_l * cohort.gain_l * amplitude;
 				out[static_cast<size_t>(frame) * 2 + 1] += sample_r * cohort.gain_r * amplitude;
 
@@ -1081,6 +1113,14 @@ void CohortEngine::all_notes_off(SynthEngine& owner, uint8_t channel) noexcept
 	catch (...) {}
 }
 
+void CohortEngine::all_sound_off(SynthEngine& owner, uint8_t channel) noexcept
+{
+	if (!state_)
+		return;
+	try { state_->all_sound_off(owner, channel); }
+	catch (...) {}
+}
+
 void CohortEngine::update_channel_gains(SynthEngine& owner, uint8_t channel) noexcept
 {
 	if (state_)
@@ -1101,6 +1141,12 @@ void CohortEngine::invalidate_onset_merges(uint8_t channel) noexcept
 				it = state_->onset_candidates.erase(it);
 			else
 				++it;
+}
+
+void CohortEngine::invalidate_all_onset_merges() noexcept
+{
+	if (state_)
+		state_->onset_candidates.clear();
 }
 
 void CohortEngine::render_audio(SynthEngine& owner, float* out, uint32_t frames) noexcept

@@ -148,6 +148,8 @@ public:
 	void control_change(uint8_t channel, uint8_t controller, uint8_t value) noexcept;
 	void program_change(uint8_t channel, uint8_t program) noexcept;
 	void set_pitch_bend(uint8_t channel, uint16_t value14) noexcept;
+	// Universal real-time Master Volume, normalized from MIDI's 14-bit value.
+	void set_master_volume(uint16_t value14) noexcept;
 	void consume_short_message(uint32_t packed_message) noexcept;
 	// Stable-order dispatch that combines only consecutive compatible note runs.
 	void consume_short_messages(const uint32_t* packed_messages, size_t count) noexcept;
@@ -195,6 +197,12 @@ private:
 		float pan = 0.0f;
 		float pitch_bend_semitones = 0.0f;
 		bool sustain_pedal = false;
+		uint8_t volume_msb = 100;
+		uint8_t volume_lsb = 0;
+		uint8_t pan_msb = 64;
+		uint8_t pan_lsb = 0;
+		uint8_t expression_msb = 127;
+		uint8_t expression_lsb = 0;
 		uint8_t bank_msb = 0;
 		uint8_t bank_lsb = 0;
 		uint8_t program = 0;
@@ -211,6 +219,7 @@ private:
 	void update_channel_voice_gains(uint8_t channel) noexcept;
 	void update_channel_pitch(uint8_t channel) noexcept;
 	void all_notes_off(uint8_t channel) noexcept;
+	void all_sound_off(uint8_t channel) noexcept;
 	void silence_all() noexcept;
 	friend class CohortEngine;
 	friend struct CohortEngineState;
@@ -222,6 +231,7 @@ private:
 	uint32_t sample_rate_ = 48000;
 	uint64_t next_serial_ = 1;
 	bool all_regions_mode_ = false;
+	float master_volume_ = 1.0f;
 	VoiceModel voice_model_ = VoiceModel::Individual;
 	size_t maximum_cohorts_ = 0;
 	PhaseProcessor phase_processor_;

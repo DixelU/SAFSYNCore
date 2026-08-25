@@ -174,6 +174,17 @@ std::vector<uint8_t> mass_duplicate_fixture(uint32_t count)
 	return make_smf(0, 100, {track});
 }
 
+std::vector<uint8_t> master_volume_fixture()
+{
+	std::vector<uint8_t> track = {0x00, 0x90, 0x3c, 0x64};
+	append_vlq(track, 10);
+	track.insert(track.end(), {0xf0, 0x07, 0x7f, 0x7f, 0x04, 0x01, 0x00, 0x20, 0xf7});
+	append_vlq(track, 10);
+	track.insert(track.end(), {0x80, 0x3c, 0x40});
+	append_eot(track);
+	return make_smf(0, 100, {track});
+}
+
 void test_type0_running_status_and_usage()
 {
 	safsyn::SmfFile file;
@@ -305,6 +316,42 @@ void test_skipped_meta_sysex_and_malformed_inputs()
 		"truncated track chunk is rejected before event parsing");
 }
 
+void test_sysex_payload_and_master_dispatch(const std::filesystem::path& directory)
+{
+	std::filesystem::create_directories(directory);
+	safsyn::SmfFile file;
+	check(file.load_bytes(master_volume_fixture()), "universal master-volume fixture loads");
+	safsyn::MergedSmfStream merged(file);
+	safsyn::SmfEvent event;
+	bool decoded = false;
+	while (merged.next(event))
+		if (event.kind == safsyn::SmfEventKind::SystemExclusive)
+		{
+			uint16_t value = 0;
+			decoded = file.payload_data(event) != nullptr &&
+				safsyn::decode_universal_master_volume(file, event, value) && value == 4096;
+		}
+	check(merged.good() && decoded,
+		"SysEx payload offsets retain and decode Universal Master Volume");
+	safsyn::SmfAnalysisOptions analysis_options;
+	analysis_options.sample_rate = 1000;
+	analysis_options.tail_frames = 20;
+	safsyn::SmfAnalysis analysis;
+	check(safsyn::analyze_smf(file, analysis_options, analysis) &&
+		analysis.sysex_events == 1 && analysis.universal_master_volume_events == 1,
+		"SMF analysis identifies retained Universal Master Volume events");
+	auto bank = make_bank(1000);
+	safsyn::SmfRenderOptions options;
+	options.sample_rate = 1000;
+	options.tail_frames = 20;
+	const auto path = directory / "master-volume.wav";
+	safsyn::SmfRenderResult result;
+	check(safsyn::render_smf_stream(file, analysis, bank, path.string().c_str(),
+		options, result) && result.dispatched_sysex_events == 1 &&
+		result.master_volume_events == 1 && result.dispatched_channel_events == 2,
+		"streamed rendering dispatches Universal Master Volume in stable event order");
+}
+
 void test_streamed_wav_headers(const std::filesystem::path& directory)
 {
 	std::filesystem::create_directories(directory);
@@ -375,6 +422,32 @@ void test_streamed_render_determinism(const std::filesystem::path& directory)
 			first_result.dispatched_channel_events == 2,
 			"streamed renderer preserves frame and triggered-event counts");
 	}
+
+	safsyn::SmfRenderOptions mastered_options;
+	mastered_options.sample_rate = 1000;
+	mastered_options.tail_frames = 100;
+	mastered_options.block_frames = 1;
+	mastered_options.mastering.output_gain_db = 30.0;
+	mastered_options.mastering.limiter_enabled = true;
+	mastered_options.mastering.limiter_ceiling_db = -6.020599913279624;
+	mastered_options.mastering.limiter_lookahead_ms = 5.0;
+	mastered_options.mastering.limiter_release_ms = 20.0;
+	auto mastered_blocked_options = mastered_options;
+	mastered_blocked_options.block_frames = 37;
+	const auto mastered_a_path = directory / "mastered-a.wav";
+	const auto mastered_b_path = directory / "mastered-b.wav";
+	safsyn::SmfRenderResult mastered_a, mastered_b;
+	check(safsyn::render_smf_stream(file, analysis, bank, mastered_a_path.string().c_str(),
+		mastered_options, mastered_a) &&
+		safsyn::render_smf_stream(file, analysis, bank, mastered_b_path.string().c_str(),
+			mastered_blocked_options, mastered_b) &&
+		read_file(mastered_a_path) == read_file(mastered_b_path),
+		"post-mix gain and lookahead limiting are block-invariant in streamed SMF output");
+	check(mastered_a.frames_written == 600 && mastered_a.raw_metric_samples == 1200 &&
+		mastered_a.metric_samples == 1200 && mastered_a.raw_peak > 0.0f &&
+		mastered_a.peak <= 0.500001f && mastered_a.mastering.lookahead_frames == 5 &&
+		mastered_a.mastering.limited_frames != 0,
+		"mastered SMF reports separate raw/output metrics without changing frame count");
 
 	safsyn::SmfFile sustain_file;
 	check(sustain_file.load_bytes(render_fixture_midi(true)), "sustain fixture loads");
@@ -509,6 +582,7 @@ int main(int argc, char** argv)
 	test_smpte_timing();
 	test_remainder_preservation();
 	test_skipped_meta_sysex_and_malformed_inputs();
+	test_sysex_payload_and_master_dispatch(directory);
 	test_streamed_wav_headers(directory);
 	test_streamed_render_determinism(directory);
 	test_cohort_histogram_and_mass_dispatch(directory);

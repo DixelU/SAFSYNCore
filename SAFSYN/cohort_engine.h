@@ -28,9 +28,11 @@ public:
 		uint64_t count) noexcept;
 	void release_sustained(SynthEngine& owner, uint8_t channel) noexcept;
 	void all_notes_off(SynthEngine& owner, uint8_t channel) noexcept;
+	void all_sound_off(SynthEngine& owner, uint8_t channel) noexcept;
 	void update_channel_gains(SynthEngine& owner, uint8_t channel) noexcept;
 	void update_channel_pitch(SynthEngine& owner, uint8_t channel) noexcept;
 	void invalidate_onset_merges(uint8_t channel) noexcept;
+	void invalidate_all_onset_merges() noexcept;
 	void render_audio(SynthEngine& owner, float* interleaved_stereo,
 		uint32_t frames) noexcept;
 

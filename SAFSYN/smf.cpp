@@ -192,6 +192,7 @@ struct TrackCursor
 			}
 			event.payload_size = length;
 			const size_t payload = position;
+			event.payload_offset = payload;
 			position += length;
 			if (event.meta_type == 0x2f)
 			{
@@ -241,6 +242,7 @@ struct TrackCursor
 			}
 			event.kind = SmfEventKind::SystemExclusive;
 			event.payload_size = length;
+			event.payload_offset = position;
 			position += length;
 			return ParseResult::Event;
 		}
@@ -434,6 +436,14 @@ bool SmfFile::load_bytes(std::vector<uint8_t> bytes) noexcept
 			"exception while parsing SMF chunks");
 		return false;
 	}
+}
+
+const uint8_t* SmfFile::payload_data(const SmfEvent& event) const noexcept
+{
+	if (event.payload_size == 0 || event.payload_offset > bytes_.size() ||
+		event.payload_size > bytes_.size() - static_cast<size_t>(event.payload_offset))
+		return nullptr;
+	return bytes_.data() + static_cast<size_t>(event.payload_offset);
 }
 
 bool SmfFile::parse_chunks()
@@ -676,6 +686,28 @@ size_t ScheduledSmfStream::state_bytes() const noexcept
 	return impl_ ? sizeof(Impl) + impl_->merged.state_bytes() : 0;
 }
 
+bool decode_universal_master_volume(const SmfFile& file, const SmfEvent& event,
+	uint16_t& value14) noexcept
+{
+	value14 = 0;
+	if (event.kind != SmfEventKind::SystemExclusive)
+		return false;
+	const uint8_t* payload = file.payload_data(event);
+	if (!payload)
+		return false;
+	size_t offset = 0;
+	if (event.payload_size != 0 && payload[0] == 0xf0)
+		offset = 1;
+	if (event.payload_size - offset < 6 || payload[offset] != 0x7f ||
+		payload[offset + 1] > 0x7f || payload[offset + 2] != 0x04 ||
+		payload[offset + 3] != 0x01 || payload[offset + 4] > 0x7f ||
+		payload[offset + 5] > 0x7f)
+		return false;
+	value14 = static_cast<uint16_t>(payload[offset + 4] |
+		(static_cast<uint16_t>(payload[offset + 5]) << 7));
+	return true;
+}
+
 bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 	SmfAnalysis& analysis) noexcept
 {
@@ -713,11 +745,29 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 		std::array<uint8_t, 16> bank_msb{};
 		std::array<uint8_t, 16> bank_lsb{};
 		std::array<uint8_t, 16> programs{};
+		std::array<uint8_t, 16> volume_msb{};
+		std::array<uint8_t, 16> volume_lsb{};
+		std::array<uint8_t, 16> pan_msb{};
+		std::array<uint8_t, 16> pan_lsb{};
+		std::array<uint8_t, 16> expression_msb{};
+		std::array<uint8_t, 16> expression_lsb{};
+		std::array<uint64_t, 16> active_channel_notes{};
+		std::array<std::array<SmfControllerUsage, 128>, 16> controller_usage{};
+		std::array<std::array<bool, 128>, 16> controller_seen{};
 		for (size_t channel = 0; channel < 16; ++channel)
 		{
 			bank_msb[channel] = static_cast<uint8_t>(options.initial_bank >> 7);
 			bank_lsb[channel] = static_cast<uint8_t>(options.initial_bank & 0x7f);
 			programs[channel] = options.initial_program;
+			volume_msb[channel] = 100;
+			pan_msb[channel] = 64;
+			expression_msb[channel] = 127;
+			for (size_t controller = 0; controller < 128; ++controller)
+			{
+				controller_usage[channel][controller].channel = static_cast<uint8_t>(channel);
+				controller_usage[channel][controller].controller =
+					static_cast<uint8_t>(controller);
+			}
 		}
 		std::map<uint32_t, uint64_t> usage;
 		std::map<uint64_t, uint64_t> note_on_histogram;
@@ -793,7 +843,10 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 				if (sustain[channel])
 					found->sustained += released;
 				else
+				{
 					active_logical_notes -= released;
+					active_channel_notes[channel] -= released;
+				}
 				count -= released;
 				retire_empty(*found);
 				trim_retired_back(groups);
@@ -808,6 +861,7 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 					note_run.note];
 				groups.push_back({note_run.count, 0, true});
 				active_logical_notes += note_run.count;
+				active_channel_notes[note_run.channel] += note_run.count;
 				++active_onset_cohorts;
 				update_peaks();
 			}
@@ -824,6 +878,7 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 				for (auto& group : groups)
 				{
 					active_logical_notes -= group.sustained;
+					active_channel_notes[channel] -= group.sustained;
 					group.sustained = 0;
 					retire_empty(group);
 				}
@@ -837,10 +892,34 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 				for (const auto& group : groups)
 				{
 					active_logical_notes -= group.held + group.sustained;
+					active_channel_notes[channel] -= group.held + group.sustained;
 					if (group.counted)
 						--active_onset_cohorts;
 				}
 				groups.clear();
+			}
+		};
+		auto all_notes_off_channel = [&](uint8_t channel) {
+			for (uint16_t note = 0; note < 128; ++note)
+			{
+				auto& groups = active_groups[static_cast<size_t>(channel) * 128 + note];
+				for (auto& group : groups)
+				{
+					if (sustain[channel])
+					{
+						group.sustained += group.held;
+						group.held = 0;
+					}
+					else
+					{
+						active_logical_notes -= group.held + group.sustained;
+						active_channel_notes[channel] -= group.held + group.sustained;
+						group.held = 0;
+						group.sustained = 0;
+						retire_empty(group);
+					}
+				}
+				trim_retired_back(groups);
 			}
 		};
 		uint64_t tick_group = 0;
@@ -925,8 +1004,34 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 				}
 				if (command == 0xb0)
 				{
+					const uint64_t active_channel_notes_before = active_channel_notes[channel];
+					auto& controller = controller_usage[channel][scheduled.event.data1];
+					if (!controller_seen[channel][scheduled.event.data1])
+					{
+						controller_seen[channel][scheduled.event.data1] = true;
+						controller.minimum_value = scheduled.event.data2;
+						controller.maximum_value = scheduled.event.data2;
+						controller.first_tick = scheduled.event.tick;
+						controller.first_sample = scheduled.sample;
+					}
+					else
+					{
+						controller.minimum_value = (std::min)(controller.minimum_value,
+							scheduled.event.data2);
+						controller.maximum_value = (std::max)(controller.maximum_value,
+							scheduled.event.data2);
+					}
+					++controller.events;
+					controller.last_tick = scheduled.event.tick;
+					controller.last_sample = scheduled.sample;
 					if (scheduled.event.data1 == 0) bank_msb[channel] = scheduled.event.data2;
 					if (scheduled.event.data1 == 32) bank_lsb[channel] = scheduled.event.data2;
+					if (scheduled.event.data1 == 7) volume_msb[channel] = scheduled.event.data2;
+					if (scheduled.event.data1 == 39) volume_lsb[channel] = scheduled.event.data2;
+					if (scheduled.event.data1 == 10) pan_msb[channel] = scheduled.event.data2;
+					if (scheduled.event.data1 == 42) pan_lsb[channel] = scheduled.event.data2;
+					if (scheduled.event.data1 == 11) expression_msb[channel] = scheduled.event.data2;
+					if (scheduled.event.data1 == 43) expression_lsb[channel] = scheduled.event.data2;
 					if (scheduled.event.data1 == 64)
 					{
 						const bool was_down = sustain[channel];
@@ -939,9 +1044,42 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 						if (sustain[channel])
 							release_sustain(channel);
 						sustain[channel] = false;
+						volume_msb[channel] = 100;
+						volume_lsb[channel] = 0;
+						pan_msb[channel] = 64;
+						pan_lsb[channel] = 0;
+						expression_msb[channel] = 127;
+						expression_lsb[channel] = 0;
 					}
-					if (scheduled.event.data1 == 123)
+					if (scheduled.event.data1 == 120)
 						release_channel(channel);
+					if (scheduled.event.data1 == 123 || scheduled.event.data1 >= 124)
+						all_notes_off_channel(channel);
+					const bool traced_controller = scheduled.event.data1 == 7 ||
+						scheduled.event.data1 == 39 || scheduled.event.data1 == 10 ||
+						scheduled.event.data1 == 42 || scheduled.event.data1 == 11 ||
+						scheduled.event.data1 == 43 || scheduled.event.data1 == 64 ||
+						scheduled.event.data1 >= 120;
+					const uint64_t trace_end = options.controller_trace_frames >
+						(std::numeric_limits<uint64_t>::max)() - options.controller_trace_start_frame
+						? (std::numeric_limits<uint64_t>::max)()
+						: options.controller_trace_start_frame + options.controller_trace_frames;
+					if (traced_controller && options.controller_trace_frames != 0 &&
+						scheduled.sample >= options.controller_trace_start_frame &&
+						scheduled.sample <= trace_end &&
+						(options.controller_trace_controller < 0 ||
+							scheduled.event.data1 == options.controller_trace_controller) &&
+						analysis.controller_trace.size() < options.controller_trace_limit)
+					{
+						analysis.controller_trace.push_back({scheduled.event.tick, scheduled.sample,
+							scheduled.event.track, scheduled.event.ordinal, channel,
+							scheduled.event.data1, scheduled.event.data2,
+							static_cast<uint16_t>((volume_msb[channel] << 7) | volume_lsb[channel]),
+							static_cast<uint16_t>((pan_msb[channel] << 7) | pan_lsb[channel]),
+							static_cast<uint16_t>((expression_msb[channel] << 7) |
+								expression_lsb[channel]), active_channel_notes_before,
+							active_channel_notes[channel], sustain[channel]});
+					}
 				}
 				else if (command == 0xc0)
 					programs[channel] = scheduled.event.data1;
@@ -968,6 +1106,11 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 				break;
 			case SmfEventKind::SystemExclusive:
 				++analysis.sysex_events;
+			{
+				uint16_t master_volume = 0;
+				if (decode_universal_master_volume(file, scheduled.event, master_volume))
+					++analysis.universal_master_volume_events;
+			}
 				break;
 			}
 		}
@@ -1009,6 +1152,10 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 			analysis.bank_program_usage.push_back({static_cast<uint8_t>(key >> 21),
 				static_cast<uint16_t>((key >> 7) & 0x3fffU), static_cast<uint8_t>(key & 0x7fU),
 				count});
+		for (size_t channel = 0; channel < 16; ++channel)
+			for (size_t controller = 0; controller < 128; ++controller)
+				if (controller_seen[channel][controller])
+					analysis.controller_usage.push_back(controller_usage[channel][controller]);
 		analysis.note_on_group_histogram.reserve(note_on_histogram.size());
 		for (const auto& [size, groups] : note_on_histogram)
 			analysis.note_on_group_histogram.push_back({size, groups, size * groups});

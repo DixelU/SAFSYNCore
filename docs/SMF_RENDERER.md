@@ -1,9 +1,10 @@
 # Streaming Standard MIDI File renderer
 
 This milestone turns the deterministic sample engine into a streaming SMF
-converter while retaining coherent playback as the default. It does not add
-normalization, limiting, filtering, multithreaded rendering, realtime audio, or
-a production phase policy.
+converter while retaining coherent playback as the default. A later milestone
+adds optional post-mix gain and sample-peak limiting; the raw float path remains
+the default. Filtering, multithreaded rendering, realtime audio, and a
+production phase policy remain out of scope.
 
 ## Parsing and scheduling architecture
 
@@ -28,7 +29,7 @@ Supported input behavior:
 - independent running status per track;
 - all MIDI channel message sizes;
 - tempo and end-of-track meta events;
-- safely skipped bounded SysEx and unknown meta payloads;
+- retained bounded SysEx and unknown meta payloads;
 - PPQN and SMPTE `-24/-25/-29/-30` divisions;
 - explicit diagnostics for invalid status, overflow, malformed VLQ, and
   truncated chunks or payloads.
@@ -46,8 +47,9 @@ The renderer advances in fixed blocks but stops exactly at every scheduled
 sample. All channel events assigned to that sample are routed in merge order
 through the stable batched dispatch API, then audio rendering continues. Only
 compatible note runs are combined. Bank
-select, program change, sustain, note-on/off, and pitch bend therefore use the
-existing engine contract and retain phase event identity.
+select, program change, sustain, note-on/off, pitch bend, 14-bit controller
+pairs, channel-mode events, and Universal Master Volume therefore use the
+engine contract and retain phase event identity.
 
 Audio is accumulated only for the current block and written immediately.
 `FloatWavWriter` predicts RIFF versus RF64 from the expected frame count and
@@ -60,6 +62,12 @@ released, and the configured tail is streamed. `--max-render-seconds` is an
 exclusive hard boundary and can truncate both the event sequence and tail.
 An opt-in drain mode renders until all represented logical voices end, subject
 to an explicit maximum tail.
+
+The optional mastering stage follows the raw float mix and precedes the WAV
+writer. Output gain is applied first. The limiter then uses a stereo-linked
+future sample-peak window, immediate attack, and exponential release. Its
+lookahead delays writing only; flushing preserves the exact source frame count.
+Raw and output peak/RMS are reported separately.
 
 ## Analysis mode
 
@@ -75,10 +83,14 @@ tick and output sample, parser-state bytes, estimated output/container, scan
 time, throughput, and malformed/truncated diagnostics. Analysis performs the
 same incremental scheduling pass used for rendering.
 
-## `Hypernova.mid` integration
+## `Hypernova.mid` integration (initial milestone)
 
 Local fixture only: `C:\Users\User\Downloads\Hypernova.mid`. Neither it nor the
 generated WAV files are committed.
+
+These measurements preserve the initial pre-controller milestone. The current
+CC120-aware analysis and full mastered renders are documented in
+`CONTROLLERS_AND_MASTERING.md` and supersede the listening artifacts below.
 
 Full-file analysis at 48 kHz:
 
@@ -132,10 +144,11 @@ multi-key MIDI files.
 ## Verification boundary
 
 Automated tests cover type 0/1, stable cross-track ordering, running status,
-tempo changes, bank/program routing, sustain and unfinished-note release, PPQN
-remainder preservation, SMPTE drop-frame timing, malformed VLQs, truncated
-chunks/payloads, skipped SysEx/meta, RIFF/RF64 finalization, block-size
-invariance, and identical coherent/analytic SMF output. A separate CTest keeps
+tempo changes, bank/program routing, controller pairs and channel-mode events,
+sustain and unfinished-note release, Universal Master Volume, PPQN remainder
+preservation, SMPTE drop-frame timing, malformed VLQs, truncated chunks/payloads,
+RIFF/RF64 finalization, mastering block invariance, and identical
+coherent/analytic SMF output. A separate CTest keeps
 the pre-SMF scripted coherent WAV at SHA-256
 `319EBFEB7C562DD50BD557DDA0DF18E6C462E9395CBFAE8BBB06896AE2595731`.
 

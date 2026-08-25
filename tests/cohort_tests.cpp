@@ -268,6 +268,45 @@ void test_lifecycle_split_and_controls()
 		"individual note-offs split release cohorts from sustaining multiplicity");
 }
 
+void test_controller_contract_equivalence()
+{
+	auto bank = make_bank(2000, true, 0.0f, 0.004f);
+	safsyn::SynthEngine reference(2000, 64), cohorts(2000, 4);
+	configure_pair(reference, cohorts, bank);
+	std::vector<float> expected, actual;
+	auto append = [&](uint32_t frames) {
+		auto reference_part = render(reference, frames);
+		auto cohort_part = render(cohorts, frames);
+		expected.insert(expected.end(), reference_part.begin(), reference_part.end());
+		actual.insert(actual.end(), cohort_part.begin(), cohort_part.end());
+	};
+	for (uint32_t index = 0; index < 12; ++index)
+		reference.note_on(0, 60, 110);
+	cohorts.note_on_batch(0, 60, 110, 12);
+	reference.control_change(0, 7, 73); cohorts.control_change(0, 7, 73);
+	reference.control_change(0, 39, 91); cohorts.control_change(0, 39, 91);
+	reference.control_change(0, 11, 88); cohorts.control_change(0, 11, 88);
+	reference.control_change(0, 43, 27); cohorts.control_change(0, 43, 27);
+	reference.control_change(0, 10, 100); cohorts.control_change(0, 10, 100);
+	reference.control_change(0, 42, 11); cohorts.control_change(0, 42, 11);
+	reference.set_master_volume(12000); cohorts.set_master_volume(12000);
+	append(17);
+	reference.control_change(0, 64, 127); cohorts.control_change(0, 64, 127);
+	reference.control_change(0, 123, 0); cohorts.control_change(0, 123, 0);
+	append(9);
+	reference.control_change(0, 64, 0); cohorts.control_change(0, 64, 0);
+	append(12);
+	for (uint32_t index = 0; index < 7; ++index)
+		reference.note_on(0, 64, 100);
+	cohorts.note_on_batch(0, 64, 100, 7);
+	append(3);
+	reference.control_change(0, 120, 0); cohorts.control_change(0, 120, 0);
+	append(5);
+	check(close_audio(expected, actual) && reference.active_voice_count() == 0 &&
+		cohorts.active_voice_count() == 0 && cohorts.active_cohort_count() == 0,
+		"14-bit controllers, master volume, sustained All Notes Off, and CC120 match cohorts");
+}
+
 void test_linked_stereo_and_one_shot()
 {
 	auto linked = make_linked_stereo_bank(3000);
@@ -413,6 +452,7 @@ int main()
 	test_coherent_and_phase_duplicates();
 	test_singleton_bit_exact_modes();
 	test_lifecycle_split_and_controls();
+	test_controller_contract_equivalence();
 	test_linked_stereo_and_one_shot();
 	test_cross_run_merging_and_dynamic_growth();
 	test_block_and_seed_determinism();

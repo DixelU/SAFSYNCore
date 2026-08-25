@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <vector>
 
 namespace safsyn
@@ -25,6 +26,7 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 		analysis.sample_rate != options.sample_rate ||
 		options.voice_capacity == 0 || options.block_frames == 0 ||
 		options.block_frames > 1'048'576U ||
+		!mastering_settings_valid(options.mastering) ||
 		(options.drain_tail && options.maximum_tail_frames == 0))
 	{
 		render_error(result.diagnostics, "invalid SMF render options");
@@ -63,8 +65,24 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 		}
 
 		std::vector<float> block(static_cast<size_t>(options.block_frames) * 2);
-		long double sum_squares = 0.0L;
+		std::vector<float> mastered;
+		mastered.reserve(static_cast<size_t>(options.block_frames) * 2);
+		std::optional<StereoMasteringProcessor> mastering;
+		if (options.mastering.active())
+			mastering.emplace(options.sample_rate, options.mastering);
+		long double raw_sum_squares = 0.0L;
+		long double output_sum_squares = 0.0L;
 		uint64_t cursor = 0;
+		auto write_output = [&](const float* audio, uint32_t frames) -> bool {
+			for (size_t index = 0; index < static_cast<size_t>(frames) * 2; ++index)
+			{
+				const float value = audio[index];
+				result.peak = (std::max)(result.peak, std::abs(value));
+				output_sum_squares += static_cast<long double>(value) * value;
+			}
+			result.metric_samples += static_cast<uint64_t>(frames) * 2;
+			return frames == 0 || writer.write(audio, frames);
+		};
 		auto render_to = [&](uint64_t target) -> bool {
 			while (cursor < target)
 			{
@@ -77,11 +95,19 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 				for (size_t index = 0; index < static_cast<size_t>(frames) * 2; ++index)
 				{
 					const float value = block[index];
-					result.peak = (std::max)(result.peak, std::abs(value));
-					sum_squares += static_cast<long double>(value) * value;
+					result.raw_peak = (std::max)(result.raw_peak, std::abs(value));
+					raw_sum_squares += static_cast<long double>(value) * value;
 				}
-				result.metric_samples += static_cast<uint64_t>(frames) * 2;
-				if (!writer.write(block.data(), frames))
+				result.raw_metric_samples += static_cast<uint64_t>(frames) * 2;
+				if (mastering)
+				{
+					mastered.clear();
+					mastering->process(block.data(), frames, mastered);
+					if (!write_output(mastered.data(),
+						static_cast<uint32_t>(mastered.size() / 2)))
+						return false;
+				}
+				else if (!write_output(block.data(), frames))
 					return false;
 				cursor += frames;
 			}
@@ -94,6 +120,11 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 		ScheduledSmfEvent scheduled;
 		bool has_event = stream.next(scheduled);
 		std::vector<uint32_t> sample_messages;
+		auto dispatch_messages = [&]() {
+			engine.consume_short_messages(sample_messages.data(), sample_messages.size());
+			result.dispatched_channel_events += sample_messages.size();
+			sample_messages.clear();
+		};
 		while (has_event && scheduled.sample < limit)
 		{
 			const uint64_t event_sample = scheduled.sample;
@@ -112,10 +143,20 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 						(static_cast<uint32_t>(scheduled.event.data1) << 8) |
 						(static_cast<uint32_t>(scheduled.event.data2) << 16));
 				}
+				else if (scheduled.event.kind == SmfEventKind::SystemExclusive)
+				{
+					dispatch_messages();
+					++result.dispatched_sysex_events;
+					uint16_t master_volume = 0;
+					if (decode_universal_master_volume(file, scheduled.event, master_volume))
+					{
+						engine.set_master_volume(master_volume);
+						++result.master_volume_events;
+					}
+				}
 				has_event = stream.next(scheduled);
 			}
-			engine.consume_short_messages(sample_messages.data(), sample_messages.size());
-			result.dispatched_channel_events += sample_messages.size();
+			dispatch_messages();
 		}
 		if (!stream.good())
 		{
@@ -164,6 +205,17 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 			result.tail_frames_written = cursor - tail_start;
 		}
 
+		if (mastering)
+		{
+			mastered.clear();
+			mastering->finish(mastered);
+			if (!write_output(mastered.data(), static_cast<uint32_t>(mastered.size() / 2)))
+			{
+				render_error(result.diagnostics, "failed while flushing mastered WAV audio");
+				return false;
+			}
+			result.mastering = mastering->stats();
+		}
 		result.container = writer.container();
 		if (!writer.close())
 		{
@@ -172,7 +224,9 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 		}
 		result.frames_written = writer.frames_written();
 		result.rms = result.metric_samples == 0 ? 0.0 :
-			std::sqrt(static_cast<double>(sum_squares / result.metric_samples));
+			std::sqrt(static_cast<double>(output_sum_squares / result.metric_samples));
+		result.raw_rms = result.raw_metric_samples == 0 ? 0.0 :
+			std::sqrt(static_cast<double>(raw_sum_squares / result.raw_metric_samples));
 		result.engine = engine.stats();
 		result.active_voices_at_end = engine.active_voice_count();
 		result.active_cohorts_at_end = engine.active_cohort_count();

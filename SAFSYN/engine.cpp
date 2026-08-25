@@ -69,6 +69,7 @@ void SynthEngine::reset() noexcept
 	silence_all();
 	for (auto& channel : channels_)
 		channel = ChannelState{};
+	master_volume_ = 1.0f;
 	next_serial_ = 1;
 	stats_ = {};
 }
@@ -390,8 +391,27 @@ void SynthEngine::all_notes_off(uint8_t channel) noexcept
 	}
 	for (auto& voice : voices_)
 		if (voice.active() && voice.channel == channel &&
-			voice.region->loop_mode != LoopMode::OneShot)
-			begin_release(voice);
+			voice.region->loop_mode != LoopMode::OneShot &&
+			voice.stage != Voice::Stage::Release && !voice.note_off_pending)
+		{
+			if (channels_[channel].sustain_pedal)
+				voice.note_off_pending = true;
+			else
+				begin_release(voice);
+		}
+}
+
+void SynthEngine::all_sound_off(uint8_t channel) noexcept
+{
+	if (voice_model_ == VoiceModel::Cohorts)
+	{
+		if (cohort_engine_)
+			cohort_engine_->all_sound_off(*this, channel);
+		return;
+	}
+	for (auto& voice : voices_)
+		if (voice.active() && voice.channel == channel)
+			voice = Voice{};
 }
 
 void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t value) noexcept
@@ -407,17 +427,45 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 		state.bank_msb = value;
 		break;
 	case 7:
-		state.volume = value / 127.0f;
+		state.volume_msb = value;
+		state.volume = static_cast<float>((state.volume_msb << 7) | state.volume_lsb) /
+			16383.0f;
 		break;
 	case 10:
-		state.pan = std::clamp((static_cast<int>(value) - 64) / 63.0f, -1.0f, 1.0f);
+		state.pan_msb = value;
+	{
+		const int pan14 = (state.pan_msb << 7) | state.pan_lsb;
+		state.pan = pan14 < 8192 ? (pan14 - 8192) / 8192.0f :
+			(pan14 - 8192) / 8191.0f;
+	}
 		update_channel_voice_gains(channel);
 		break;
 	case 11:
-		state.expression = value / 127.0f;
+		state.expression_msb = value;
+		state.expression = static_cast<float>((state.expression_msb << 7) |
+			state.expression_lsb) / 16383.0f;
 		break;
 	case 32:
 		state.bank_lsb = value;
+		break;
+	case 39:
+		state.volume_lsb = value;
+		state.volume = static_cast<float>((state.volume_msb << 7) | state.volume_lsb) /
+			16383.0f;
+		break;
+	case 42:
+		state.pan_lsb = value;
+	{
+		const int pan14 = (state.pan_msb << 7) | state.pan_lsb;
+		state.pan = pan14 < 8192 ? (pan14 - 8192) / 8192.0f :
+			(pan14 - 8192) / 8191.0f;
+	}
+		update_channel_voice_gains(channel);
+		break;
+	case 43:
+		state.expression_lsb = value;
+		state.expression = static_cast<float>((state.expression_msb << 7) |
+			state.expression_lsb) / 16383.0f;
 		break;
 	case 64:
 	{
@@ -437,6 +485,9 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 		}
 		break;
 	}
+	case 120:
+		all_sound_off(channel);
+		break;
 	case 121:
 	{
 		const bool release_pending = state.sustain_pedal;
@@ -464,11 +515,23 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 		break;
 	}
 	case 123:
+	case 124:
+	case 125:
+	case 126:
+	case 127:
 		all_notes_off(channel);
 		break;
 	default:
 		break;
 	}
+}
+
+void SynthEngine::set_master_volume(uint16_t value14) noexcept
+{
+	value14 = (std::min)(value14, uint16_t{16383});
+	master_volume_ = static_cast<float>(value14) / 16383.0f;
+	if (voice_model_ == VoiceModel::Cohorts && cohort_engine_)
+		cohort_engine_->invalidate_all_onset_merges();
 }
 
 void SynthEngine::program_change(uint8_t channel, uint8_t program) noexcept
@@ -637,7 +700,8 @@ void SynthEngine::render_audio(float* out, uint32_t frames) noexcept
 			}
 
 			const ChannelState& channel = channels_[voice.channel];
-			const float amplitude = envelope * channel.volume * channel.expression;
+			const float amplitude = envelope * channel.volume * channel.expression *
+				master_volume_;
 			out[static_cast<size_t>(frame) * 2] += sample_l * voice.gain_l * amplitude;
 			out[static_cast<size_t>(frame) * 2 + 1] += sample_r * voice.gain_r * amplitude;
 

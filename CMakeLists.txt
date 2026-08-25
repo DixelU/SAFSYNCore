@@ -8,6 +8,7 @@ add_library(safsyn STATIC
 	SAFSYN/core.cpp
 	SAFSYN/cohort_engine.cpp
 	SAFSYN/engine.cpp
+	SAFSYN/mastering.cpp
 	SAFSYN/phase.cpp
 	SAFSYN/smf.cpp
 	SAFSYN/smf_renderer.cpp
@@ -67,6 +68,13 @@ if(SAFSYN_BUILD_TESTS)
 		target_compile_options(safsyn-cohort-tests PRIVATE /EHsc)
 	endif()
 	add_test(NAME safsyn-cohorts COMMAND safsyn-cohort-tests)
+	add_executable(safsyn-mastering-tests tests/mastering_tests.cpp)
+	target_link_libraries(safsyn-mastering-tests PRIVATE SAFSYN::safsyn)
+	target_compile_features(safsyn-mastering-tests PRIVATE cxx_std_20)
+	if(MSVC)
+		target_compile_options(safsyn-mastering-tests PRIVATE /EHsc)
+	endif()
+	add_test(NAME safsyn-mastering COMMAND safsyn-mastering-tests)
 	add_executable(safsyn-smf-tests tests/smf_tests.cpp)
 	target_link_libraries(safsyn-smf-tests PRIVATE SAFSYN::safsyn)
 	target_compile_features(safsyn-smf-tests PRIVATE cxx_std_20)
