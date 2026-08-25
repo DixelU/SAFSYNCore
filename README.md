@@ -15,8 +15,9 @@ and platform audio drivers so DSP experiments retain a reproducible baseline.
 - `safsyn-smf-tests`: SMF parsing, timing, merge, streaming, and RF64 tests
 - `SAFSYN/dllmain.cpp`: preserved Windows driver sketch, excluded by default
 
-The coherent engine supports configurable preallocated polyphony, deterministic
-voice stealing, pitch and pitch bend, linear interpolation, AHDSR envelopes,
+The coherent engine supports the preserved fixed individual-voice reference
+path plus dynamically growing exact onset cohorts for normal offline SMF
+rendering, deterministic safety-limit stealing, pitch and pitch bend, linear interpolation, AHDSR envelopes,
 note-off and sustain behavior, forward and ping-pong loops, stereo samples,
 constant-power panning, channel volume/expression, and unclipped float mixing.
 SF2 playback resolves preset zones through instruments to sample zones, combines
@@ -65,6 +66,7 @@ Or stream a bounded or complete render directly to RIFF/RF64 WAV:
 ```text
 build/Release/safsyn-render input.mid piano.sf2 output.wav --bank 0 --program 0 --tail-seconds 2
 build/Release/safsyn-render input.mid piano.sf2 excerpt.wav --max-render-seconds 30 --phase-mode analytic --phase-continuous --phase-seed 7
+build/Release/safsyn-render input.mid piano.sf2 drained.wav --drain-tail --max-tail-seconds 30
 ```
 
 SMF types 0 and 1, PPQN and SMPTE timing, running status, tempo changes,
@@ -72,7 +74,11 @@ channel events, safely skipped SysEx/meta payloads, and deterministic multi-trac
 merge are supported. Type 2 is rejected. Input bytes are buffered, but parser
 and scheduler state is O(track count); audio output is streamed in fixed blocks.
 `--max-render-seconds` bounds both event dispatch and output, while
-`--tail-seconds` controls the natural-end release tail.
+`--tail-seconds` controls the fixed natural-end release tail. SMF rendering uses
+exact cohorts by default. `--individual-voices --voices N` selects the fixed
+reference path, while `--max-cohorts N` gives cohorts an explicit deterministic
+safety ceiling; zero means dynamic offline growth. `--drain-tail` renders until
+all represented logical voices finish or `--max-tail-seconds` is reached.
 
 Run an opt-in phase experiment with the same scripted events:
 
@@ -88,6 +94,10 @@ Available modes are `coherent`, `polarity`, `analytic`, `smooth-field`, and
 default, strength zero takes the exact coherent path, and no experimental mode
 has been selected as a production default.
 
+SMF analysis also reports identical-note group histograms, group locations,
+logical-note/cohort peak estimates, and onset compression. These are MIDI-only
+estimates; exact post-preset region/cohort statistics are reported by renders.
+
 ## Project boundary
 
 `SAFSYN_BUILD_WINMM` defaults to `OFF`. Enabling it only compiles the preserved
@@ -96,3 +106,5 @@ DLL shell; it does not claim a functioning WinMM/WASAPI backend. See
 phase architecture, measurements, and evidence boundaries. See
 `docs/SMF_RENDERER.md` for the file/scheduling contract and the `Hypernova.mid`
 integration evidence.
+See `docs/BLACK_MIDI_COHORTS.md` for logical-note/cohort architecture, tail
+drain, validation, and the measured Hypernova compression limit.

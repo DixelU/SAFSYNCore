@@ -160,6 +160,20 @@ std::vector<uint8_t> render_fixture_midi(bool sustain)
 	return make_smf(0, 100, {track});
 }
 
+std::vector<uint8_t> mass_duplicate_fixture(uint32_t count)
+{
+	std::vector<uint8_t> track;
+	track.reserve(static_cast<size_t>(count) * 8 + 16);
+	for (uint32_t index = 0; index < count; ++index)
+		track.insert(track.end(), {0x00, 0x90, 0x3c, 0x64});
+	append_vlq(track, 100);
+	track.insert(track.end(), {0x80, 0x3c, 0x40});
+	for (uint32_t index = 1; index < count; ++index)
+		track.insert(track.end(), {0x00, 0x80, 0x3c, 0x40});
+	append_eot(track);
+	return make_smf(0, 100, {track});
+}
+
 void test_type0_running_status_and_usage()
 {
 	safsyn::SmfFile file;
@@ -408,6 +422,83 @@ void test_streamed_render_determinism(const std::filesystem::path& directory)
 		routed_result.engine.started_voices == 2,
 		"SMF bank select and program change route through the existing engine API");
 }
+
+void test_cohort_histogram_and_mass_dispatch(const std::filesystem::path& directory)
+{
+	constexpr uint32_t event_count = 51911;
+	safsyn::SmfFile file;
+	check(file.load_bytes(mass_duplicate_fixture(event_count)),
+		"51,911-event same-sample cohort fixture loads");
+	safsyn::SmfAnalysisOptions analysis_options;
+	analysis_options.sample_rate = 1000;
+	analysis_options.tail_frames = 20;
+	safsyn::SmfAnalysis analysis;
+	check(safsyn::analyze_smf(file, analysis_options, analysis),
+		"51,911-event cohort fixture analyzes");
+	check(analysis.note_on_groups == 1 && analysis.note_off_groups == 1 &&
+		analysis.largest_identical_note_on_group == event_count &&
+		analysis.largest_identical_note_off_group == event_count &&
+		analysis.estimated_peak_active_logical_notes == event_count &&
+		analysis.estimated_peak_same_onset_cohorts == 1 &&
+		analysis.estimated_same_onset_compression_ratio == event_count,
+		"analysis measures exact note groups, logical peak, and same-onset compression");
+	check(analysis.note_on_group_histogram.size() == 1 &&
+		analysis.note_on_group_histogram[0].group_size == event_count &&
+		analysis.note_on_group_histogram[0].groups == 1 &&
+		analysis.note_on_group_histogram[0].events == event_count,
+		"note-on group histogram retains group, run, and covered-event counts");
+
+	auto bank = make_bank(1000);
+	safsyn::SmfRenderOptions options;
+	options.sample_rate = 1000;
+	options.tail_frames = 20;
+	options.block_frames = 17;
+	const auto path = directory / "mass-cohort.wav";
+	safsyn::SmfRenderResult result;
+	check(safsyn::render_smf_stream(file, analysis, bank, path.string().c_str(),
+		options, result), "51,911-event cohort fixture renders");
+	check(result.engine.logical_voices_started == event_count &&
+		result.engine.peak_active_logical_voices == event_count &&
+		result.engine.peak_active_cohorts == 1 &&
+		result.engine.logical_voices_merged == event_count - 1 &&
+		result.engine.maximum_cohort_multiplicity == event_count &&
+		result.engine.cohort_capacity_steals == 0 && result.engine.stolen_voices == 0,
+		"same-sample SMF batching represents 51,911 identities in one onset cohort");
+}
+
+void test_tail_drain(const std::filesystem::path& directory)
+{
+	std::vector<uint8_t> track = {0x00, 0x90, 0x3c, 0x64};
+	append_eot(track, 100);
+	safsyn::SmfFile file;
+	check(file.load_bytes(make_smf(0, 100, {track})), "tail-drain fixture loads");
+	safsyn::SmfAnalysisOptions analysis_options;
+	analysis_options.sample_rate = 1000;
+	analysis_options.tail_frames = 100;
+	safsyn::SmfAnalysis analysis;
+	check(safsyn::analyze_smf(file, analysis_options, analysis),
+		"tail-drain fixture analyzes");
+	auto bank = make_bank(1000);
+	safsyn::SmfRenderOptions options;
+	options.sample_rate = 1000;
+	options.drain_tail = true;
+	options.maximum_tail_frames = 100;
+	options.block_frames = 37;
+	const auto drained_path = directory / "tail-drained.wav";
+	safsyn::SmfRenderResult drained;
+	check(safsyn::render_smf_stream(file, analysis, bank, drained_path.string().c_str(),
+		options, drained) && drained.active_voices_at_end == 0 &&
+		!drained.tail_ceiling_reached && drained.tail_frames_written == 10,
+		"tail drain stops exactly when the final logical voice becomes inactive");
+
+	options.maximum_tail_frames = 5;
+	const auto bounded_path = directory / "tail-bounded.wav";
+	safsyn::SmfRenderResult bounded;
+	check(safsyn::render_smf_stream(file, analysis, bank, bounded_path.string().c_str(),
+		options, bounded) && bounded.active_voices_at_end != 0 &&
+		bounded.tail_ceiling_reached && bounded.tail_frames_written == 5,
+		"tail drain reports an explicit maximum-tail ceiling");
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -420,6 +511,8 @@ int main(int argc, char** argv)
 	test_skipped_meta_sysex_and_malformed_inputs();
 	test_streamed_wav_headers(directory);
 	test_streamed_render_determinism(directory);
+	test_cohort_histogram_and_mass_dispatch(directory);
+	test_tail_drain(directory);
 	if (failures != 0)
 	{
 		std::cerr << failures << " SMF test(s) failed\n";

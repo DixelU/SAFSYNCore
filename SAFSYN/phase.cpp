@@ -590,12 +590,13 @@ struct PhaseProcessor::Impl
 	}
 
 	PhaseVoiceState make_state(const SampleRegion& region, uint64_t region_id,
-		uint64_t serial, uint8_t channel, uint8_t note)
+		uint64_t serial, uint8_t channel, uint8_t note, bool record_assignment)
 	{
 		PhaseVoiceState state;
 		if (settings.mode == PhaseMode::Coherent || settings.strength <= 0.0f)
 			return state;
-		++statistics.assignments;
+		if (record_assignment)
+			++statistics.assignments;
 		state.attack_hold_frames = static_cast<uint32_t>(std::clamp<int64_t>(std::llround(
 			settings.preserve_attack_ms * 0.001 * region.sample_rate), 0, region.pcm_len));
 		if (state.attack_hold_frames < region.pcm_len && settings.preserve_attack_ms > 0.0f)
@@ -692,11 +693,26 @@ PhaseVoiceState PhaseProcessor::assign(const SampleRegion& region, uint64_t regi
 		return {};
 	try
 	{
-		return impl_->make_state(region, region_id, event_serial, channel, note);
+		return impl_->make_state(region, region_id, event_serial, channel, note, true);
 	}
 	catch (...)
 	{
 		++impl_->statistics.failures;
+		return {};
+	}
+}
+
+PhaseVoiceState PhaseProcessor::reconstruct(const SampleRegion& region, uint64_t region_id,
+	uint64_t event_serial, uint8_t channel, uint8_t note) noexcept
+{
+	if (!impl_)
+		return {};
+	try
+	{
+		return impl_->make_state(region, region_id, event_serial, channel, note, false);
+	}
+	catch (...)
+	{
 		return {};
 	}
 }

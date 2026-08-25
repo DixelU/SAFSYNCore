@@ -109,6 +109,11 @@ public:
 	void clear() noexcept;
 	PhaseVoiceState assign(const SampleRegion& region, uint64_t region_id,
 		uint64_t event_serial, uint8_t channel, uint8_t note) noexcept;
+	// Rebuild an already-assigned logical event contribution without counting a
+	// second assignment. Cohort note-off splitting uses this to subtract the
+	// exact deterministic phase contribution without storing every event angle.
+	PhaseVoiceState reconstruct(const SampleRegion& region, uint64_t region_id,
+		uint64_t event_serial, uint8_t channel, uint8_t note) noexcept;
 	PhaseCacheStats stats() const noexcept;
 
 private:

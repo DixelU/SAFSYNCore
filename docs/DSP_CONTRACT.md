@@ -54,6 +54,12 @@ It must not be described or measured as phase-only processing.
   measurement fixtures cover 1, 8, 32, and 64. Continuous analytic mode derives
   an angle directly from the stable event identity.
 - Stereo partners use the same analytic angle or FFT phase sheet.
+- Exact render cohorts retain every logical event serial. Analytic cohorts sum
+  per-event left/right cosine and sine terms including angle-dependent RMS
+  scales; a logical batch never receives one shared phase angle.
+- Multiplicity-one cohorts use the original per-voice phase operation exactly.
+  Grouped cohorts may differ from the individual reference only through
+  floating summation order.
 - Looping regions use separately transformed periodic loop bodies with a
   bounded entry crossfade rather than wrapping an arbitrary transformed tail.
 - A protected attack is copied exactly, followed by a 10 ms smoothstep blend
@@ -101,6 +107,14 @@ before the configured tail is rendered. A maximum-render limit is a hard output
 boundary: events on or after its exclusive frame are not dispatched. SMF input
 and decoded PCM remain buffered, so this milestone does not claim constant
 whole-process memory or realtime note-dispatch safety.
+
+Normal offline SMF rendering uses dynamically growing exact same-onset cohorts;
+the fixed individual path remains available as the reference mode. A cohort
+safety limit is explicit and deterministic rather than an implicit 512-voice
+ceiling. Optional tail drain renders until all represented logical voices end
+or a configured maximum tail is reached. Hypernova analysis shows that exact
+same-onset grouping does not materially compress its active peak; the measured
+boundary is documented in `BLACK_MIDI_COHORTS.md`.
 
 ## Piano integration baselines
 

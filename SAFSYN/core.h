@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -90,21 +91,45 @@ struct RenderStats
 	uint64_t started_voices = 0;
 	uint64_t stolen_voices = 0;
 	size_t peak_active_voices = 0;
+	uint64_t logical_voices_started = 0;
+	size_t peak_active_logical_voices = 0;
+	uint64_t cohorts_created = 0;
+	size_t peak_active_cohorts = 0;
+	uint64_t logical_voices_merged = 0;
+	uint64_t cohort_splits = 0;
+	uint64_t cohort_merges = 0;
+	uint64_t cohort_capacity_steals = 0;
+	double average_cohort_multiplicity = 0.0;
+	uint64_t maximum_cohort_multiplicity = 0;
 };
+
+enum class VoiceModel : uint8_t
+{
+	Individual,
+	Cohorts,
+};
+
+class CohortEngine;
+struct CohortEngineState;
 
 class SynthEngine
 {
 public:
 	explicit SynthEngine(uint32_t sample_rate = 48000, size_t voice_capacity = 256);
+	~SynthEngine();
 
 	SynthEngine(const SynthEngine&) = delete;
 	SynthEngine& operator=(const SynthEngine&) = delete;
-	SynthEngine(SynthEngine&&) noexcept = default;
-	SynthEngine& operator=(SynthEngine&&) noexcept = default;
+	SynthEngine(SynthEngine&&) noexcept;
+	SynthEngine& operator=(SynthEngine&&) noexcept;
 
 	uint32_t sample_rate() const noexcept { return sample_rate_; }
+	// The constructor reserve/capacity belongs to the individual reference path.
+	// Cohorts grow dynamically unless maximum_cohorts() is nonzero.
 	size_t voice_capacity() const noexcept { return voices_.size(); }
+	// In cohort mode this is represented logical region voices, not slot count.
 	size_t active_voice_count() const noexcept;
+	size_t active_cohort_count() const noexcept;
 	const RenderStats& stats() const noexcept { return stats_; }
 	const PhaseSettings& phase_settings() const noexcept { return phase_processor_.settings(); }
 	PhaseCacheStats phase_cache_stats() const noexcept { return phase_processor_.stats(); }
@@ -116,13 +141,22 @@ public:
 
 	void reset() noexcept;
 	void note_on(uint8_t channel, uint8_t note, uint8_t velocity) noexcept;
+	void note_on_batch(uint8_t channel, uint8_t note, uint8_t velocity,
+		uint64_t count) noexcept;
 	void note_off(uint8_t channel, uint8_t note) noexcept;
+	void note_off_batch(uint8_t channel, uint8_t note, uint64_t count) noexcept;
 	void control_change(uint8_t channel, uint8_t controller, uint8_t value) noexcept;
 	void program_change(uint8_t channel, uint8_t program) noexcept;
 	void set_pitch_bend(uint8_t channel, uint16_t value14) noexcept;
 	void consume_short_message(uint32_t packed_message) noexcept;
+	// Stable-order dispatch that combines only consecutive compatible note runs.
+	void consume_short_messages(const uint32_t* packed_messages, size_t count) noexcept;
 	void render_audio(float* interleaved_stereo, uint32_t frames) noexcept;
 	void set_phase_settings(const PhaseSettings& settings) noexcept;
+	// A zero cohort ceiling means dynamic offline growth without stealing.
+	void set_voice_model(VoiceModel model, size_t maximum_cohorts = 0) noexcept;
+	VoiceModel voice_model() const noexcept { return voice_model_; }
+	size_t maximum_cohorts() const noexcept { return maximum_cohorts_; }
 
 	// Explicit compatibility/stress path for reproducing the old flattened SF2
 	// behavior. Normal playback always selects the channel bank and program.
@@ -178,13 +212,18 @@ private:
 	void update_channel_pitch(uint8_t channel) noexcept;
 	void all_notes_off(uint8_t channel) noexcept;
 	void silence_all() noexcept;
+	friend class CohortEngine;
+	friend struct CohortEngineState;
 
 	const Soundfont* soundfont_ = nullptr;
 	std::vector<Voice> voices_;
+	std::unique_ptr<CohortEngine> cohort_engine_;
 	ChannelState channels_[16] = {};
 	uint32_t sample_rate_ = 48000;
 	uint64_t next_serial_ = 1;
 	bool all_regions_mode_ = false;
+	VoiceModel voice_model_ = VoiceModel::Individual;
+	size_t maximum_cohorts_ = 0;
 	PhaseProcessor phase_processor_;
 	RenderStats stats_;
 };

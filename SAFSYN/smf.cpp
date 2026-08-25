@@ -693,6 +693,22 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 	}
 	try
 	{
+		struct ActiveOnsetGroup
+		{
+			uint64_t held = 0;
+			uint64_t sustained = 0;
+			bool counted = true;
+		};
+		struct NoteRun
+		{
+			bool valid = false;
+			bool note_on = false;
+			uint8_t channel = 0;
+			uint8_t note = 0;
+			uint8_t velocity = 0;
+			uint64_t sample = 0;
+			uint64_t count = 0;
+		};
 		ScheduledSmfStream stream(file, options.sample_rate);
 		std::array<uint8_t, 16> bank_msb{};
 		std::array<uint8_t, 16> bank_lsb{};
@@ -704,6 +720,129 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 			programs[channel] = options.initial_program;
 		}
 		std::map<uint32_t, uint64_t> usage;
+		std::map<uint64_t, uint64_t> note_on_histogram;
+		std::map<uint64_t, uint64_t> note_off_histogram;
+		using NoteOnGroupKey = std::tuple<uint8_t, uint8_t, uint8_t, uint64_t>;
+		using NoteOffGroupKey = std::tuple<uint8_t, uint8_t, uint64_t>;
+		std::map<NoteOnGroupKey, uint64_t> sample_note_on_groups;
+		std::map<NoteOffGroupKey, uint64_t> sample_note_off_groups;
+		std::array<uint64_t, 16> channel_semantic_epoch{};
+		uint64_t compatible_group_sample = 0;
+		bool have_compatible_group_sample = false;
+		std::array<std::vector<ActiveOnsetGroup>, 16 * 128> active_groups;
+		std::array<bool, 16> sustain{};
+		uint64_t active_logical_notes = 0;
+		uint64_t active_onset_cohorts = 0;
+		NoteRun note_run;
+		auto finalize_compatible_groups = [&]() {
+			for (const auto& [key, count] : sample_note_on_groups)
+			{
+				(void)key;
+				++note_on_histogram[count];
+				++analysis.note_on_groups;
+				analysis.largest_identical_note_on_group = (std::max)(
+					analysis.largest_identical_note_on_group, count);
+				if (count == analysis.largest_identical_note_on_group)
+					analysis.largest_note_on_group_sample = compatible_group_sample;
+			}
+			for (const auto& [key, count] : sample_note_off_groups)
+			{
+				(void)key;
+				++note_off_histogram[count];
+				++analysis.note_off_groups;
+				analysis.largest_identical_note_off_group = (std::max)(
+					analysis.largest_identical_note_off_group, count);
+				if (count == analysis.largest_identical_note_off_group)
+					analysis.largest_note_off_group_sample = compatible_group_sample;
+			}
+			sample_note_on_groups.clear();
+			sample_note_off_groups.clear();
+		};
+		auto update_peaks = [&]() {
+			analysis.estimated_peak_active_logical_notes = (std::max)(
+				analysis.estimated_peak_active_logical_notes, active_logical_notes);
+			analysis.estimated_peak_same_onset_cohorts = (std::max)(
+				analysis.estimated_peak_same_onset_cohorts, active_onset_cohorts);
+		};
+		auto retire_empty = [&](ActiveOnsetGroup& group) {
+			if (group.counted && group.held == 0 && group.sustained == 0)
+			{
+				group.counted = false;
+				--active_onset_cohorts;
+			}
+		};
+		auto trim_retired_back = [](std::vector<ActiveOnsetGroup>& groups) {
+			while (!groups.empty() && !groups.back().counted)
+				groups.pop_back();
+		};
+		auto release_notes = [&](uint8_t channel, uint8_t note, uint64_t count) {
+			auto& groups = active_groups[static_cast<size_t>(channel) * 128 + note];
+			while (count != 0)
+			{
+				auto found = groups.rend();
+				for (auto it = groups.rbegin(); it != groups.rend(); ++it)
+					if (it->held != 0)
+					{
+						found = it;
+						break;
+					}
+				if (found == groups.rend())
+					break;
+				const uint64_t released = (std::min)(count, found->held);
+				found->held -= released;
+				if (sustain[channel])
+					found->sustained += released;
+				else
+					active_logical_notes -= released;
+				count -= released;
+				retire_empty(*found);
+				trim_retired_back(groups);
+			}
+		};
+		auto finalize_note_run = [&]() {
+			if (!note_run.valid || note_run.count == 0)
+				return;
+			if (note_run.note_on)
+			{
+				auto& groups = active_groups[static_cast<size_t>(note_run.channel) * 128 +
+					note_run.note];
+				groups.push_back({note_run.count, 0, true});
+				active_logical_notes += note_run.count;
+				++active_onset_cohorts;
+				update_peaks();
+			}
+			else
+			{
+				release_notes(note_run.channel, note_run.note, note_run.count);
+			}
+			note_run = {};
+		};
+		auto release_sustain = [&](uint8_t channel) {
+			for (uint16_t note = 0; note < 128; ++note)
+			{
+				auto& groups = active_groups[static_cast<size_t>(channel) * 128 + note];
+				for (auto& group : groups)
+				{
+					active_logical_notes -= group.sustained;
+					group.sustained = 0;
+					retire_empty(group);
+				}
+				trim_retired_back(groups);
+			}
+		};
+		auto release_channel = [&](uint8_t channel) {
+			for (uint16_t note = 0; note < 128; ++note)
+			{
+				auto& groups = active_groups[static_cast<size_t>(channel) * 128 + note];
+				for (const auto& group : groups)
+				{
+					active_logical_notes -= group.held + group.sustained;
+					if (group.counted)
+						--active_onset_cohorts;
+				}
+				groups.clear();
+			}
+		};
 		uint64_t tick_group = 0;
 		uint64_t sample_group = 0;
 		uint64_t group_tick = 0;
@@ -712,6 +851,15 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 		ScheduledSmfEvent scheduled;
 		while (stream.next(scheduled))
 		{
+			if (note_run.valid && scheduled.sample != note_run.sample)
+				finalize_note_run();
+			if (!have_compatible_group_sample || scheduled.sample != compatible_group_sample)
+			{
+				if (have_compatible_group_sample)
+					finalize_compatible_groups();
+				compatible_group_sample = scheduled.sample;
+				have_compatible_group_sample = true;
+			}
 			++analysis.total_events;
 			if (first || scheduled.event.tick != group_tick)
 			{
@@ -724,10 +872,18 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 				group_sample = scheduled.sample;
 			}
 			first = false;
-			analysis.maximum_events_same_tick = (std::max)(
-				analysis.maximum_events_same_tick, ++tick_group);
-			analysis.maximum_events_same_sample = (std::max)(
-				analysis.maximum_events_same_sample, ++sample_group);
+			++tick_group;
+			if (tick_group > analysis.maximum_events_same_tick)
+			{
+				analysis.maximum_events_same_tick = tick_group;
+				analysis.maximum_events_tick_location = scheduled.event.tick;
+			}
+			++sample_group;
+			if (sample_group > analysis.maximum_events_same_sample)
+			{
+				analysis.maximum_events_same_sample = sample_group;
+				analysis.maximum_events_sample_location = scheduled.sample;
+			}
 			analysis.last_tick = scheduled.event.tick;
 			analysis.duration_frames = scheduled.sample;
 
@@ -738,10 +894,54 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 				++analysis.channel_events;
 				const uint8_t command = scheduled.event.status & 0xf0U;
 				const uint8_t channel = scheduled.event.status & 0x0fU;
+				const bool is_note_on = command == 0x90 && scheduled.event.data2 != 0;
+				const bool is_note_off = command == 0x80 ||
+					(command == 0x90 && scheduled.event.data2 == 0);
+				if (is_note_on || is_note_off)
+				{
+					const uint8_t velocity = is_note_on ? scheduled.event.data2 : 0;
+					if (is_note_on)
+						++sample_note_on_groups[NoteOnGroupKey{channel,
+							scheduled.event.data1, velocity, channel_semantic_epoch[channel]}];
+					else
+						++sample_note_off_groups[NoteOffGroupKey{channel,
+							scheduled.event.data1, channel_semantic_epoch[channel]}];
+					const bool same_run = note_run.valid && note_run.sample == scheduled.sample &&
+						note_run.note_on == is_note_on && note_run.channel == channel &&
+						note_run.note == scheduled.event.data1 &&
+						(!is_note_on || note_run.velocity == velocity);
+					if (!same_run)
+					{
+						finalize_note_run();
+						note_run = {true, is_note_on, channel, scheduled.event.data1,
+							velocity, scheduled.sample, 0};
+					}
+					++note_run.count;
+				}
+				else
+				{
+					finalize_note_run();
+					++channel_semantic_epoch[channel];
+				}
 				if (command == 0xb0)
 				{
 					if (scheduled.event.data1 == 0) bank_msb[channel] = scheduled.event.data2;
 					if (scheduled.event.data1 == 32) bank_lsb[channel] = scheduled.event.data2;
+					if (scheduled.event.data1 == 64)
+					{
+						const bool was_down = sustain[channel];
+						sustain[channel] = scheduled.event.data2 >= 64;
+						if (was_down && !sustain[channel])
+							release_sustain(channel);
+					}
+					if (scheduled.event.data1 == 121)
+					{
+						if (sustain[channel])
+							release_sustain(channel);
+						sustain[channel] = false;
+					}
+					if (scheduled.event.data1 == 123)
+						release_channel(channel);
 				}
 				else if (command == 0xc0)
 					programs[channel] = scheduled.event.data1;
@@ -771,6 +971,9 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 				break;
 			}
 		}
+		finalize_note_run();
+		if (have_compatible_group_sample)
+			finalize_compatible_groups();
 		analysis.parser_state_bytes = stream.state_bytes();
 		analysis.diagnostics = stream.diagnostics();
 		if (!stream.good())
@@ -806,6 +1009,14 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 			analysis.bank_program_usage.push_back({static_cast<uint8_t>(key >> 21),
 				static_cast<uint16_t>((key >> 7) & 0x3fffU), static_cast<uint8_t>(key & 0x7fU),
 				count});
+		analysis.note_on_group_histogram.reserve(note_on_histogram.size());
+		for (const auto& [size, groups] : note_on_histogram)
+			analysis.note_on_group_histogram.push_back({size, groups, size * groups});
+		analysis.note_off_group_histogram.reserve(note_off_histogram.size());
+		for (const auto& [size, groups] : note_off_histogram)
+			analysis.note_off_group_histogram.push_back({size, groups, size * groups});
+		analysis.estimated_same_onset_compression_ratio = analysis.note_on_groups == 0 ? 0.0 :
+			static_cast<double>(analysis.note_ons) / static_cast<double>(analysis.note_on_groups);
 		return true;
 	}
 	catch (...)

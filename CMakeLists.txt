@@ -6,6 +6,7 @@ option(SAFSYN_BUILD_WINMM "Build the experimental Windows DLL shell" OFF)
 
 add_library(safsyn STATIC
 	SAFSYN/core.cpp
+	SAFSYN/cohort_engine.cpp
 	SAFSYN/engine.cpp
 	SAFSYN/phase.cpp
 	SAFSYN/smf.cpp
@@ -59,6 +60,13 @@ if(SAFSYN_BUILD_TESTS)
 		target_compile_options(safsyn-phase-tests PRIVATE /EHsc)
 	endif()
 	add_test(NAME safsyn-phase COMMAND safsyn-phase-tests)
+	add_executable(safsyn-cohort-tests tests/cohort_tests.cpp)
+	target_link_libraries(safsyn-cohort-tests PRIVATE SAFSYN::safsyn)
+	target_compile_features(safsyn-cohort-tests PRIVATE cxx_std_20)
+	if(MSVC)
+		target_compile_options(safsyn-cohort-tests PRIVATE /EHsc)
+	endif()
+	add_test(NAME safsyn-cohorts COMMAND safsyn-cohort-tests)
 	add_executable(safsyn-smf-tests tests/smf_tests.cpp)
 	target_link_libraries(safsyn-smf-tests PRIVATE SAFSYN::safsyn)
 	target_compile_features(safsyn-smf-tests PRIVATE cxx_std_20)

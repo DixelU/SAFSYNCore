@@ -182,7 +182,18 @@ void print_smf_analysis(const safsyn::SmfAnalysis& analysis, uint32_t sample_rat
 		<< " tempo_changes=" << analysis.tempo_changes
 		<< " sysex_events=" << analysis.sysex_events
 		<< " max_events_tick=" << analysis.maximum_events_same_tick
+		<< " max_events_tick_at=" << analysis.maximum_events_tick_location
 		<< " max_events_sample=" << analysis.maximum_events_same_sample
+		<< " max_events_sample_at=" << analysis.maximum_events_sample_location
+		<< " note_on_groups=" << analysis.note_on_groups
+		<< " largest_note_on_group=" << analysis.largest_identical_note_on_group
+		<< " largest_note_on_group_at=" << analysis.largest_note_on_group_sample
+		<< " note_off_groups=" << analysis.note_off_groups
+		<< " largest_note_off_group=" << analysis.largest_identical_note_off_group
+		<< " largest_note_off_group_at=" << analysis.largest_note_off_group_sample
+		<< " estimated_peak_logical_notes=" << analysis.estimated_peak_active_logical_notes
+		<< " estimated_peak_onset_cohorts=" << analysis.estimated_peak_same_onset_cohorts
+		<< " estimated_onset_compression=" << analysis.estimated_same_onset_compression_ratio
 		<< " parser_state_bytes=" << analysis.parser_state_bytes
 		<< " input_bytes=" << analysis.input_bytes
 		<< " estimated_output_frames=" << bounded_frames
@@ -202,6 +213,22 @@ void print_smf_analysis(const safsyn::SmfAnalysis& analysis, uint32_t sample_rat
 	if (shown < analysis.bank_program_usage.size())
 		std::cout << ";+" << (analysis.bank_program_usage.size() - shown) << "_more";
 	std::cout << '\n';
+	auto print_histogram = [](const char* name,
+		const std::vector<safsyn::SmfGroupHistogramEntry>& histogram) {
+		std::cout << name << '=';
+		const size_t shown_entries = (std::min)(histogram.size(), size_t{64});
+		for (size_t index = 0; index < shown_entries; ++index)
+		{
+			if (index != 0) std::cout << ';';
+			const auto& entry = histogram[index];
+			std::cout << entry.group_size << 'x' << entry.groups << '(' << entry.events << ')';
+		}
+		if (shown_entries < histogram.size())
+			std::cout << ";+" << (histogram.size() - shown_entries) << "_more";
+		std::cout << '\n';
+	};
+	print_histogram("note_on_group_histogram", analysis.note_on_group_histogram);
+	print_histogram("note_off_group_histogram", analysis.note_off_group_histogram);
 }
 
 int run_smf(int argc, char** argv)
@@ -227,10 +254,14 @@ int run_smf(int argc, char** argv)
 
 		uint32_t sample_rate = 48000;
 		size_t voice_capacity = 256;
+		size_t maximum_cohorts = 0;
+		safsyn::VoiceModel voice_model = safsyn::VoiceModel::Cohorts;
 		uint32_t bank = 0;
 		uint32_t program = 0;
 		bool all_regions = false;
 		double tail_seconds = 2.0;
+		bool drain_tail = false;
+		double maximum_tail_seconds = 30.0;
 		double maximum_seconds = 0.0;
 		bool maximum_set = false;
 		uint32_t block_frames = 256;
@@ -243,6 +274,12 @@ int run_smf(int argc, char** argv)
 				sample_rate = static_cast<uint32_t>(std::stoul(argv[++index]));
 			else if (option == "--voices" && index + 1 < argc)
 				voice_capacity = static_cast<size_t>(std::stoull(argv[++index]));
+			else if (option == "--max-cohorts" && index + 1 < argc)
+				maximum_cohorts = static_cast<size_t>(std::stoull(argv[++index]));
+			else if (option == "--individual-voices")
+				voice_model = safsyn::VoiceModel::Individual;
+			else if (option == "--cohorts")
+				voice_model = safsyn::VoiceModel::Cohorts;
 			else if (option == "--bank" && index + 1 < argc)
 				bank = static_cast<uint32_t>(std::stoul(argv[++index]));
 			else if (option == "--program" && index + 1 < argc)
@@ -250,6 +287,10 @@ int run_smf(int argc, char** argv)
 			else if (option == "--all-regions") all_regions = true;
 			else if (option == "--tail-seconds" && index + 1 < argc)
 				tail_seconds = std::stod(argv[++index]);
+			else if (option == "--drain-tail")
+				drain_tail = true;
+			else if (option == "--max-tail-seconds" && index + 1 < argc)
+				maximum_tail_seconds = std::stod(argv[++index]);
 			else if (option == "--max-render-seconds" && index + 1 < argc)
 			{
 				maximum_seconds = std::stod(argv[++index]);
@@ -275,6 +316,7 @@ int run_smf(int argc, char** argv)
 		}
 
 		uint64_t tail_frames = 0;
+		uint64_t maximum_tail_frames = 0;
 		uint64_t maximum_frames = 0;
 		if (sample_rate < 8000 || sample_rate > 384000 || voice_capacity == 0 ||
 			bank > 16383 || program > 127 || block_frames == 0 || block_frames > 1'048'576U ||
@@ -282,6 +324,8 @@ int run_smf(int argc, char** argv)
 			phase_settings.pool_size == 0 || phase_settings.pool_size > 64 ||
 			phase_settings.correlation_hz <= 0.0f || phase_settings.preserve_attack_ms < 0.0f ||
 			!seconds_to_frames(tail_seconds, sample_rate, tail_frames) ||
+			!seconds_to_frames(maximum_tail_seconds, sample_rate, maximum_tail_frames) ||
+			(drain_tail && maximum_tail_frames == 0) ||
 			(maximum_set && (maximum_seconds <= 0.0 ||
 				!seconds_to_frames(maximum_seconds, sample_rate, maximum_frames) ||
 				maximum_frames == 0)))
@@ -300,7 +344,7 @@ int run_smf(int argc, char** argv)
 		analysis_options.sample_rate = sample_rate;
 		analysis_options.initial_bank = static_cast<uint16_t>(bank);
 		analysis_options.initial_program = static_cast<uint8_t>(program);
-		analysis_options.tail_frames = tail_frames;
+		analysis_options.tail_frames = drain_tail ? maximum_tail_frames : tail_frames;
 		safsyn::SmfAnalysis analysis;
 		const auto analysis_started = std::chrono::steady_clock::now();
 		const bool analyzed = safsyn::analyze_smf(midi, analysis_options, analysis);
@@ -327,9 +371,13 @@ int run_smf(int argc, char** argv)
 		safsyn::SmfRenderOptions render_options;
 		render_options.sample_rate = sample_rate;
 		render_options.voice_capacity = voice_capacity;
+		render_options.voice_model = voice_model;
+		render_options.maximum_cohorts = maximum_cohorts;
 		render_options.initial_bank = static_cast<uint16_t>(bank);
 		render_options.initial_program = static_cast<uint8_t>(program);
 		render_options.tail_frames = tail_frames;
+		render_options.drain_tail = drain_tail;
+		render_options.maximum_tail_frames = maximum_tail_frames;
 		render_options.maximum_frames = maximum_frames;
 		render_options.block_frames = block_frames;
 		render_options.all_regions = all_regions;
@@ -343,6 +391,10 @@ int run_smf(int argc, char** argv)
 		print_smf_diagnostics(result.diagnostics);
 		if (!rendered)
 			return 1;
+		const uint64_t onset_cohorts = result.engine.logical_voices_started -
+			result.engine.logical_voices_merged;
+		const double cohort_compression = onset_cohorts == 0 ? 0.0 :
+			static_cast<double>(result.engine.logical_voices_started) / onset_cohorts;
 		std::cout << std::setprecision(9)
 			<< "Rendered SMF to " << output_path
 			<< " frames=" << result.frames_written
@@ -352,6 +404,21 @@ int run_smf(int argc, char** argv)
 			<< " peak_active=" << result.engine.peak_active_voices
 			<< " active_end=" << result.active_voices_at_end
 			<< " stolen=" << result.engine.stolen_voices
+			<< " voice_model=" << (voice_model == safsyn::VoiceModel::Cohorts ? "cohorts" : "individual")
+			<< " logical_started=" << result.engine.logical_voices_started
+			<< " peak_logical=" << result.engine.peak_active_logical_voices
+			<< " cohorts_created=" << result.engine.cohorts_created
+			<< " peak_cohorts=" << result.engine.peak_active_cohorts
+			<< " active_cohorts_end=" << result.active_cohorts_at_end
+			<< " logical_merged=" << result.engine.logical_voices_merged
+			<< " cohort_compression=" << cohort_compression
+			<< " cohort_splits=" << result.engine.cohort_splits
+			<< " cohort_merges=" << result.engine.cohort_merges
+			<< " cohort_capacity_steals=" << result.engine.cohort_capacity_steals
+			<< " avg_cohort_multiplicity=" << result.engine.average_cohort_multiplicity
+			<< " max_cohort_multiplicity=" << result.engine.maximum_cohort_multiplicity
+			<< " tail_frames=" << result.tail_frames_written
+			<< " tail_ceiling_reached=" << (result.tail_ceiling_reached ? "yes" : "no")
 			<< " peak=" << result.peak
 			<< " rms=" << result.rms
 			<< " container=" << (result.container == safsyn::WavContainer::Rf64 ? "RF64" : "RIFF")
@@ -440,7 +507,8 @@ void print_usage()
 		"      [--phase-seed N] [--phase-correlation-hz N]\n"
 		"      [--phase-preserve-attack-ms N]\n"
 		"  SMF: [--tail-seconds N] [--max-render-seconds N] [--analyze|--dry-run]\n"
-		"      [--block-size N]\n"
+		"      [--block-size N] [--cohorts|--individual-voices] [--max-cohorts N]\n"
+		"      [--drain-tail] [--max-tail-seconds N]\n"
 		"  Script: [--script chords|repeated] [--repeat-hz N] [--repeat-count N]\n";
 }
 }

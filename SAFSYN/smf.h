@@ -133,6 +133,13 @@ struct SmfBankProgramUsage
 	uint64_t note_ons = 0;
 };
 
+struct SmfGroupHistogramEntry
+{
+	uint64_t group_size = 0;
+	uint64_t groups = 0;
+	uint64_t events = 0;
+};
+
 struct SmfAnalysisOptions
 {
 	uint32_t sample_rate = 48000;
@@ -159,9 +166,22 @@ struct SmfAnalysis
 	uint64_t estimated_output_bytes = 0;
 	uint64_t maximum_events_same_tick = 0;
 	uint64_t maximum_events_same_sample = 0;
+	uint64_t maximum_events_tick_location = 0;
+	uint64_t maximum_events_sample_location = 0;
+	uint64_t note_on_groups = 0;
+	uint64_t note_off_groups = 0;
+	uint64_t largest_identical_note_on_group = 0;
+	uint64_t largest_identical_note_off_group = 0;
+	uint64_t largest_note_on_group_sample = 0;
+	uint64_t largest_note_off_group_sample = 0;
+	uint64_t estimated_peak_active_logical_notes = 0;
+	uint64_t estimated_peak_same_onset_cohorts = 0;
+	double estimated_same_onset_compression_ratio = 0.0;
 	size_t parser_state_bytes = 0;
 	bool requires_rf64 = false;
 	std::vector<SmfBankProgramUsage> bank_program_usage;
+	std::vector<SmfGroupHistogramEntry> note_on_group_histogram;
+	std::vector<SmfGroupHistogramEntry> note_off_group_histogram;
 	std::vector<SmfDiagnostic> diagnostics;
 };
 

@@ -43,8 +43,9 @@ floating-point value participates in event timestamps.
 ## Rendering and file output
 
 The renderer advances in fixed blocks but stops exactly at every scheduled
-sample. All events assigned to that sample are routed in merge order through
-`SynthEngine::consume_short_message`, then audio rendering continues. Bank
+sample. All channel events assigned to that sample are routed in merge order
+through the stable batched dispatch API, then audio rendering continues. Only
+compatible note runs are combined. Bank
 select, program change, sustain, note-on/off, and pitch bend therefore use the
 existing engine contract and retain phase event identity.
 
@@ -57,6 +58,8 @@ and retains its canonical RIFF bytes.
 At natural end, sustain is lifted on all channels, all non-one-shot notes are
 released, and the configured tail is streamed. `--max-render-seconds` is an
 exclusive hard boundary and can truncate both the event sequence and tail.
+An opt-in drain mode renders until all represented logical voices end, subject
+to an explicit maximum tail.
 
 ## Analysis mode
 
@@ -139,3 +142,6 @@ the pre-SMF scripted coherent WAV at SHA-256
 The current evidence is same-executable MSVC Release output. Cross-platform bit
 identity, multithreaded scheduling, realtime dispatch, and subjective listening
 remain outside the proof boundary.
+
+The follow-up logical-voice/cohort implementation, expanded analysis, and
+Hypernova compression result are documented in `BLACK_MIDI_COHORTS.md`.

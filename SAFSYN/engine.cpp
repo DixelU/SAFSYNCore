@@ -1,4 +1,5 @@
 #include "core.h"
+#include "cohort_engine.h"
 
 #include <algorithm>
 #include <cmath>
@@ -17,15 +18,28 @@ float pcm_to_float(int16_t sample) noexcept
 
 SynthEngine::SynthEngine(uint32_t sample_rate, size_t voice_capacity)
 	: voices_((std::max)(voice_capacity, size_t{1})),
+	  cohort_engine_(std::make_unique<CohortEngine>()),
 	  sample_rate_((std::max)(sample_rate, uint32_t{1}))
 {
 	reset();
 }
 
+SynthEngine::~SynthEngine() = default;
+SynthEngine::SynthEngine(SynthEngine&&) noexcept = default;
+SynthEngine& SynthEngine::operator=(SynthEngine&&) noexcept = default;
+
 size_t SynthEngine::active_voice_count() const noexcept
 {
+	if (voice_model_ == VoiceModel::Cohorts)
+		return cohort_engine_ ? cohort_engine_->active_logical_voices() : 0;
 	return static_cast<size_t>(std::count_if(voices_.begin(), voices_.end(),
 		[](const Voice& voice) { return voice.active(); }));
+}
+
+size_t SynthEngine::active_cohort_count() const noexcept
+{
+	return voice_model_ == VoiceModel::Cohorts && cohort_engine_
+		? cohort_engine_->active_cohorts() : active_voice_count();
 }
 
 void SynthEngine::set_soundfont(const Soundfont* soundfont) noexcept
@@ -41,6 +55,15 @@ void SynthEngine::set_phase_settings(const PhaseSettings& settings) noexcept
 	phase_processor_.configure(settings);
 }
 
+void SynthEngine::set_voice_model(VoiceModel model, size_t maximum_cohorts) noexcept
+{
+	silence_all();
+	voice_model_ = model;
+	maximum_cohorts_ = maximum_cohorts;
+	if (cohort_engine_)
+		cohort_engine_->configure(*this, maximum_cohorts_);
+}
+
 void SynthEngine::reset() noexcept
 {
 	silence_all();
@@ -54,6 +77,8 @@ void SynthEngine::silence_all() noexcept
 {
 	for (auto& voice : voices_)
 		voice = Voice{};
+	if (cohort_engine_)
+		cohort_engine_->clear(*this);
 }
 
 SynthEngine::Voice* SynthEngine::allocate_voice() noexcept
@@ -207,6 +232,14 @@ float SynthEngine::advance_envelope(Voice& voice) noexcept
 
 void SynthEngine::note_on(uint8_t channel, uint8_t note, uint8_t velocity) noexcept
 {
+	if (voice_model_ == VoiceModel::Cohorts)
+	{
+		if (velocity == 0)
+			note_off_batch(channel, note, 1);
+		else if (cohort_engine_)
+			cohort_engine_->note_on_batch(*this, channel, note, velocity, 1);
+		return;
+	}
 	if (velocity == 0)
 	{
 		note_off(channel, note);
@@ -249,17 +282,45 @@ void SynthEngine::note_on(uint8_t channel, uint8_t note, uint8_t velocity) noexc
 		compute_gains(region, channel, velocity, voice->gain_l, voice->gain_r);
 		begin_envelope(*voice);
 		++stats_.started_voices;
+		++stats_.logical_voices_started;
+		stats_.average_cohort_multiplicity = 1.0;
+		stats_.maximum_cohort_multiplicity = 1;
 	}
 	stats_.peak_active_voices = (std::max)(stats_.peak_active_voices, active_voice_count());
+	stats_.peak_active_logical_voices = stats_.peak_active_voices;
+}
+
+void SynthEngine::note_on_batch(uint8_t channel, uint8_t note, uint8_t velocity,
+	uint64_t count) noexcept
+{
+	if (count == 0)
+		return;
+	if (voice_model_ == VoiceModel::Cohorts)
+	{
+		if (velocity == 0)
+			note_off_batch(channel, note, count);
+		else if (cohort_engine_)
+			cohort_engine_->note_on_batch(*this, channel, note, velocity, count);
+		return;
+	}
+	for (uint64_t index = 0; index < count; ++index)
+		note_on(channel, note, velocity);
 }
 
 void SynthEngine::note_off(uint8_t channel, uint8_t note) noexcept
 {
+	if (voice_model_ == VoiceModel::Cohorts)
+	{
+		if (cohort_engine_)
+			cohort_engine_->note_off_batch(*this, channel, note, 1);
+		return;
+	}
 	if (channel >= 16)
 		return;
 	uint64_t newest_serial = 0;
 	for (const auto& voice : voices_)
-		if (voice.active() && voice.channel == channel && voice.note == note)
+		if (voice.active() && voice.stage != Voice::Stage::Release && !voice.note_off_pending &&
+			voice.channel == channel && voice.note == note)
 			newest_serial = (std::max)(newest_serial, voice.serial);
 	if (newest_serial == 0)
 		return;
@@ -278,8 +339,28 @@ void SynthEngine::note_off(uint8_t channel, uint8_t note) noexcept
 	}
 }
 
+void SynthEngine::note_off_batch(uint8_t channel, uint8_t note, uint64_t count) noexcept
+{
+	if (count == 0)
+		return;
+	if (voice_model_ == VoiceModel::Cohorts)
+	{
+		if (cohort_engine_)
+			cohort_engine_->note_off_batch(*this, channel, note, count);
+		return;
+	}
+	for (uint64_t index = 0; index < count; ++index)
+		note_off(channel, note);
+}
+
 void SynthEngine::update_channel_voice_gains(uint8_t channel) noexcept
 {
+	if (voice_model_ == VoiceModel::Cohorts)
+	{
+		if (cohort_engine_)
+			cohort_engine_->update_channel_gains(*this, channel);
+		return;
+	}
 	for (auto& voice : voices_)
 		if (voice.active() && voice.channel == channel)
 			compute_gains(*voice.region, channel, voice.velocity, voice.gain_l, voice.gain_r);
@@ -287,6 +368,12 @@ void SynthEngine::update_channel_voice_gains(uint8_t channel) noexcept
 
 void SynthEngine::update_channel_pitch(uint8_t channel) noexcept
 {
+	if (voice_model_ == VoiceModel::Cohorts)
+	{
+		if (cohort_engine_)
+			cohort_engine_->update_channel_pitch(*this, channel);
+		return;
+	}
 	for (auto& voice : voices_)
 		if (voice.active() && voice.channel == channel)
 			voice.inc = compute_increment(*voice.region, voice.note,
@@ -295,6 +382,12 @@ void SynthEngine::update_channel_pitch(uint8_t channel) noexcept
 
 void SynthEngine::all_notes_off(uint8_t channel) noexcept
 {
+	if (voice_model_ == VoiceModel::Cohorts)
+	{
+		if (cohort_engine_)
+			cohort_engine_->all_notes_off(*this, channel);
+		return;
+	}
 	for (auto& voice : voices_)
 		if (voice.active() && voice.channel == channel &&
 			voice.region->loop_mode != LoopMode::OneShot)
@@ -305,6 +398,8 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 {
 	if (channel >= 16)
 		return;
+	if (voice_model_ == VoiceModel::Cohorts && cohort_engine_)
+		cohort_engine_->invalidate_onset_merges(channel);
 	auto& state = channels_[channel];
 	switch (controller)
 	{
@@ -329,9 +424,17 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 		const bool was_down = state.sustain_pedal;
 		state.sustain_pedal = value >= 64;
 		if (was_down && !state.sustain_pedal)
-			for (auto& voice : voices_)
-				if (voice.active() && voice.channel == channel && voice.note_off_pending)
-					begin_release(voice);
+		{
+			if (voice_model_ == VoiceModel::Cohorts)
+			{
+				if (cohort_engine_)
+					cohort_engine_->release_sustained(*this, channel);
+			}
+			else
+				for (auto& voice : voices_)
+					if (voice.active() && voice.channel == channel && voice.note_off_pending)
+						begin_release(voice);
+		}
 		break;
 	}
 	case 121:
@@ -345,9 +448,17 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 		state.bank_lsb = bank_lsb;
 		state.program = program;
 		if (release_pending)
-			for (auto& voice : voices_)
-				if (voice.active() && voice.channel == channel && voice.note_off_pending)
-					begin_release(voice);
+		{
+			if (voice_model_ == VoiceModel::Cohorts)
+			{
+				if (cohort_engine_)
+					cohort_engine_->release_sustained(*this, channel);
+			}
+			else
+				for (auto& voice : voices_)
+					if (voice.active() && voice.channel == channel && voice.note_off_pending)
+						begin_release(voice);
+		}
 		update_channel_voice_gains(channel);
 		update_channel_pitch(channel);
 		break;
@@ -363,13 +474,19 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 void SynthEngine::program_change(uint8_t channel, uint8_t program) noexcept
 {
 	if (channel < 16)
+	{
+		if (voice_model_ == VoiceModel::Cohorts && cohort_engine_)
+			cohort_engine_->invalidate_onset_merges(channel);
 		channels_[channel].program = static_cast<uint8_t>((std::min)(program, uint8_t{127}));
+	}
 }
 
 void SynthEngine::set_pitch_bend(uint8_t channel, uint16_t value14) noexcept
 {
 	if (channel >= 16)
 		return;
+	if (voice_model_ == VoiceModel::Cohorts && cohort_engine_)
+		cohort_engine_->invalidate_onset_merges(channel);
 	value14 = (std::min)(value14, uint16_t{16383});
 	channels_[channel].pitch_bend_semitones =
 		(static_cast<int>(value14) - 8192) / 8192.0f * 2.0f;
@@ -405,10 +522,64 @@ void SynthEngine::consume_short_message(uint32_t message) noexcept
 	}
 }
 
+void SynthEngine::consume_short_messages(const uint32_t* messages, size_t count) noexcept
+{
+	if (!messages || count == 0)
+		return;
+	for (size_t index = 0; index < count;)
+	{
+		const uint32_t message = messages[index];
+		const uint8_t status = static_cast<uint8_t>(message & 0xff);
+		const uint8_t data1 = static_cast<uint8_t>((message >> 8) & 0x7f);
+		const uint8_t data2 = static_cast<uint8_t>((message >> 16) & 0x7f);
+		const uint8_t command = status & 0xf0;
+		const uint8_t channel = status & 0x0f;
+		const bool note_on_message = command == 0x90 && data2 != 0;
+		const bool note_off_message = command == 0x80 || (command == 0x90 && data2 == 0);
+		if (!note_on_message && !note_off_message)
+		{
+			consume_short_message(message);
+			++index;
+			continue;
+		}
+		size_t end = index + 1;
+		while (end < count)
+		{
+			const uint32_t next = messages[end];
+			const uint8_t next_status = static_cast<uint8_t>(next & 0xff);
+			const uint8_t next_data1 = static_cast<uint8_t>((next >> 8) & 0x7f);
+			const uint8_t next_data2 = static_cast<uint8_t>((next >> 16) & 0x7f);
+			const uint8_t next_command = next_status & 0xf0;
+			const bool next_note_on = next_command == 0x90 && next_data2 != 0;
+			const bool next_note_off = next_command == 0x80 ||
+				(next_command == 0x90 && next_data2 == 0);
+			if ((next_status & 0x0f) != channel || next_data1 != data1 ||
+				next_note_on != note_on_message || next_note_off != note_off_message ||
+				(note_on_message && next_data2 != data2))
+				break;
+			++end;
+		}
+		const uint64_t run = end - index;
+		if (note_on_message)
+			note_on_batch(channel, data1, data2, run);
+		else
+			note_off_batch(channel, data1, run);
+		index = end;
+	}
+}
+
 void SynthEngine::render_audio(float* out, uint32_t frames) noexcept
 {
 	if (!out || frames == 0)
 		return;
+	if (voice_model_ == VoiceModel::Cohorts)
+	{
+		if (cohort_engine_)
+			cohort_engine_->render_audio(*this, out, frames);
+		else
+			std::fill(out, out + static_cast<size_t>(frames) * 2, 0.0f);
+		return;
+	}
 	std::fill(out, out + static_cast<size_t>(frames) * 2, 0.0f);
 
 	for (auto& voice : voices_)
