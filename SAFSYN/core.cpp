@@ -20,13 +20,13 @@ namespace safsyn
 //  Shared helpers
 // ============================================================
 
-static float timecents_to_sec(int16_t tc)
+static float timecents_to_sec(int tc)
 {
 	// SF2 spec: t = 2^(tc/1200).  tc=-12000 → ~0.001 s (effectively instantaneous).
 	return std::pow(2.0f, tc / 1200.0f);
 }
 
-static float cb_to_linear(int16_t cb)
+static float cb_to_linear(int cb)
 {
 	// Centibels: 0 = full gain; positive values attenuate.
 	return std::pow(10.0f, -cb / 200.0f);
@@ -124,6 +124,83 @@ struct GenSet
 	uint8_t  hi(uint16_t id, uint8_t  def = 127) const { return (id < GEN_COUNT && present[id]) ? gens[id].amount.range.hi : def; }
 };
 
+static int16_t combined_s16(const GenSet& preset, const GenSet& instrument,
+	uint16_t id, int16_t instrument_default = 0)
+{
+	const int value = static_cast<int>(instrument.s16(id, instrument_default)) +
+		static_cast<int>(preset.s16(id, 0));
+	return static_cast<int16_t>(std::clamp(value, -32768, 32767));
+}
+
+static std::string sf2_name(const char* name, size_t size)
+{
+	size_t end = 0;
+	while (end < size && name[end] != '\0')
+		++end;
+	while (end > 0 && name[end - 1] == ' ')
+		--end;
+	return std::string(name, end);
+}
+
+static bool build_seed_loader_region(const SF2Shdr& sh, const GenSet& generators,
+	Soundfont& sf, uint32_t smpl_frames, SampleRegion& r)
+{
+	const int32_t s_ofs = generators.s16(GEN_StartAddrsOffset, 0) +
+		generators.s16(GEN_StartAddrsCoarse, 0) * 32768;
+	const int32_t e_ofs = generators.s16(GEN_EndAddrsOffset, 0) +
+		generators.s16(GEN_EndAddrsCoarse, 0) * 32768;
+	const int32_t ls_ofs = generators.s16(GEN_StartloopAddrsOffset, 0) +
+		generators.s16(GEN_StartloopCoarse, 0) * 32768;
+	const int32_t le_ofs = generators.s16(GEN_EndloopAddrsOffset, 0) +
+		generators.s16(GEN_EndloopCoarse, 0) * 32768;
+
+	const uint32_t abs_s = static_cast<uint32_t>(static_cast<int32_t>(sh.start) + s_ofs);
+	uint32_t abs_e = static_cast<uint32_t>(static_cast<int32_t>(sh.end) + e_ofs);
+	const uint32_t abs_ls = static_cast<uint32_t>(
+		static_cast<int32_t>(sh.loop_start) + ls_ofs);
+	const uint32_t abs_le = static_cast<uint32_t>(
+		static_cast<int32_t>(sh.loop_end) + le_ofs);
+	if (abs_e > smpl_frames)
+		abs_e = smpl_frames;
+	if (abs_s >= abs_e)
+		return false;
+
+	r.lo_key = generators.lo(GEN_KeyRange, 0);
+	r.hi_key = generators.hi(GEN_KeyRange, 127);
+	r.lo_vel = generators.lo(GEN_VelRange, 0);
+	r.hi_vel = generators.hi(GEN_VelRange, 127);
+	const int16_t root = generators.s16(GEN_OverridingRootKey, -1);
+	r.root_key = root >= 0 && root <= 127 ? static_cast<uint8_t>(root) : sh.pitch;
+	r.pcm = sf.pcm_pool.data() + abs_s;
+	r.pcm_len = abs_e - abs_s;
+	r.sample_rate = sh.sample_rate;
+	r.channels = 1;
+
+	const uint16_t modes = generators.u16(GEN_SampleModes, 0);
+	if (((modes & 3) == 1 || (modes & 3) == 3) &&
+		abs_ls >= abs_s && abs_le <= abs_e && abs_ls < abs_le)
+	{
+		r.loop_mode = (modes & 3) == 3 ? LoopMode::Sustain : LoopMode::Forward;
+		r.loop_start = abs_ls - abs_s;
+		r.loop_end = abs_le - abs_s;
+	}
+
+	r.coarse_tune = generators.s16(GEN_CoarseTune, 0);
+	r.fine_tune = generators.s16(GEN_FineTune, 0) + sh.pitch_correction;
+	r.scale_tuning = generators.u16(GEN_ScaleTuning, 100);
+	r.attack = timecents_to_sec(generators.s16(GEN_AttackVolEnv, -12000));
+	r.hold = timecents_to_sec(generators.s16(GEN_HoldVolEnv, -12000));
+	r.decay = timecents_to_sec(generators.s16(GEN_DecayVolEnv, -12000));
+	const int16_t sustain_cb = std::clamp<int16_t>(
+		generators.s16(GEN_SustainVolEnv, 0), 0, 1000);
+	r.sustain = cb_to_linear(sustain_cb);
+	r.release = timecents_to_sec(generators.s16(GEN_ReleaseVolEnv, -12000));
+	r.pan = generators.s16(GEN_Pan, 0) / 500.0f;
+	r.attenuation = cb_to_linear(generators.s16(GEN_InitialAttenuation, 0));
+	r.exclusive_class = generators.u16(GEN_ExclusiveClass, 0);
+	return true;
+}
+
 // ============================================================
 //  SF2 loader
 // ============================================================
@@ -181,6 +258,7 @@ bool load_sf2(const char* path, Soundfont& sf)
 		}
 	}
 	if (!smpl || smpl_frames == 0) return false;
+	sf = Soundfont{};
 	sf.pcm_pool.assign(smpl, smpl + smpl_frames);
 
 	// Extract all pdta sub-chunks
@@ -220,6 +298,13 @@ bool load_sf2(const char* path, Soundfont& sf)
 	// Build SampleRegions by walking preset → instrument → sample hierarchy
 	for (size_t pi = 0; pi + 1 < nPhdr; pi++)
 	{
+		const SF2Phdr* preset_header = PHDR_(pi);
+		PresetInfo preset;
+		preset.bank = preset_header->bank;
+		preset.program = preset_header->preset;
+		preset.name = sf2_name(preset_header->name, sizeof(preset_header->name));
+		preset.first_region = sf.regions.size();
+
 		uint16_t pbag_lo = PHDR_(pi)->bag_idx;
 		uint16_t pbag_hi = PHDR_(pi + 1)->bag_idx;
 		bool     first_p = true;
@@ -240,6 +325,7 @@ bool load_sf2(const char* path, Soundfont& sf)
 			}
 			if (inst_idx < 0) { if (first_p) preset_global = pzone; first_p = false; continue; }
 			first_p = false;
+			pzone.merge_defaults(preset_global);
 
 			if ((size_t)inst_idx + 1 >= nInst) continue;
 			uint16_t ibag_lo = INST_(inst_idx)->bag_idx;
@@ -266,18 +352,25 @@ bool load_sf2(const char* path, Soundfont& sf)
 				if ((size_t)shdr_idx >= nShdr) continue;
 				const SF2Shdr* sh = SHDR_(shdr_idx);
 
-				// Skip ROM samples and right-channel stereo pairs (handled via left)
+				// Skip ROM samples and right-channel stereo pairs (handled via left).
 				if (sh->sample_type & 0x8000) continue;
-				if (sh->sample_type == 2) continue; // rightSample
+				const uint16_t sample_type = sh->sample_type & 0x7fff;
+				if (sample_type == 2) continue; // rightSample
 
 				izone.merge_defaults(inst_global);
-				// (Preset-level generators add to instrument values; omitted for simplicity)
+				SampleRegion seed_region;
+				if (build_seed_loader_region(*sh, izone, sf, smpl_frames, seed_region))
+					sf.stress_regions.push_back(seed_region);
 
-				// Resolve sample window with optional per-zone offsets
-				int32_t s_ofs = izone.s16(GEN_StartAddrsOffset, 0) + izone.s16(GEN_StartAddrsCoarse, 0) * 32768;
-				int32_t e_ofs = izone.s16(GEN_EndAddrsOffset, 0) + izone.s16(GEN_EndAddrsCoarse, 0) * 32768;
-				int32_t ls_ofs = izone.s16(GEN_StartloopAddrsOffset, 0) + izone.s16(GEN_StartloopCoarse, 0) * 32768;
-				int32_t le_ofs = izone.s16(GEN_EndloopAddrsOffset, 0) + izone.s16(GEN_EndloopCoarse, 0) * 32768;
+				// Preset generator amounts are adjustments to instrument amounts.
+				const int32_t s_ofs = combined_s16(pzone, izone, GEN_StartAddrsOffset) +
+					static_cast<int32_t>(combined_s16(pzone, izone, GEN_StartAddrsCoarse)) * 32768;
+				const int32_t e_ofs = combined_s16(pzone, izone, GEN_EndAddrsOffset) +
+					static_cast<int32_t>(combined_s16(pzone, izone, GEN_EndAddrsCoarse)) * 32768;
+				const int32_t ls_ofs = combined_s16(pzone, izone, GEN_StartloopAddrsOffset) +
+					static_cast<int32_t>(combined_s16(pzone, izone, GEN_StartloopCoarse)) * 32768;
+				const int32_t le_ofs = combined_s16(pzone, izone, GEN_EndloopAddrsOffset) +
+					static_cast<int32_t>(combined_s16(pzone, izone, GEN_EndloopCoarse)) * 32768;
 
 				uint32_t abs_s = (uint32_t)((int32_t)sh->start + s_ofs);
 				uint32_t abs_e = (uint32_t)((int32_t)sh->end + e_ofs);
@@ -288,20 +381,41 @@ bool load_sf2(const char* path, Soundfont& sf)
 				if (abs_s >= abs_e) continue;
 
 				SampleRegion r;
-				r.lo_key = izone.lo(GEN_KeyRange, 0);
-				r.hi_key = izone.hi(GEN_KeyRange, 127);
-				r.lo_vel = izone.lo(GEN_VelRange, 0);
-				r.hi_vel = izone.hi(GEN_VelRange, 127);
+				r.preset_bank = preset.bank;
+				r.preset_program = preset.program;
+				r.lo_key = (std::max)(pzone.lo(GEN_KeyRange, 0), izone.lo(GEN_KeyRange, 0));
+				r.hi_key = (std::min)(pzone.hi(GEN_KeyRange, 127), izone.hi(GEN_KeyRange, 127));
+				r.lo_vel = (std::max)(pzone.lo(GEN_VelRange, 0), izone.lo(GEN_VelRange, 0));
+				r.hi_vel = (std::min)(pzone.hi(GEN_VelRange, 127), izone.hi(GEN_VelRange, 127));
+				if (r.lo_key > r.hi_key || r.lo_vel > r.hi_vel)
+					continue;
 
 				{
 					int16_t ovr = izone.s16(GEN_OverridingRootKey, -1);
 					r.root_key = (ovr >= 0 && ovr <= 127) ? (uint8_t)ovr : sh->pitch;
 				}
 
-				r.pcm = sf.pcm_pool.data() + abs_s;
 				r.pcm_len = abs_e - abs_s;
 				r.sample_rate = sh->sample_rate;
-				r.channels = 1; // SF2 zones are always mono (stereo is two linked zones)
+				r.channels = 1;
+				r.pcm = sf.pcm_pool.data() + abs_s;
+				if (sample_type == 4 && sh->sample_link < nShdr)
+				{
+					const SF2Shdr* linked = SHDR_(sh->sample_link);
+					const uint16_t linked_type = linked->sample_type & 0x7fff;
+					const int64_t linked_start = static_cast<int64_t>(linked->start) + s_ofs;
+					const int64_t linked_end = static_cast<int64_t>(linked->end) + e_ofs;
+					if (!(linked->sample_type & 0x8000) && linked_type == 2 &&
+						linked->sample_link == shdr_idx && linked_start >= 0 &&
+						linked_end > linked_start && linked_end <= smpl_frames &&
+						linked->sample_rate == sh->sample_rate)
+					{
+						r.pcm_len = (std::min)(r.pcm_len,
+							static_cast<uint32_t>(linked_end - linked_start));
+						r.pcm_right = sf.pcm_pool.data() + linked_start;
+						r.channels = 2;
+					}
+				}
 
 				{
 					uint16_t modes = izone.u16(GEN_SampleModes, 0);
@@ -316,26 +430,40 @@ bool load_sf2(const char* path, Soundfont& sf)
 					}
 				}
 
-				r.coarse_tune = izone.s16(GEN_CoarseTune, 0);
-				r.fine_tune = izone.s16(GEN_FineTune, 0) + sh->pitch_correction;
-				r.scale_tuning = izone.u16(GEN_ScaleTuning, 100);
+				r.coarse_tune = combined_s16(pzone, izone, GEN_CoarseTune);
+				r.fine_tune = static_cast<int16_t>(std::clamp(
+					static_cast<int>(combined_s16(pzone, izone, GEN_FineTune)) +
+					sh->pitch_correction, -32768, 32767));
+				r.scale_tuning = static_cast<uint16_t>(std::clamp(
+					static_cast<int>(izone.s16(GEN_ScaleTuning, 100)) +
+					static_cast<int>(pzone.s16(GEN_ScaleTuning, 0)), 0, 1200));
 
-				r.attack = timecents_to_sec(izone.s16(GEN_AttackVolEnv, -12000));
-				r.hold = timecents_to_sec(izone.s16(GEN_HoldVolEnv, -12000));
-				r.decay = timecents_to_sec(izone.s16(GEN_DecayVolEnv, -12000));
+				r.attack = timecents_to_sec(std::clamp<int>(
+					combined_s16(pzone, izone, GEN_AttackVolEnv, -12000), -12000, 8000));
+				r.hold = timecents_to_sec(std::clamp<int>(
+					combined_s16(pzone, izone, GEN_HoldVolEnv, -12000), -12000, 5000));
+				r.decay = timecents_to_sec(std::clamp<int>(
+					combined_s16(pzone, izone, GEN_DecayVolEnv, -12000), -12000, 8000));
 				{
-					int16_t sus_cb = std::clamp<int16_t>(izone.s16(GEN_SustainVolEnv, 0), 0, 1000);
+					int16_t sus_cb = static_cast<int16_t>(std::clamp<int>(
+						combined_s16(pzone, izone, GEN_SustainVolEnv), 0, 1440));
 					r.sustain = cb_to_linear(sus_cb);
 				}
-				r.release = timecents_to_sec(izone.s16(GEN_ReleaseVolEnv, -12000));
+				r.release = timecents_to_sec(std::clamp<int>(
+					combined_s16(pzone, izone, GEN_ReleaseVolEnv, -12000), -12000, 8000));
 
-				r.pan = izone.s16(GEN_Pan, 0) / 500.0f;
-				r.attenuation = cb_to_linear(izone.s16(GEN_InitialAttenuation, 0));
+				const GenSet& pan_generators = r.channels == 2 ? inst_global : izone;
+				r.pan = std::clamp(combined_s16(pzone, pan_generators, GEN_Pan) / 500.0f,
+					-1.0f, 1.0f);
+				r.attenuation = cb_to_linear(static_cast<int16_t>(std::clamp<int>(
+					combined_s16(pzone, izone, GEN_InitialAttenuation), 0, 1440)));
 				r.exclusive_class = izone.u16(GEN_ExclusiveClass, 0);
 
 				sf.regions.push_back(r);
 			}
 		}
+		preset.region_count = sf.regions.size() - preset.first_region;
+		sf.presets.push_back(std::move(preset));
 	}
 	return !sf.regions.empty();
 }

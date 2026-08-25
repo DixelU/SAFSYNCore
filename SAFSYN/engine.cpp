@@ -209,9 +209,16 @@ void SynthEngine::note_on(uint8_t channel, uint8_t note, uint8_t velocity) noexc
 		return;
 
 	const uint64_t serial = next_serial_++;
-	for (const auto& region : soundfont_->regions)
+	const auto& channel_state = channels_[channel];
+	const uint16_t selected_bank = static_cast<uint16_t>(
+		(static_cast<uint16_t>(channel_state.bank_msb) << 7) | channel_state.bank_lsb);
+	const auto& render_regions = all_regions_mode_ && !soundfont_->stress_regions.empty()
+		? soundfont_->stress_regions : soundfont_->regions;
+	for (const auto& region : render_regions)
 	{
 		if (!region.pcm || region.pcm_len == 0 || region.channels < 1 || region.channels > 2 ||
+			(!all_regions_mode_ && (region.preset_bank != selected_bank ||
+				region.preset_program != channel_state.program)) ||
 			note < region.lo_key || note > region.hi_key ||
 			velocity < region.lo_vel || velocity > region.hi_vel)
 			continue;
@@ -292,6 +299,9 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 	auto& state = channels_[channel];
 	switch (controller)
 	{
+	case 0:
+		state.bank_msb = value;
+		break;
 	case 7:
 		state.volume = value / 127.0f;
 		break;
@@ -301,6 +311,9 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 		break;
 	case 11:
 		state.expression = value / 127.0f;
+		break;
+	case 32:
+		state.bank_lsb = value;
 		break;
 	case 64:
 	{
@@ -315,7 +328,13 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 	case 121:
 	{
 		const bool release_pending = state.sustain_pedal;
+		const uint8_t bank_msb = state.bank_msb;
+		const uint8_t bank_lsb = state.bank_lsb;
+		const uint8_t program = state.program;
 		state = ChannelState{};
+		state.bank_msb = bank_msb;
+		state.bank_lsb = bank_lsb;
+		state.program = program;
 		if (release_pending)
 			for (auto& voice : voices_)
 				if (voice.active() && voice.channel == channel && voice.note_off_pending)
@@ -330,6 +349,12 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 	default:
 		break;
 	}
+}
+
+void SynthEngine::program_change(uint8_t channel, uint8_t program) noexcept
+{
+	if (channel < 16)
+		channels_[channel].program = static_cast<uint8_t>((std::min)(program, uint8_t{127}));
 }
 
 void SynthEngine::set_pitch_bend(uint8_t channel, uint16_t value14) noexcept
@@ -359,6 +384,9 @@ void SynthEngine::consume_short_message(uint32_t message) noexcept
 		break;
 	case 0xb0:
 		control_change(channel, data1, data2);
+		break;
+	case 0xc0:
+		program_change(channel, data1);
 		break;
 	case 0xe0:
 		set_pitch_bend(channel, static_cast<uint16_t>((data2 << 7) | data1));
@@ -401,16 +429,20 @@ void SynthEngine::render_audio(float* out, uint32_t frames) noexcept
 			if (valid_loop && voice.loop_dir_fwd && index1 >= region.loop_end)
 				index1 = region.loop_start;
 			const float fraction = static_cast<float>(voice.pos - index0);
-			const size_t offset0 = static_cast<size_t>(index0) * region.channels;
-			const size_t offset1 = static_cast<size_t>(index1) * region.channels;
+			const size_t offset0 = region.pcm_right ? index0 :
+				static_cast<size_t>(index0) * region.channels;
+			const size_t offset1 = region.pcm_right ? index1 :
+				static_cast<size_t>(index1) * region.channels;
 			const float source_l0 = pcm_to_float(region.pcm[offset0]);
 			const float source_l1 = pcm_to_float(region.pcm[offset1]);
 			const float sample_l = source_l0 + (source_l1 - source_l0) * fraction;
 			float sample_r = sample_l;
 			if (region.channels == 2)
 			{
-				const float source_r0 = pcm_to_float(region.pcm[offset0 + 1]);
-				const float source_r1 = pcm_to_float(region.pcm[offset1 + 1]);
+				const float source_r0 = pcm_to_float(region.pcm_right ?
+					region.pcm_right[index0] : region.pcm[offset0 + 1]);
+				const float source_r1 = pcm_to_float(region.pcm_right ?
+					region.pcm_right[index1] : region.pcm[offset1 + 1]);
 				sample_r = source_r0 + (source_r1 - source_r0) * fraction;
 			}
 

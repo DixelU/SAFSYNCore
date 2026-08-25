@@ -36,6 +36,168 @@ void write_u32(std::ostream& stream, uint32_t value)
 		stream.put(static_cast<char>((value >> shift) & 0xff));
 }
 
+void append_u16(std::vector<uint8_t>& data, uint16_t value)
+{
+	data.push_back(static_cast<uint8_t>(value & 0xff));
+	data.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+}
+
+void append_u32(std::vector<uint8_t>& data, uint32_t value)
+{
+	for (int shift = 0; shift < 32; shift += 8)
+		data.push_back(static_cast<uint8_t>((value >> shift) & 0xff));
+}
+
+void append_name(std::vector<uint8_t>& data, const char* name)
+{
+	std::array<char, 20> field{};
+	const size_t length = (std::min)(std::char_traits<char>::length(name), field.size());
+	std::copy_n(name, length, field.begin());
+	data.insert(data.end(), field.begin(), field.end());
+}
+
+void append_chunk(std::vector<uint8_t>& destination, const char id[5],
+	const std::vector<uint8_t>& payload)
+{
+	destination.insert(destination.end(), id, id + 4);
+	append_u32(destination, static_cast<uint32_t>(payload.size()));
+	destination.insert(destination.end(), payload.begin(), payload.end());
+	if (payload.size() & 1)
+		destination.push_back(0);
+}
+
+void append_phdr(std::vector<uint8_t>& data, const char* name, uint16_t program,
+	uint16_t bank, uint16_t bag_index)
+{
+	append_name(data, name);
+	append_u16(data, program);
+	append_u16(data, bank);
+	append_u16(data, bag_index);
+	append_u32(data, 0);
+	append_u32(data, 0);
+	append_u32(data, 0);
+}
+
+void append_bag(std::vector<uint8_t>& data, uint16_t generator_index)
+{
+	append_u16(data, generator_index);
+	append_u16(data, 0);
+}
+
+void append_gen(std::vector<uint8_t>& data, uint16_t oper, int16_t amount)
+{
+	append_u16(data, oper);
+	append_u16(data, static_cast<uint16_t>(amount));
+}
+
+void append_range_gen(std::vector<uint8_t>& data, uint16_t oper, uint8_t lo, uint8_t hi)
+{
+	append_u16(data, oper);
+	append_u16(data, static_cast<uint16_t>(lo | (static_cast<uint16_t>(hi) << 8)));
+}
+
+void append_inst(std::vector<uint8_t>& data, const char* name, uint16_t bag_index)
+{
+	append_name(data, name);
+	append_u16(data, bag_index);
+}
+
+void append_shdr(std::vector<uint8_t>& data, const char* name, uint32_t start,
+	uint32_t end, uint16_t link, uint16_t type)
+{
+	append_name(data, name);
+	append_u32(data, start);
+	append_u32(data, end);
+	append_u32(data, start);
+	append_u32(data, end);
+	append_u32(data, 1000);
+	data.push_back(60);
+	data.push_back(0);
+	append_u16(data, link);
+	append_u16(data, type);
+}
+
+void write_sf2_fixture(const std::filesystem::path& path)
+{
+	// Generator IDs used by this deliberately small fixture.
+	constexpr uint16_t pan = 17;
+	constexpr uint16_t instrument = 41;
+	constexpr uint16_t key_range = 43;
+	constexpr uint16_t velocity_range = 44;
+	constexpr uint16_t fine_tune = 52;
+	constexpr uint16_t sample_id = 53;
+
+	std::vector<uint8_t> smpl;
+	const std::array<int16_t, 16> samples = {
+		1000, 2000, 3000, 4000, -1000, -2000, -3000, -4000,
+		6000, 6000, 6000, 6000, 12000, 12000, 12000, 12000};
+	for (int16_t sample : samples)
+		append_u16(smpl, static_cast<uint16_t>(sample));
+
+	std::vector<uint8_t> phdr;
+	append_phdr(phdr, "Layered", 0, 0, 0);
+	append_phdr(phdr, "Other", 1, 0, 1);
+	append_phdr(phdr, "EOP", 0, 0, 2);
+	std::vector<uint8_t> pbag;
+	append_bag(pbag, 0); append_bag(pbag, 3); append_bag(pbag, 4);
+	std::vector<uint8_t> pgen;
+	append_range_gen(pgen, key_range, 50, 70);
+	append_gen(pgen, fine_tune, 10);
+	append_gen(pgen, instrument, 0);
+	append_gen(pgen, instrument, 1);
+
+	std::vector<uint8_t> inst;
+	append_inst(inst, "Layers", 0);
+	append_inst(inst, "OtherInst", 3);
+	append_inst(inst, "EOI", 4);
+	std::vector<uint8_t> ibag;
+	append_bag(ibag, 0); append_bag(ibag, 5); append_bag(ibag, 10);
+	append_bag(ibag, 14); append_bag(ibag, 15);
+	std::vector<uint8_t> igen;
+	append_range_gen(igen, key_range, 60, 80);
+	append_range_gen(igen, velocity_range, 0, 63);
+	append_gen(igen, pan, -500);
+	append_gen(igen, fine_tune, 20);
+	append_gen(igen, sample_id, 0);
+	append_range_gen(igen, key_range, 60, 80);
+	append_range_gen(igen, velocity_range, 0, 63);
+	append_gen(igen, pan, 500);
+	append_gen(igen, fine_tune, 20);
+	append_gen(igen, sample_id, 1);
+	append_range_gen(igen, key_range, 60, 80);
+	append_range_gen(igen, velocity_range, 64, 127);
+	append_gen(igen, fine_tune, 20);
+	append_gen(igen, sample_id, 2);
+	append_gen(igen, sample_id, 3);
+
+	std::vector<uint8_t> shdr;
+	append_shdr(shdr, "Left", 0, 4, 1, 4);
+	append_shdr(shdr, "Right", 4, 8, 0, 2);
+	append_shdr(shdr, "High", 8, 12, 0, 1);
+	append_shdr(shdr, "Other", 12, 16, 0, 1);
+	append_shdr(shdr, "EOS", 16, 16, 0, 1);
+
+	std::vector<uint8_t> sdta = {'s', 'd', 't', 'a'};
+	append_chunk(sdta, "smpl", smpl);
+	std::vector<uint8_t> pdta = {'p', 'd', 't', 'a'};
+	append_chunk(pdta, "phdr", phdr);
+	append_chunk(pdta, "pbag", pbag);
+	append_chunk(pdta, "pgen", pgen);
+	append_chunk(pdta, "inst", inst);
+	append_chunk(pdta, "ibag", ibag);
+	append_chunk(pdta, "igen", igen);
+	append_chunk(pdta, "shdr", shdr);
+
+	std::vector<uint8_t> riff = {'s', 'f', 'b', 'k'};
+	append_chunk(riff, "LIST", sdta);
+	append_chunk(riff, "LIST", pdta);
+	std::ofstream stream(path, std::ios::binary);
+	stream.write("RIFF", 4);
+	write_u32(stream, static_cast<uint32_t>(riff.size()));
+	stream.write(reinterpret_cast<const char*>(riff.data()),
+		static_cast<std::streamsize>(riff.size()));
+}
+
 void write_pcm16_wav(const std::filesystem::path& path, const std::vector<int16_t>& pcm,
 	uint32_t sample_rate)
 {
@@ -167,6 +329,119 @@ void test_voice_stealing_and_midi_messages()
 	check(engine.active_voice_count() == 1, "packed MIDI note-off reaches the engine");
 }
 
+void test_channel_preset_selection_and_stress_mode()
+{
+	safsyn::Soundfont bank;
+	bank.sfz_pcm.emplace_back(32, 16384);
+	safsyn::SampleRegion region;
+	region.pcm = bank.sfz_pcm.back().data();
+	region.pcm_len = 32;
+	region.sample_rate = 1000;
+	region.attack = 0.0f;
+	region.decay = 0.0f;
+	region.sustain = 1.0f;
+	region.release = 0.0f;
+	bank.regions.push_back(region);
+	region.preset_program = 1;
+	bank.regions.push_back(region);
+	region.preset_program = 0;
+	region.preset_bank = 130;
+	bank.regions.push_back(region);
+
+	safsyn::SynthEngine engine(1000, 8);
+	engine.set_soundfont(&bank);
+	engine.note_on(0, 60, 100);
+	check(engine.stats().started_voices == 1, "default bank/program excludes unrelated presets");
+	engine.reset();
+	engine.consume_short_message(0x000001c0); // channel 0, program 1
+	engine.note_on(0, 60, 100);
+	check(engine.stats().started_voices == 1, "packed MIDI program change selects another preset");
+	engine.reset();
+	engine.control_change(0, 0, 1);
+	engine.control_change(0, 32, 2);
+	engine.note_on(0, 60, 100);
+	check(engine.stats().started_voices == 1, "MIDI bank MSB/LSB selects bank 130");
+	engine.reset();
+	engine.set_all_regions_mode(true);
+	engine.note_on(0, 60, 100);
+	check(engine.stats().started_voices == 3,
+		"explicit all-regions mode retains the flattened stress behavior");
+}
+
+void test_sf2_preset_loader(const std::filesystem::path& directory)
+{
+	std::filesystem::create_directories(directory);
+	const auto sf2_path = directory / "preset-fixture.sf2";
+	write_sf2_fixture(sf2_path);
+	safsyn::Soundfont bank;
+	check(safsyn::load_sf2(sf2_path.string().c_str(), bank), "SF2 preset fixture loads");
+	check(bank.presets.size() == 2 && bank.presets[0].bank == 0 &&
+		bank.presets[0].program == 0 && bank.presets[1].program == 1,
+		"SF2 phdr bank/program identity is preserved");
+	check(bank.regions.size() == 3,
+		"linked stereo headers collapse to one logical region");
+	check(bank.stress_regions.size() == 3 && bank.stress_regions[0].channels == 1,
+		"SF2 loader retains a separate mono seed-loader stress view");
+	if (bank.regions.size() != 3)
+		return;
+
+	const auto low = std::find_if(bank.regions.begin(), bank.regions.end(),
+		[](const safsyn::SampleRegion& item) {
+			return item.preset_program == 0 && item.lo_vel == 0;
+		});
+	const auto high = std::find_if(bank.regions.begin(), bank.regions.end(),
+		[](const safsyn::SampleRegion& item) {
+			return item.preset_program == 0 && item.lo_vel == 64;
+		});
+	check(low != bank.regions.end() && high != bank.regions.end(),
+		"SF2 velocity layers remain distinct");
+	if (low == bank.regions.end() || high == bank.regions.end())
+		return;
+	check(low->lo_key == 60 && low->hi_key == 70,
+		"preset and instrument key ranges are intersected");
+	check(low->fine_tune == 30,
+		"preset and instrument tuning generators are combined");
+	check(low->channels == 2 && low->pcm_len == 4 && low->pcm_right &&
+		low->pcm[0] == 1000 && low->pcm_right[0] == -1000,
+		"linked left/right samples are reconstructed as one planar stereo region");
+
+	safsyn::SynthEngine selected(1000, 8);
+	selected.set_soundfont(&bank);
+	selected.note_on(0, 59, 40);
+	check(selected.stats().started_voices == 0, "notes outside the intersected key range do not trigger");
+	selected.note_on(0, 60, 40);
+	check(selected.stats().started_voices == 1,
+		"low velocity triggers one stereo layer from the selected preset");
+	std::array<float, 2> stereo{};
+	selected.render_audio(stereo.data(), 1);
+	check(stereo[0] > 0.0f && stereo[1] < 0.0f,
+		"one logical SF2 stereo voice renders independent left and right samples");
+
+	safsyn::SynthEngine high_velocity(1000, 8);
+	high_velocity.set_soundfont(&bank);
+	high_velocity.note_on(0, 60, 100);
+	check(high_velocity.stats().started_voices == 1,
+		"high velocity selects only the expected layer");
+
+	safsyn::SynthEngine other_preset(1000, 8);
+	other_preset.set_soundfont(&bank);
+	other_preset.program_change(0, 1);
+	other_preset.note_on(0, 60, 100);
+	check(other_preset.stats().started_voices == 1,
+		"program change triggers the other preset without layering preset zero");
+
+	safsyn::SynthEngine first(1000, 8), second(1000, 8);
+	first.set_soundfont(&bank);
+	second.set_soundfont(&bank);
+	first.note_on(0, 60, 40);
+	second.note_on(0, 60, 40);
+	std::vector<float> a(16), b(16);
+	first.render_audio(a.data(), 8);
+	second.render_audio(b.data(), 3);
+	second.render_audio(b.data() + 6, 5);
+	check(a == b, "selected-preset SF2 renders are deterministic across block sizes");
+}
+
 void test_sfz_loader(const std::filesystem::path& directory)
 {
 	std::filesystem::create_directories(directory);
@@ -220,6 +495,8 @@ int main(int argc, char** argv)
 	test_determinism_and_block_invariance();
 	test_interpolation_pitch_and_stereo();
 	test_voice_stealing_and_midi_messages();
+	test_channel_preset_selection_and_stress_mode();
+	test_sf2_preset_loader(test_directory);
 	test_sfz_loader(test_directory);
 	test_float_wav(test_directory);
 	if (failures != 0)

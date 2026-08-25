@@ -42,10 +42,46 @@ It must not be described or measured as phase-only processing.
 - The audio loop allocates nothing and performs no I/O.
 - A sound bank is immutable while attached to an engine.
 - Output is IEEE float32 WAV; values outside `[-1, 1]` are retained as evidence.
+- MIDI bank select uses CC 0/32 and program changes use status `0xCn`.
+- Normal SF2 note-on traversal is limited to the channel's selected bank and
+  program. The legacy flattened view is reachable only through the explicit
+  all-regions stress setting.
 
-The current SF2 loader preserves the seed implementation. Full preset/global
-generator composition, bank/program selection, and stereo-linked SF2 samples
-remain milestone 5 work and are not claimed by this baseline.
+Milestone 2.5 resolves SF2 preset zones through instruments to sample zones,
+combines the currently supported preset and instrument generator subset, and
+intersects their key and velocity ranges. Linked left/right samples become one
+logical stereo region backed by the original planar sample data. This does not
+claim the full SF2 modulator system, filters, LFOs, or every generator.
+
+Bit identity is currently promised for the same MSVC executable and settings.
+Other supported platforms are expected to be numerically equivalent within a
+future documented tolerance; cross-platform bit identity is not claimed.
+
+## Piano integration baselines
+
+The coherent seed-loader reference is intentionally preserved by
+`--all-regions`. With `sDetrimental Concert Grand Piano.sf2`, the scripted
+four-second render at 48 kHz and 512-voice capacity reports:
+
+- presets: 1
+- legacy stress regions: 1,740
+- started voices: 180
+- peak active voices: 180
+- unclipped peak: `11.0501`
+- SHA-256: `4F2AD2A76244D43AF5E813E5DA8A3444AE510BAEE6E12D37DD41757CFA3D11AD`
+
+The selected bank 0/program 0 playback of the same script and soundfont reports:
+
+- resolved regions belonging to the selected preset: 1,740
+- started voices: 9
+- peak active voices: 9
+- unclipped peak: `0.390679`
+- SHA-256: `1A79343D659CD744970FB57AA5C1E6CD7E859679A0E8C3CF0C43E89DB285983D`
+
+Two selected-preset renders produced the same SHA-256 under MSVC 19.51.36256.0.
+The stress SHA also matches the pre-milestone seed-loader WAV. These WAV files
+remain unnormalized float output; neither peak is evidence of limiting or
+production loudness policy.
 
 ## Required fixtures and measurements for the later phase milestone
 

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace safsyn
@@ -11,15 +12,23 @@ enum class LoopMode : uint8_t { None, Forward, Sustain, PingPong, OneShot };
 
 struct SampleRegion
 {
+	// SFZ regions use the General MIDI default preset (bank 0/program 0).
+	// SF2 regions retain the preset identity resolved from the phdr table.
+	uint16_t preset_bank = 0;
+	uint16_t preset_program = 0;
+
 	uint8_t lo_key = 0;
 	uint8_t hi_key = 127;
 	uint8_t lo_vel = 0;
 	uint8_t hi_vel = 127;
 	uint8_t root_key = 60;
 
-	// Audio is signed 16-bit PCM, interleaved when channels == 2. The owning
-	// storage lives in Soundfont for the complete lifetime of an engine render.
+	// Audio is signed 16-bit PCM. Stereo is interleaved unless pcm_right points
+	// at a separate right plane. Soundfont owns the storage for an engine render.
 	const int16_t* pcm = nullptr;
+	// Linked SF2 stereo is planar in the smpl pool; pcm_right identifies that
+	// representation. Stereo SFZ/WAV data remains interleaved with this null.
+	const int16_t* pcm_right = nullptr;
 	uint32_t pcm_len = 0;
 	uint32_t sample_rate = 44100;
 	uint8_t channels = 1;
@@ -43,9 +52,21 @@ struct SampleRegion
 	uint16_t exclusive_class = 0;
 };
 
+struct PresetInfo
+{
+	uint16_t bank = 0;
+	uint16_t program = 0;
+	std::string name;
+	size_t first_region = 0;
+	size_t region_count = 0;
+};
+
 struct Soundfont
 {
 	std::vector<SampleRegion> regions;
+	// Seed-loader view retained solely for the explicit all-regions stress mode.
+	std::vector<SampleRegion> stress_regions;
+	std::vector<PresetInfo> presets;
 	std::vector<int16_t> pcm_pool;
 	std::vector<std::vector<int16_t>> sfz_pcm;
 
@@ -91,9 +112,15 @@ public:
 	void note_on(uint8_t channel, uint8_t note, uint8_t velocity) noexcept;
 	void note_off(uint8_t channel, uint8_t note) noexcept;
 	void control_change(uint8_t channel, uint8_t controller, uint8_t value) noexcept;
+	void program_change(uint8_t channel, uint8_t program) noexcept;
 	void set_pitch_bend(uint8_t channel, uint16_t value14) noexcept;
 	void consume_short_message(uint32_t packed_message) noexcept;
 	void render_audio(float* interleaved_stereo, uint32_t frames) noexcept;
+
+	// Explicit compatibility/stress path for reproducing the old flattened SF2
+	// behavior. Normal playback always selects the channel bank and program.
+	void set_all_regions_mode(bool enabled) noexcept { all_regions_mode_ = enabled; }
+	bool all_regions_mode() const noexcept { return all_regions_mode_; }
 
 private:
 	struct Voice
@@ -126,6 +153,9 @@ private:
 		float pan = 0.0f;
 		float pitch_bend_semitones = 0.0f;
 		bool sustain_pedal = false;
+		uint8_t bank_msb = 0;
+		uint8_t bank_lsb = 0;
+		uint8_t program = 0;
 	};
 
 	Voice* allocate_voice() noexcept;
@@ -146,6 +176,7 @@ private:
 	ChannelState channels_[16] = {};
 	uint32_t sample_rate_ = 48000;
 	uint64_t next_serial_ = 1;
+	bool all_regions_mode_ = false;
 	RenderStats stats_;
 };
 

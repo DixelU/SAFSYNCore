@@ -69,7 +69,8 @@ void print_usage()
 {
 	std::cerr << "Usage:\n"
 		"  safsyn-render --demo output.wav [--sample-rate N] [--voices N]\n"
-		"  safsyn-render bank.sfz|bank.sf2 output.wav [--sample-rate N] [--voices N]\n";
+		"  safsyn-render bank.sfz|bank.sf2 output.wav [--bank N] [--program N]\n"
+		"      [--sample-rate N] [--voices N] [--all-regions]\n";
 }
 }
 
@@ -86,6 +87,9 @@ int main(int argc, char** argv)
 	const std::string output_path = argv[2];
 	uint32_t sample_rate = 48000;
 	size_t voice_capacity = 256;
+	uint32_t bank = 0;
+	uint32_t program = 0;
+	bool all_regions = false;
 	for (int index = 3; index < argc; ++index)
 	{
 		const std::string option = argv[index];
@@ -93,13 +97,20 @@ int main(int argc, char** argv)
 			sample_rate = static_cast<uint32_t>(std::stoul(argv[++index]));
 		else if (option == "--voices" && index + 1 < argc)
 			voice_capacity = static_cast<size_t>(std::stoull(argv[++index]));
+		else if (option == "--bank" && index + 1 < argc)
+			bank = static_cast<uint32_t>(std::stoul(argv[++index]));
+		else if (option == "--program" && index + 1 < argc)
+			program = static_cast<uint32_t>(std::stoul(argv[++index]));
+		else if (option == "--all-regions")
+			all_regions = true;
 		else
 		{
 			print_usage();
 			return 2;
 		}
 	}
-	if (sample_rate < 8000 || sample_rate > 384000 || voice_capacity == 0)
+	if (sample_rate < 8000 || sample_rate > 384000 || voice_capacity == 0 ||
+		bank > 16383 || program > 127)
 	{
 		std::cerr << "Invalid sample rate or voice capacity.\n";
 		return 2;
@@ -128,6 +139,10 @@ int main(int argc, char** argv)
 	std::vector<float> audio(static_cast<size_t>(total_frames) * 2, 0.0f);
 	safsyn::SynthEngine engine(sample_rate, voice_capacity);
 	engine.set_soundfont(&soundfont);
+	engine.set_all_regions_mode(all_regions);
+	engine.control_change(0, 0, static_cast<uint8_t>(bank >> 7));
+	engine.control_change(0, 32, static_cast<uint8_t>(bank & 0x7f));
+	engine.program_change(0, static_cast<uint8_t>(program));
 
 	size_t event_index = 0;
 	uint64_t cursor = 0;
@@ -160,8 +175,22 @@ int main(int argc, char** argv)
 	for (float sample : audio)
 		peak = (std::max)(peak, std::abs(sample));
 	const auto& stats = engine.stats();
+	const size_t selected_regions = all_regions && !soundfont.stress_regions.empty()
+		? soundfont.stress_regions.size()
+		: static_cast<size_t>(std::count_if(
+			soundfont.regions.begin(), soundfont.regions.end(),
+			[&](const safsyn::SampleRegion& region) {
+				return all_regions ||
+					(region.preset_bank == bank && region.preset_program == program);
+			}));
 	std::cout << "Rendered " << stats.rendered_frames << " frames to " << output_path
-		<< "\nregions=" << soundfont.regions.size()
+		<< "\npresets=" << soundfont.presets.size()
+		<< " regions=" << soundfont.regions.size()
+		<< " stress_regions=" << soundfont.stress_regions.size()
+		<< " selected_regions=" << selected_regions
+		<< " bank=" << bank
+		<< " program=" << static_cast<unsigned>(program)
+		<< " all_regions=" << (all_regions ? "yes" : "no")
 		<< " started_voices=" << stats.started_voices
 		<< " peak_active=" << stats.peak_active_voices
 		<< " stolen=" << stats.stolen_voices
