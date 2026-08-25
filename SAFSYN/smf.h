@@ -185,7 +185,7 @@ struct SmfAnalysisOptions
 	uint64_t controller_trace_frames = 0;
 	uint64_t controller_trace_start_frame = 0;
 	size_t controller_trace_limit = 0;
-	// -1 traces all relevant controllers, otherwise only the selected CC.
+	// -1 traces every controller, otherwise only the selected CC.
 	int16_t controller_trace_controller = -1;
 };
 

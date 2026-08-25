@@ -192,6 +192,8 @@ void test_type0_running_status_and_usage()
 	safsyn::SmfAnalysis analysis;
 	safsyn::SmfAnalysisOptions options;
 	options.sample_rate = 48000;
+	options.controller_trace_frames = 1;
+	options.controller_trace_limit = 16;
 	check(safsyn::analyze_smf(file, options, analysis), "type-0 fixture analyzes");
 	check(analysis.header.format == 0 && analysis.header.track_count == 1 &&
 		analysis.header.ppqn == 480, "type-0 header and PPQN are retained");
@@ -207,6 +209,10 @@ void test_type0_running_status_and_usage()
 		analysis.bank_program_usage[0].program == 5 &&
 		analysis.bank_program_usage[0].note_ons == 2,
 		"bank MSB/LSB and program usage follow merged channel state");
+	check(analysis.controller_trace.size() == 2 &&
+		analysis.controller_trace[0].controller == 0 &&
+		analysis.controller_trace[1].controller == 32,
+		"bounded analysis traces arbitrary per-channel CC state, including bank controls");
 }
 
 void test_type1_merge_and_tempo_changes()

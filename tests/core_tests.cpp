@@ -298,6 +298,22 @@ void test_controller_contract()
 	auto bank = make_constant_bank();
 	{
 		safsyn::SynthEngine engine(1000, 8);
+		engine.control_change(0, 91, 37);
+		engine.control_change(0, 93, 81);
+		engine.control_change(1, 91, 99);
+		check(engine.controller_value(0, 91) == 37 &&
+			engine.controller_value(0, 93) == 81 &&
+			engine.controller_value(1, 91) == 99 &&
+			engine.controller_value(1, 93) == 0,
+			"every CC is retained independently for every MIDI channel");
+		engine.control_change(0, 121, 0);
+		check(engine.controller_value(0, 91) == 0 &&
+			engine.controller_value(0, 93) == 0 &&
+			engine.controller_value(1, 91) == 99,
+			"CC121 resets only the addressed channel's complete controller table");
+	}
+	{
+		safsyn::SynthEngine engine(1000, 8);
 		engine.set_soundfont(&bank);
 		engine.note_on(0, 60, 127);
 		std::array<float, 2> baseline{}, changed{};
@@ -381,6 +397,73 @@ void test_controller_contract()
 	}
 }
 
+void test_rpn_pitch_bend_sensitivity()
+{
+	safsyn::Soundfont bank;
+	bank.sfz_pcm.emplace_back(64);
+	for (size_t index = 0; index < bank.sfz_pcm.back().size(); ++index)
+		bank.sfz_pcm.back()[index] = static_cast<int16_t>(index * 400);
+	safsyn::SampleRegion region;
+	region.pcm = bank.sfz_pcm.back().data();
+	region.pcm_len = static_cast<uint32_t>(bank.sfz_pcm.back().size());
+	region.sample_rate = 1000;
+	region.root_key = 60;
+	region.attack = 0.0f;
+	region.decay = 0.0f;
+	region.sustain = 1.0f;
+	region.release = 0.0f;
+	bank.regions.push_back(region);
+
+	for (const auto model : {safsyn::VoiceModel::Individual, safsyn::VoiceModel::Cohorts})
+	{
+		safsyn::SynthEngine engine(1000, 8), reference(1000, 8);
+		engine.set_soundfont(&bank);
+		engine.set_voice_model(model);
+		reference.set_soundfont(&bank);
+		reference.set_voice_model(model);
+		engine.note_on(0, 60, 127);
+		reference.note_on(0, 60, 127);
+		std::array<float, 8> discarded{};
+		engine.render_audio(discarded.data(), 4);
+		reference.render_audio(discarded.data(), 6);
+
+		// Make a non-centered bend active first, then change its range. The held
+		// voice must be retuned by Data Entry without another pitch-bend event.
+		engine.set_pitch_bend(0, 16383);
+		engine.control_change(0, 101, 0);
+		engine.control_change(0, 100, 0);
+		engine.control_change(0, 6, 12);
+		std::array<float, 4> bent{};
+		std::array<float, 2> expected{};
+		engine.render_audio(bent.data(), 2);
+		reference.render_audio(expected.data(), 1);
+		check(std::abs(bent[2] - expected[0]) < 1e-6f,
+			"RPN 0 Data Entry retunes a held voice to the configured 12-semitone range");
+		check(engine.pitch_bend_value(0) == 16383 &&
+			engine.pitch_bend_range_semitones(0) == 12.0f &&
+			engine.pitch_bend_range_semitones(1) == 2.0f,
+			"pitch-bend value and sensitivity remain isolated per channel");
+
+		engine.control_change(0, 99, 1);
+		engine.control_change(0, 98, 2);
+		engine.control_change(0, 6, 5);
+		check(engine.pitch_bend_range_semitones(0) == 12.0f,
+			"NRPN Data Entry does not overwrite the selected RPN pitch range");
+		engine.control_change(0, 101, 0);
+		engine.control_change(0, 100, 0);
+		engine.control_change(0, 6, 12);
+		engine.control_change(0, 38, 50);
+		check(std::abs(engine.pitch_bend_range_semitones(0) - 12.5f) < 1e-6f,
+			"RPN 0 retains independent semitone and cent Data Entry components");
+		engine.control_change(0, 121, 0);
+		check(engine.pitch_bend_value(0) == 8192 &&
+			engine.pitch_bend_range_semitones(0) == 2.0f &&
+			engine.controller_value(0, 100) == 127 &&
+			engine.controller_value(0, 101) == 127,
+			"CC121 restores bend center, default sensitivity, and null parameter selection");
+	}
+}
+
 void test_determinism_and_block_invariance()
 {
 	auto bank = make_constant_bank();
@@ -436,11 +519,41 @@ void test_voice_stealing_and_midi_messages()
 	engine.note_on(0, 62, 100);
 	engine.note_on(0, 64, 100);
 	check(engine.active_voice_count() == 2, "voice capacity is enforced");
-	check(engine.stats().stolen_voices == 1, "oldest voice is stolen at capacity");
+	check(engine.stats().stolen_voices == 1, "voice capacity performs one deterministic steal");
 	engine.consume_short_message(0x00004080); // note 64 off
 	std::vector<float> release(16);
 	engine.render_audio(release.data(), 8);
 	check(engine.active_voice_count() == 1, "packed MIDI note-off reaches the engine");
+
+	for (const auto model : {safsyn::VoiceModel::Individual, safsyn::VoiceModel::Cohorts})
+	{
+		safsyn::SynthEngine prioritized(1000, 2);
+		prioritized.set_soundfont(&bank);
+		prioritized.set_voice_model(model, 2);
+		prioritized.note_on(0, 60, 127);
+		prioritized.note_on(0, 61, 1);
+		std::array<float, 2> establish_envelopes{};
+		prioritized.render_audio(establish_envelopes.data(), 1);
+		prioritized.note_on(0, 62, 127);
+		prioritized.note_off(0, 60);
+		std::array<float, 8> release_quiet_test{};
+		prioritized.render_audio(release_quiet_test.data(), 4);
+		check(prioritized.active_voice_count() == 1,
+			"capacity stealing discards the least-audible voice before a louder held voice");
+
+		safsyn::SynthEngine long_held(1000, 2);
+		long_held.set_soundfont(&bank);
+		long_held.set_voice_model(model, 2);
+		long_held.note_on(0, 60, 100);
+		long_held.note_on(0, 61, 100);
+		long_held.render_audio(establish_envelopes.data(), 1);
+		long_held.note_on(0, 62, 100);
+		long_held.note_off(0, 60);
+		std::array<float, 8> release_tie_test{};
+		long_held.render_audio(release_tie_test.data(), 4);
+		check(long_held.active_voice_count() == 1,
+			"equal-audibility stealing preserves the older long-held voice");
+	}
 }
 
 void test_channel_preset_selection_and_stress_mode()
@@ -608,6 +721,7 @@ int main(int argc, char** argv)
 	test_independent_instances();
 	test_release_and_sustain();
 	test_controller_contract();
+	test_rpn_pitch_bend_sensitivity();
 	test_determinism_and_block_invariance();
 	test_interpolation_pitch_and_stereo();
 	test_voice_stealing_and_midi_messages();

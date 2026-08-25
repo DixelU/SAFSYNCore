@@ -742,26 +742,23 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 			uint64_t count = 0;
 		};
 		ScheduledSmfStream stream(file, options.sample_rate);
-		std::array<uint8_t, 16> bank_msb{};
-		std::array<uint8_t, 16> bank_lsb{};
 		std::array<uint8_t, 16> programs{};
-		std::array<uint8_t, 16> volume_msb{};
-		std::array<uint8_t, 16> volume_lsb{};
-		std::array<uint8_t, 16> pan_msb{};
-		std::array<uint8_t, 16> pan_lsb{};
-		std::array<uint8_t, 16> expression_msb{};
-		std::array<uint8_t, 16> expression_lsb{};
+		std::array<std::array<uint8_t, 128>, 16> controller_values{};
 		std::array<uint64_t, 16> active_channel_notes{};
 		std::array<std::array<SmfControllerUsage, 128>, 16> controller_usage{};
 		std::array<std::array<bool, 128>, 16> controller_seen{};
 		for (size_t channel = 0; channel < 16; ++channel)
 		{
-			bank_msb[channel] = static_cast<uint8_t>(options.initial_bank >> 7);
-			bank_lsb[channel] = static_cast<uint8_t>(options.initial_bank & 0x7f);
+			controller_values[channel][0] = static_cast<uint8_t>(options.initial_bank >> 7);
+			controller_values[channel][32] = static_cast<uint8_t>(options.initial_bank & 0x7f);
 			programs[channel] = options.initial_program;
-			volume_msb[channel] = 100;
-			pan_msb[channel] = 64;
-			expression_msb[channel] = 127;
+			controller_values[channel][7] = 100;
+			controller_values[channel][10] = 64;
+			controller_values[channel][11] = 127;
+			controller_values[channel][98] = 127;
+			controller_values[channel][99] = 127;
+			controller_values[channel][100] = 127;
+			controller_values[channel][101] = 127;
 			for (size_t controller = 0; controller < 128; ++controller)
 			{
 				controller_usage[channel][controller].channel = static_cast<uint8_t>(channel);
@@ -1005,6 +1002,7 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 				if (command == 0xb0)
 				{
 					const uint64_t active_channel_notes_before = active_channel_notes[channel];
+					controller_values[channel][scheduled.event.data1] = scheduled.event.data2;
 					auto& controller = controller_usage[channel][scheduled.event.data1];
 					if (!controller_seen[channel][scheduled.event.data1])
 					{
@@ -1024,14 +1022,6 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 					++controller.events;
 					controller.last_tick = scheduled.event.tick;
 					controller.last_sample = scheduled.sample;
-					if (scheduled.event.data1 == 0) bank_msb[channel] = scheduled.event.data2;
-					if (scheduled.event.data1 == 32) bank_lsb[channel] = scheduled.event.data2;
-					if (scheduled.event.data1 == 7) volume_msb[channel] = scheduled.event.data2;
-					if (scheduled.event.data1 == 39) volume_lsb[channel] = scheduled.event.data2;
-					if (scheduled.event.data1 == 10) pan_msb[channel] = scheduled.event.data2;
-					if (scheduled.event.data1 == 42) pan_lsb[channel] = scheduled.event.data2;
-					if (scheduled.event.data1 == 11) expression_msb[channel] = scheduled.event.data2;
-					if (scheduled.event.data1 == 43) expression_lsb[channel] = scheduled.event.data2;
 					if (scheduled.event.data1 == 64)
 					{
 						const bool was_down = sustain[channel];
@@ -1044,27 +1034,28 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 						if (sustain[channel])
 							release_sustain(channel);
 						sustain[channel] = false;
-						volume_msb[channel] = 100;
-						volume_lsb[channel] = 0;
-						pan_msb[channel] = 64;
-						pan_lsb[channel] = 0;
-						expression_msb[channel] = 127;
-						expression_lsb[channel] = 0;
+						const uint8_t bank_msb = controller_values[channel][0];
+						const uint8_t bank_lsb = controller_values[channel][32];
+						controller_values[channel] = {};
+						controller_values[channel][0] = bank_msb;
+						controller_values[channel][32] = bank_lsb;
+						controller_values[channel][7] = 100;
+						controller_values[channel][10] = 64;
+						controller_values[channel][11] = 127;
+						controller_values[channel][98] = 127;
+						controller_values[channel][99] = 127;
+						controller_values[channel][100] = 127;
+						controller_values[channel][101] = 127;
 					}
 					if (scheduled.event.data1 == 120)
 						release_channel(channel);
 					if (scheduled.event.data1 == 123 || scheduled.event.data1 >= 124)
 						all_notes_off_channel(channel);
-					const bool traced_controller = scheduled.event.data1 == 7 ||
-						scheduled.event.data1 == 39 || scheduled.event.data1 == 10 ||
-						scheduled.event.data1 == 42 || scheduled.event.data1 == 11 ||
-						scheduled.event.data1 == 43 || scheduled.event.data1 == 64 ||
-						scheduled.event.data1 >= 120;
 					const uint64_t trace_end = options.controller_trace_frames >
 						(std::numeric_limits<uint64_t>::max)() - options.controller_trace_start_frame
 						? (std::numeric_limits<uint64_t>::max)()
 						: options.controller_trace_start_frame + options.controller_trace_frames;
-					if (traced_controller && options.controller_trace_frames != 0 &&
+					if (options.controller_trace_frames != 0 &&
 						scheduled.sample >= options.controller_trace_start_frame &&
 						scheduled.sample <= trace_end &&
 						(options.controller_trace_controller < 0 ||
@@ -1074,10 +1065,12 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 						analysis.controller_trace.push_back({scheduled.event.tick, scheduled.sample,
 							scheduled.event.track, scheduled.event.ordinal, channel,
 							scheduled.event.data1, scheduled.event.data2,
-							static_cast<uint16_t>((volume_msb[channel] << 7) | volume_lsb[channel]),
-							static_cast<uint16_t>((pan_msb[channel] << 7) | pan_lsb[channel]),
-							static_cast<uint16_t>((expression_msb[channel] << 7) |
-								expression_lsb[channel]), active_channel_notes_before,
+							static_cast<uint16_t>((controller_values[channel][7] << 7) |
+								controller_values[channel][39]),
+							static_cast<uint16_t>((controller_values[channel][10] << 7) |
+								controller_values[channel][42]),
+							static_cast<uint16_t>((controller_values[channel][11] << 7) |
+								controller_values[channel][43]), active_channel_notes_before,
 							active_channel_notes[channel], sustain[channel]});
 					}
 				}
@@ -1087,7 +1080,8 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 				{
 					++analysis.note_ons;
 					const uint16_t bank = static_cast<uint16_t>(
-						(static_cast<uint16_t>(bank_msb[channel]) << 7) | bank_lsb[channel]);
+						(static_cast<uint16_t>(controller_values[channel][0]) << 7) |
+						controller_values[channel][32]);
 					const uint32_t key = (static_cast<uint32_t>(channel) << 21) |
 						(static_cast<uint32_t>(bank) << 7) | programs[channel];
 					++usage[key];

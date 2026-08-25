@@ -336,7 +336,7 @@ void test_voice_stealing_does_not_reassign_survivor_phases()
 		stolen.note_on(0, note, 100);
 		explicit_stop.note_on(0, note, 100);
 	}
-	explicit_stop.note_off(0, 60);
+	explicit_stop.note_off(0, 61);
 	check(stolen.stats().stolen_voices == 1, "voice-stealing fixture actually steals one voice");
 	check(render(stolen, 96) == render(explicit_stop, 96),
 		"voice stealing does not alter phases assigned to surviving events");

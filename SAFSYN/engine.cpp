@@ -100,15 +100,22 @@ SynthEngine::Voice* SynthEngine::allocate_voice() noexcept
 		if (!voice.active())
 			return &voice;
 
+	auto estimated_level = [&](const Voice& voice) {
+		const auto& channel = channels_[voice.channel];
+		return voice.env * channel.volume * channel.expression * master_volume_ *
+			(std::max)(std::abs(voice.gain_l), std::abs(voice.gain_r));
+	};
 	auto candidate = voices_.begin();
 	for (auto it = voices_.begin(); it != voices_.end(); ++it)
 	{
 		const bool it_releasing = it->stage == Voice::Stage::Release;
 		const bool candidate_releasing = candidate->stage == Voice::Stage::Release;
+		const float it_level = estimated_level(*it);
+		const float candidate_level = estimated_level(*candidate);
 		if ((it_releasing && !candidate_releasing) ||
 			(it_releasing == candidate_releasing &&
-				(it->env < candidate->env ||
-					(it->env == candidate->env && it->serial < candidate->serial))))
+				(it_level < candidate_level ||
+					(it_level == candidate_level && it->serial > candidate->serial))))
 			candidate = it;
 	}
 	++stats_.stolen_voices;
@@ -264,7 +271,8 @@ void SynthEngine::note_on(uint8_t channel, uint8_t note, uint8_t velocity) noexc
 	const uint64_t serial = next_serial_++;
 	const auto& channel_state = channels_[channel];
 	const uint16_t selected_bank = static_cast<uint16_t>(
-		(static_cast<uint16_t>(channel_state.bank_msb) << 7) | channel_state.bank_lsb);
+		(static_cast<uint16_t>(channel_state.controllers[0]) << 7) |
+		channel_state.controllers[32]);
 	const auto& render_regions = all_regions_mode_ && !soundfont_->stress_regions.empty()
 		? soundfont_->stress_regions : soundfont_->regions;
 	for (size_t region_id = 0; region_id < render_regions.size(); ++region_id)
@@ -379,6 +387,17 @@ void SynthEngine::update_channel_voice_gains(uint8_t channel) noexcept
 			compute_gains(*voice.region, channel, voice.velocity, voice.gain_l, voice.gain_r);
 }
 
+void SynthEngine::update_channel_pitch_bend(uint8_t channel) noexcept
+{
+	auto& state = channels_[channel];
+	const int displacement = static_cast<int>(state.pitch_bend_value) - 8192;
+	const float normalized = displacement < 0
+		? displacement / 8192.0f
+		: displacement / 8191.0f;
+	state.pitch_bend_semitones = normalized * state.pitch_bend_range_semitones;
+	update_channel_pitch(channel);
+}
+
 void SynthEngine::update_channel_pitch(uint8_t channel) noexcept
 {
 	if (voice_model_ == VoiceModel::Cohorts)
@@ -428,56 +447,50 @@ void SynthEngine::all_sound_off(uint8_t channel) noexcept
 
 void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t value) noexcept
 {
-	if (channel >= 16)
+	if (channel >= 16 || controller >= 128)
 		return;
+	value = (std::min)(value, uint8_t{127});
 	if (voice_model_ == VoiceModel::Cohorts && cohort_engine_)
 		cohort_engine_->invalidate_onset_merges(channel);
 	auto& state = channels_[channel];
+	state.controllers[controller] = value;
 	switch (controller)
 	{
 	case 0:
-		state.bank_msb = value;
 		break;
 	case 7:
-		state.volume_msb = value;
-		state.volume = static_cast<float>((state.volume_msb << 7) | state.volume_lsb) /
-			16383.0f;
+		state.volume = static_cast<float>((state.controllers[7] << 7) |
+			state.controllers[39]) / 16383.0f;
 		break;
 	case 10:
-		state.pan_msb = value;
 	{
-		const int pan14 = (state.pan_msb << 7) | state.pan_lsb;
+		const int pan14 = (state.controllers[10] << 7) | state.controllers[42];
 		state.pan = pan14 < 8192 ? (pan14 - 8192) / 8192.0f :
 			(pan14 - 8192) / 8191.0f;
 	}
 		update_channel_voice_gains(channel);
 		break;
 	case 11:
-		state.expression_msb = value;
-		state.expression = static_cast<float>((state.expression_msb << 7) |
-			state.expression_lsb) / 16383.0f;
+		state.expression = static_cast<float>((state.controllers[11] << 7) |
+			state.controllers[43]) / 16383.0f;
 		break;
 	case 32:
-		state.bank_lsb = value;
 		break;
 	case 39:
-		state.volume_lsb = value;
-		state.volume = static_cast<float>((state.volume_msb << 7) | state.volume_lsb) /
-			16383.0f;
+		state.volume = static_cast<float>((state.controllers[7] << 7) |
+			state.controllers[39]) / 16383.0f;
 		break;
 	case 42:
-		state.pan_lsb = value;
 	{
-		const int pan14 = (state.pan_msb << 7) | state.pan_lsb;
+		const int pan14 = (state.controllers[10] << 7) | state.controllers[42];
 		state.pan = pan14 < 8192 ? (pan14 - 8192) / 8192.0f :
 			(pan14 - 8192) / 8191.0f;
 	}
 		update_channel_voice_gains(channel);
 		break;
 	case 43:
-		state.expression_lsb = value;
-		state.expression = static_cast<float>((state.expression_msb << 7) |
-			state.expression_lsb) / 16383.0f;
+		state.expression = static_cast<float>((state.controllers[11] << 7) |
+			state.controllers[43]) / 16383.0f;
 		break;
 	case 64:
 	{
@@ -497,18 +510,39 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 		}
 		break;
 	}
+	case 98:
+	case 99:
+		state.parameter_selection = ChannelState::ParameterSelection::Nrpn;
+		break;
+	case 100:
+	case 101:
+		state.parameter_selection = state.controllers[100] == 127 &&
+			state.controllers[101] == 127
+			? ChannelState::ParameterSelection::None
+			: ChannelState::ParameterSelection::Rpn;
+		break;
+	case 6:
+	case 38:
+		if (state.parameter_selection == ChannelState::ParameterSelection::Rpn &&
+			state.controllers[101] == 0 && state.controllers[100] == 0)
+		{
+			state.pitch_bend_range_semitones = state.controllers[6] +
+				state.controllers[38] / 100.0f;
+			update_channel_pitch_bend(channel);
+		}
+		break;
 	case 120:
 		all_sound_off(channel);
 		break;
 	case 121:
 	{
 		const bool release_pending = state.sustain_pedal;
-		const uint8_t bank_msb = state.bank_msb;
-		const uint8_t bank_lsb = state.bank_lsb;
+		const uint8_t bank_msb = state.controllers[0];
+		const uint8_t bank_lsb = state.controllers[32];
 		const uint8_t program = state.program;
 		state = ChannelState{};
-		state.bank_msb = bank_msb;
-		state.bank_lsb = bank_lsb;
+		state.controllers[0] = bank_msb;
+		state.controllers[32] = bank_lsb;
 		state.program = program;
 		if (release_pending)
 		{
@@ -538,6 +572,11 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 	}
 }
 
+uint8_t SynthEngine::controller_value(uint8_t channel, uint8_t controller) const noexcept
+{
+	return channel < 16 && controller < 128 ? channels_[channel].controllers[controller] : 0;
+}
+
 void SynthEngine::set_master_volume(uint16_t value14) noexcept
 {
 	value14 = (std::min)(value14, uint16_t{16383});
@@ -562,10 +601,18 @@ void SynthEngine::set_pitch_bend(uint8_t channel, uint16_t value14) noexcept
 		return;
 	if (voice_model_ == VoiceModel::Cohorts && cohort_engine_)
 		cohort_engine_->invalidate_onset_merges(channel);
-	value14 = (std::min)(value14, uint16_t{16383});
-	channels_[channel].pitch_bend_semitones =
-		(static_cast<int>(value14) - 8192) / 8192.0f * 2.0f;
-	update_channel_pitch(channel);
+	channels_[channel].pitch_bend_value = (std::min)(value14, uint16_t{16383});
+	update_channel_pitch_bend(channel);
+}
+
+uint16_t SynthEngine::pitch_bend_value(uint8_t channel) const noexcept
+{
+	return channel < 16 ? channels_[channel].pitch_bend_value : 8192;
+}
+
+float SynthEngine::pitch_bend_range_semitones(uint8_t channel) const noexcept
+{
+	return channel < 16 ? channels_[channel].pitch_bend_range_semitones : 2.0f;
 }
 
 void SynthEngine::consume_short_message(uint32_t message) noexcept

@@ -235,6 +235,9 @@ std::vector<float> lifecycle_render(safsyn::SynthEngine& engine, bool batched)
 	if (batched) engine.note_off_batch(0, 60, 4);
 	else for (uint32_t index = 0; index < 4; ++index) engine.note_off(0, 60);
 	append(5);
+	engine.control_change(0, 101, 0);
+	engine.control_change(0, 100, 0);
+	engine.control_change(0, 6, 12);
 	engine.set_pitch_bend(0, 10240);
 	engine.control_change(0, 10, 35);
 	engine.control_change(0, 7, 103);

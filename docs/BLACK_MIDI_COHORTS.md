@@ -32,6 +32,14 @@ Offline cohort growth has no implicit limit. `--max-cohorts N` installs an
 explicit safety ceiling and enables deterministic cohort stealing; a zero
 ceiling means dynamic growth without stealing.
 
+Capacity stealing first prefers release-stage cohorts and then the smallest
+estimated audible contribution. The estimate includes envelope, channel volume
+and expression, velocity/region gain, master volume, and cohort multiplicity.
+Exact ties discard the newer cohort so older held tones are not systematically
+removed before a dense burst ends. This policy improves bounded listening
+renders, but no victim heuristic can exactly represent Hypernova's roughly
+55,000-cohort peak in 4,096 physical slots.
+
 ## Phase aggregation
 
 Coherent cohorts multiply the source by logical multiplicity. Random polarity

@@ -21,7 +21,8 @@ path plus dynamically growing exact onset cohorts for normal offline SMF
 rendering, deterministic safety-limit stealing, pitch and pitch bend, linear interpolation, AHDSR envelopes,
 note-off and sustain behavior, forward and ping-pong loops, stereo samples,
 constant-power panning, 14-bit volume/pan/expression pairs, universal master
-volume, channel-mode messages, and unclipped float mixing.
+volume, per-channel retention of all 128 CC values, RPN/NRPN selection,
+RPN 0 pitch-bend sensitivity, channel-mode messages, and unclipped float mixing.
 SF2 playback resolves preset zones through instruments to sample zones, combines
 the supported generator subset, intersects key/velocity ranges, and reconstructs
 linked left/right samples as one logical stereo region. MIDI bank select and
@@ -100,7 +101,7 @@ has been selected as a production default.
 SMF analysis also reports identical-note group histograms, group locations,
 logical-note/cohort peak estimates, and onset compression. These are MIDI-only
 estimates; exact post-preset region/cohort statistics are reported by renders.
-It also reports a controller histogram and supports bounded controller traces.
+It also reports a controller histogram and supports bounded traces for any CC.
 
 Optional mastering controls are `--output-gain-db`, `--limiter`,
 `--limiter-ceiling-db`, `--limiter-lookahead-ms`, and

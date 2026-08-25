@@ -2,6 +2,7 @@
 
 #include "phase.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -146,8 +147,13 @@ public:
 	void note_off(uint8_t channel, uint8_t note) noexcept;
 	void note_off_batch(uint8_t channel, uint8_t note, uint64_t count) noexcept;
 	void control_change(uint8_t channel, uint8_t controller, uint8_t value) noexcept;
+	// Every MIDI CC has independent retained state on every channel, including
+	// controls whose DSP behavior is not implemented yet (for example effects sends).
+	uint8_t controller_value(uint8_t channel, uint8_t controller) const noexcept;
 	void program_change(uint8_t channel, uint8_t program) noexcept;
 	void set_pitch_bend(uint8_t channel, uint16_t value14) noexcept;
+	uint16_t pitch_bend_value(uint8_t channel) const noexcept;
+	float pitch_bend_range_semitones(uint8_t channel) const noexcept;
 	// Universal real-time Master Volume, normalized from MIDI's 14-bit value.
 	void set_master_volume(uint16_t value14) noexcept;
 	void consume_short_message(uint32_t packed_message) noexcept;
@@ -192,19 +198,28 @@ private:
 
 	struct ChannelState
 	{
+		enum class ParameterSelection : uint8_t { None, Rpn, Nrpn };
+
+		ChannelState() noexcept
+		{
+			controllers[7] = 100;
+			controllers[10] = 64;
+			controllers[11] = 127;
+			controllers[98] = 127;
+			controllers[99] = 127;
+			controllers[100] = 127;
+			controllers[101] = 127;
+		}
+
+		std::array<uint8_t, 128> controllers{};
 		float volume = 100.0f / 127.0f;
 		float expression = 1.0f;
 		float pan = 0.0f;
 		float pitch_bend_semitones = 0.0f;
+		float pitch_bend_range_semitones = 2.0f;
+		uint16_t pitch_bend_value = 8192;
+		ParameterSelection parameter_selection = ParameterSelection::None;
 		bool sustain_pedal = false;
-		uint8_t volume_msb = 100;
-		uint8_t volume_lsb = 0;
-		uint8_t pan_msb = 64;
-		uint8_t pan_lsb = 0;
-		uint8_t expression_msb = 127;
-		uint8_t expression_lsb = 0;
-		uint8_t bank_msb = 0;
-		uint8_t bank_lsb = 0;
 		uint8_t program = 0;
 	};
 
@@ -217,6 +232,7 @@ private:
 	void begin_envelope(Voice& voice) noexcept;
 	float advance_envelope(Voice& voice) noexcept;
 	void update_channel_voice_gains(uint8_t channel) noexcept;
+	void update_channel_pitch_bend(uint8_t channel) noexcept;
 	void update_channel_pitch(uint8_t channel) noexcept;
 	void all_notes_off(uint8_t channel) noexcept;
 	void all_sound_off(uint8_t channel) noexcept;

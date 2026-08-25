@@ -354,8 +354,14 @@ struct CohortEngineState
 		(void)owner;
 	}
 
-	uint32_t steal_candidate() const noexcept
+	uint32_t steal_candidate(const SynthEngine& owner) const noexcept
 	{
+		auto estimated_level = [&](const RenderCohort& cohort) {
+			const auto& channel = owner.channels_[cohort.channel];
+			const double gain = (std::max)(std::abs(cohort.gain_l), std::abs(cohort.gain_r));
+			return static_cast<double>(cohort.env) * channel.volume * channel.expression *
+				owner.master_volume_ * gain * cohort.phase.multiplicity;
+		};
 		uint32_t candidate = invalid_index;
 		for (uint32_t index = 0; index < cohorts.size(); ++index)
 		{
@@ -370,10 +376,13 @@ struct CohortEngineState
 			const auto& selected = cohorts[candidate].cohort;
 			const bool current_releasing = current.stage == CohortStage::Release;
 			const bool selected_releasing = selected.stage == CohortStage::Release;
+			const double current_level = estimated_level(current);
+			const double selected_level = estimated_level(selected);
 			if ((current_releasing && !selected_releasing) ||
 				(current_releasing == selected_releasing &&
-					(current.env < selected.env ||
-						(current.env == selected.env && current.oldest_serial < selected.oldest_serial))))
+					(current_level < selected_level ||
+						(current_level == selected_level &&
+							current.oldest_serial > selected.oldest_serial))))
 				candidate = index;
 		}
 		return candidate;
@@ -384,7 +393,7 @@ struct CohortEngineState
 	{
 		if (maximum_cohorts != 0 && active_cohort_count >= maximum_cohorts)
 		{
-			const uint32_t victim = steal_candidate();
+			const uint32_t victim = steal_candidate(owner);
 			if (victim != invalid_index)
 			{
 				owner.stats_.stolen_voices += cohorts[victim].cohort.phase.multiplicity;
@@ -757,7 +766,8 @@ struct CohortEngineState
 			return;
 		const auto& channel_state = owner.channels_[channel];
 		const uint16_t selected_bank = static_cast<uint16_t>(
-			(static_cast<uint16_t>(channel_state.bank_msb) << 7) | channel_state.bank_lsb);
+			(static_cast<uint16_t>(channel_state.controllers[0]) << 7) |
+			channel_state.controllers[32]);
 		const auto& render_regions = owner.all_regions_mode_ &&
 			!owner.soundfont_->stress_regions.empty()
 			? owner.soundfont_->stress_regions : owner.soundfont_->regions;

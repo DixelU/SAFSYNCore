@@ -72,6 +72,10 @@ It must not be described or measured as phase-only processing.
   they fit; RF64 with a `ds64` chunk is selected from the predicted frame count
   when ordinary RIFF can exceed 4 GiB.
 - MIDI bank select uses CC 0/32 and program changes use status `0xCn`.
+- Each channel retains an independent 128-entry CC table. Implemented DSP
+  controls derive from that table; unimplemented effects sends remain retained.
+- RPN/NRPN selection is channel-local. RPN 0 CC6/38 Data Entry controls pitch
+  bend sensitivity and retunes already-active voices immediately.
 - Normal SF2 note-on traversal is limited to the channel's selected bank and
   program. The legacy flattened view is reachable only through the explicit
   all-regions stress setting.
