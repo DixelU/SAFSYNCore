@@ -10,6 +10,8 @@ default so DSP experiments retain a reproducible baseline.
 - `safsyn`: static library with a C++20 public API, SF2/SFZ loading, and an
   instance-based synthesizer
 - `safsyn-render`: headless scripted-note renderer producing stereo float32 WAV
+- `safsyn-render-gui`: native Windows SMF renderer with organized settings,
+  live render metrics, remaining-time estimates, and cancellation
 - `safsyn-tests`: engine, MIDI-message, SFZ-loader, determinism, and WAV tests
 - `safsyn-phase-tests`: phase policy, determinism, pool, loop, and cache tests
 - `safsyn-mastering-tests`: gain, lookahead, stereo-link, and invariance tests
@@ -37,6 +39,14 @@ cmake -S . -B build
 cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
+
+On Windows, open `build/Release/safsyn-render-gui.exe` for the graphical
+renderer. Choose a MIDI file, an SF2/SFZ sound bank, and an output WAV; the
+Essentials, Phase, and Mastering tabs expose the same defaults as the CLI.
+Rendering stays off the UI thread and reports exact frame progress, scheduled
+events, active voices/cohorts, peak level, elapsed time, and estimated time
+remaining. Cancelling finalizes the frames already written as a valid partial
+WAV.
 
 The public library headers remain C++20. The library implementation uses the
 pinned `DixelU/utility` `long_uint` header for exact scheduling arithmetic and

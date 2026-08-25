@@ -17,6 +17,38 @@ namespace
 {
 int failures = 0;
 
+struct ProgressCapture
+{
+	uint64_t previous_frame = 0;
+	uint64_t final_frame = 0;
+	uint64_t cancel_after_frame = 0;
+	bool monotonic = true;
+	bool saw_events = false;
+	bool saw_tail = false;
+	bool saw_finalizing = false;
+	bool saw_complete = false;
+	uint32_t calls = 0;
+};
+
+bool capture_progress(const safsyn::SmfRenderProgress& progress, void* user_data) noexcept
+{
+	auto& capture = *static_cast<ProgressCapture*>(user_data);
+	++capture.calls;
+	capture.monotonic = capture.monotonic && progress.frames_rendered >= capture.previous_frame;
+	capture.previous_frame = progress.frames_rendered;
+	capture.final_frame = progress.frames_rendered;
+	capture.saw_events = capture.saw_events ||
+		progress.stage == safsyn::SmfRenderProgressStage::RenderingEvents;
+	capture.saw_tail = capture.saw_tail ||
+		progress.stage == safsyn::SmfRenderProgressStage::RenderingTail;
+	capture.saw_finalizing = capture.saw_finalizing ||
+		progress.stage == safsyn::SmfRenderProgressStage::Finalizing;
+	capture.saw_complete = capture.saw_complete ||
+		progress.stage == safsyn::SmfRenderProgressStage::Complete;
+	return capture.cancel_after_frame == 0 ||
+		progress.frames_rendered < capture.cancel_after_frame;
+}
+
 void check(bool condition, const char* message)
 {
 	if (!condition)
@@ -578,6 +610,52 @@ void test_tail_drain(const std::filesystem::path& directory)
 		bounded.tail_ceiling_reached && bounded.tail_frames_written == 5,
 		"tail drain reports an explicit maximum-tail ceiling");
 }
+
+void test_render_progress_and_cancellation(const std::filesystem::path& directory)
+{
+	safsyn::SmfFile file;
+	check(file.load_bytes(render_fixture_midi(false)), "progress fixture loads");
+	safsyn::SmfAnalysisOptions analysis_options;
+	analysis_options.sample_rate = 1000;
+	analysis_options.tail_frames = 100;
+	safsyn::SmfAnalysis analysis;
+	check(safsyn::analyze_smf(file, analysis_options, analysis),
+		"progress fixture analyzes");
+	auto bank = make_bank(1000);
+
+	safsyn::SmfRenderOptions options;
+	options.sample_rate = 1000;
+	options.tail_frames = 100;
+	options.block_frames = 37;
+	ProgressCapture completed_progress;
+	options.progress_callback = capture_progress;
+	options.progress_user_data = &completed_progress;
+	const auto completed_path = directory / "progress-complete.wav";
+	safsyn::SmfRenderResult completed;
+	check(safsyn::render_smf_stream(file, analysis, bank,
+		completed_path.string().c_str(), options, completed),
+		"render with progress callback succeeds");
+	check(completed_progress.calls > 3 && completed_progress.monotonic &&
+		completed_progress.saw_events && completed_progress.saw_tail &&
+		completed_progress.saw_finalizing && completed_progress.saw_complete &&
+		completed_progress.final_frame == completed.frames_written,
+		"render progress reports monotonic stages through completion");
+
+	ProgressCapture cancelled_progress;
+	cancelled_progress.cancel_after_frame = 50;
+	options.block_frames = 10;
+	options.progress_user_data = &cancelled_progress;
+	const auto cancelled_path = directory / "progress-cancelled.wav";
+	safsyn::SmfRenderResult cancelled;
+	check(!safsyn::render_smf_stream(file, analysis, bank,
+		cancelled_path.string().c_str(), options, cancelled) && cancelled.cancelled &&
+		cancelled.frames_written == 50 && cancelled.diagnostics.empty(),
+		"progress callback can cancel a render at a block boundary");
+	const auto cancelled_bytes = read_file(cancelled_path);
+	check(cancelled_bytes.size() == 44 + cancelled.frames_written * 8 &&
+		read_le32(cancelled_bytes, 40) == cancelled.frames_written * 8,
+		"cancelled render is finalized as a valid partial WAV");
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -593,6 +671,7 @@ int main(int argc, char** argv)
 	test_streamed_render_determinism(directory);
 	test_cohort_histogram_and_mass_dispatch(directory);
 	test_tail_drain(directory);
+	test_render_progress_and_cancellation(directory);
 	if (failures != 0)
 	{
 		std::cerr << failures << " SMF test(s) failed\n";

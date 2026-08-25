@@ -51,6 +51,17 @@ if(MSVC)
 	target_compile_options(safsyn-render PRIVATE /EHsc)
 endif()
 
+if(WIN32)
+	add_executable(safsyn-render-gui WIN32 tools/safsyn_render_gui.cpp)
+	target_link_libraries(safsyn-render-gui PRIVATE SAFSYN::safsyn
+		comctl32 comdlg32 shell32)
+	target_compile_features(safsyn-render-gui PRIVATE cxx_std_20)
+	target_compile_definitions(safsyn-render-gui PRIVATE UNICODE _UNICODE NOMINMAX)
+	if(MSVC)
+		target_compile_options(safsyn-render-gui PRIVATE /EHsc /W4 /permissive-)
+	endif()
+endif()
+
 if(WIN32 AND SAFSYN_BUILD_WINMM)
 	add_library(safsyn-winmm MODULE SAFSYN/dllmain.cpp)
 	target_link_libraries(safsyn-winmm PRIVATE SAFSYN::safsyn)

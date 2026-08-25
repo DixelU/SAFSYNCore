@@ -76,6 +76,31 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 		long double raw_sum_squares = 0.0L;
 		long double output_sum_squares = 0.0L;
 		uint64_t cursor = 0;
+		const uint64_t progress_frame_interval = (std::max)(uint64_t{1},
+			static_cast<uint64_t>(options.sample_rate) / 100ULL);
+		uint64_t next_progress_frame = 0;
+		uint64_t next_progress_event = 16'384;
+		SmfRenderProgressStage progress_stage = SmfRenderProgressStage::Preparing;
+		auto report_progress = [&](SmfRenderProgressStage stage,
+			uint64_t completed, uint64_t total) -> bool {
+			if (!options.progress_callback)
+				return true;
+			return options.progress_callback({stage, completed, total,
+				result.scheduled_events, engine.active_voice_count(),
+				engine.active_cohort_count(), result.raw_peak},
+				options.progress_user_data);
+		};
+		auto finish_cancelled = [&]() -> bool {
+			result.cancelled = true;
+			result.container = writer.container();
+			writer.close();
+			result.frames_written = writer.frames_written();
+			result.engine = engine.stats();
+			result.active_voices_at_end = engine.active_voice_count();
+			result.active_cohorts_at_end = engine.active_cohort_count();
+			result.phase = engine.phase_cache_stats();
+			return false;
+		};
 		auto write_output = [&](const float* audio, uint32_t frames) -> bool {
 			for (size_t index = 0; index < static_cast<size_t>(frames) * 2; ++index)
 			{
@@ -113,12 +138,27 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 				else if (!write_output(block.data(), frames))
 					return false;
 				cursor += frames;
+				if (cursor >= next_progress_frame &&
+					!report_progress(progress_stage, cursor, expected_frames))
+				{
+					result.cancelled = true;
+					return false;
+				}
+				if (cursor >= next_progress_frame)
+					next_progress_frame = cursor > (std::numeric_limits<uint64_t>::max)() -
+						progress_frame_interval ? (std::numeric_limits<uint64_t>::max)() :
+						cursor + progress_frame_interval;
 			}
 			return true;
 		};
+		if (!report_progress(SmfRenderProgressStage::Preparing, 0, expected_frames))
+			return finish_cancelled();
 
 		const uint64_t limit = options.maximum_frames == 0
 			? (std::numeric_limits<uint64_t>::max)() : options.maximum_frames;
+		progress_stage = SmfRenderProgressStage::RenderingEvents;
+		if (!report_progress(progress_stage, 0, expected_frames))
+			return finish_cancelled();
 		ScheduledSmfStream stream(file, options.sample_rate);
 		ScheduledSmfEvent scheduled;
 		bool has_event = stream.next(scheduled);
@@ -133,6 +173,8 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 			const uint64_t event_sample = scheduled.sample;
 			if (!render_to(event_sample))
 			{
+				if (result.cancelled)
+					return finish_cancelled();
 				render_error(result.diagnostics, "failed while streaming WAV audio");
 				return false;
 			}
@@ -160,6 +202,15 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 				has_event = stream.next(scheduled);
 			}
 			dispatch_messages();
+			if (result.scheduled_events >= next_progress_event)
+			{
+				if (!report_progress(progress_stage, cursor, expected_frames))
+					return finish_cancelled();
+				next_progress_event = result.scheduled_events >
+					(std::numeric_limits<uint64_t>::max)() - 16'384ULL
+					? (std::numeric_limits<uint64_t>::max)()
+					: result.scheduled_events + 16'384ULL;
+			}
 		}
 		if (!stream.good())
 		{
@@ -172,6 +223,8 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 			result.truncated = true;
 			if (!render_to(limit))
 			{
+				if (result.cancelled)
+					return finish_cancelled();
 				render_error(result.diagnostics, "failed while writing bounded SMF excerpt");
 				return false;
 			}
@@ -184,6 +237,12 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 				engine.control_change(channel, 123, 0);
 			}
 			const uint64_t tail_start = cursor;
+			progress_stage = SmfRenderProgressStage::RenderingTail;
+			if (!report_progress(progress_stage, cursor, expected_frames))
+				return finish_cancelled();
+			next_progress_frame = cursor > (std::numeric_limits<uint64_t>::max)() -
+				progress_frame_interval ? (std::numeric_limits<uint64_t>::max)() :
+				cursor + progress_frame_interval;
 			uint64_t target = natural_frames;
 			if (options.maximum_frames != 0 && target > options.maximum_frames)
 			{
@@ -195,6 +254,8 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 				while (cursor < target && engine.active_voice_count() != 0)
 					if (!render_to(cursor + 1))
 					{
+						if (result.cancelled)
+							return finish_cancelled();
 						render_error(result.diagnostics, "failed while draining the SMF release tail");
 						return false;
 					}
@@ -202,12 +263,17 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 			}
 			else if (!render_to(target))
 			{
+				if (result.cancelled)
+					return finish_cancelled();
 				render_error(result.diagnostics, "failed while writing the SMF release tail");
 				return false;
 			}
 			result.tail_frames_written = cursor - tail_start;
 		}
 
+		progress_stage = SmfRenderProgressStage::Finalizing;
+		const bool cancelled_during_finalization =
+			!report_progress(progress_stage, cursor, expected_frames);
 		if (mastering)
 		{
 			mastered.clear();
@@ -235,6 +301,13 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 		result.active_cohorts_at_end = engine.active_cohort_count();
 		result.phase = engine.phase_cache_stats();
 		result.diagnostics = stream.diagnostics();
+		if (cancelled_during_finalization)
+		{
+			result.cancelled = true;
+			return false;
+		}
+		report_progress(SmfRenderProgressStage::Complete,
+			result.frames_written, result.frames_written);
 		return true;
 	}
 	catch (...)

@@ -12,6 +12,31 @@
 namespace safsyn
 {
 
+enum class SmfRenderProgressStage : uint8_t
+{
+	Preparing,
+	RenderingEvents,
+	RenderingTail,
+	Finalizing,
+	Complete,
+};
+
+struct SmfRenderProgress
+{
+	SmfRenderProgressStage stage = SmfRenderProgressStage::Preparing;
+	uint64_t frames_rendered = 0;
+	uint64_t total_frames = 0;
+	uint64_t scheduled_events = 0;
+	size_t active_voices = 0;
+	size_t active_cohorts = 0;
+	float raw_peak = 0.0f;
+};
+
+// Return false to stop rendering. A cancelled render is finalized as a valid
+// partial WAV and reported through SmfRenderResult::cancelled.
+using SmfRenderProgressCallback = bool (*)(const SmfRenderProgress& progress,
+	void* user_data) noexcept;
+
 struct SmfRenderOptions
 {
 	uint32_t sample_rate = 48000;
@@ -31,6 +56,8 @@ struct SmfRenderOptions
 	bool all_regions = false;
 	PhaseSettings phase;
 	MasteringSettings mastering;
+	SmfRenderProgressCallback progress_callback = nullptr;
+	void* progress_user_data = nullptr;
 };
 
 struct SmfRenderResult
@@ -53,6 +80,7 @@ struct SmfRenderResult
 	double render_ms = 0.0;
 	bool truncated = false;
 	bool tail_ceiling_reached = false;
+	bool cancelled = false;
 	WavContainer container = WavContainer::Riff;
 	RenderStats engine;
 	PhaseCacheStats phase;
