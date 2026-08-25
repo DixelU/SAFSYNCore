@@ -2,6 +2,7 @@
 #include "cohort_engine.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 namespace safsyn
@@ -13,6 +14,17 @@ constexpr double pi = 3.1415926535897932384626433832795;
 float pcm_to_float(int16_t sample) noexcept
 {
 	return static_cast<float>(sample) / 32768.0f;
+}
+
+const std::array<float, 128>& velocity_amplitudes() noexcept
+{
+	static const auto amplitudes = [] {
+		std::array<float, 128> result{};
+		for (size_t velocity = 1; velocity < result.size(); ++velocity)
+			result[velocity] = std::pow(static_cast<float>(velocity) / 127.0f, 1.7f);
+		return result;
+	}();
+	return amplitudes;
 }
 }
 
@@ -121,7 +133,7 @@ void SynthEngine::compute_gains(const SampleRegion& region, uint8_t channel,
 	const float combined_pan = std::clamp(region.pan + channels_[channel].pan,
 		-1.0f, 1.0f);
 	const double angle = (static_cast<double>(combined_pan) + 1.0) * pi * 0.25;
-	const float base_gain = region.attenuation * (velocity / 127.0f);
+	const float base_gain = region.attenuation * velocity_amplitudes()[velocity];
 	left = base_gain * static_cast<float>(std::cos(angle));
 	right = base_gain * static_cast<float>(std::sin(angle));
 }

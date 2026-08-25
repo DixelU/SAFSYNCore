@@ -233,6 +233,32 @@ bool any_nonzero(const std::vector<float>& audio)
 	return std::any_of(audio.begin(), audio.end(), [](float sample) { return sample != 0.0f; });
 }
 
+void test_velocity_response()
+{
+	auto bank = make_constant_bank();
+	for (const auto model : {safsyn::VoiceModel::Individual, safsyn::VoiceModel::Cohorts})
+	{
+		auto render_one = [&](uint8_t velocity) {
+			safsyn::SynthEngine engine(1000, 8);
+			engine.set_soundfont(&bank);
+			engine.set_voice_model(model);
+			engine.note_on(0, 60, velocity);
+			std::array<float, 2> audio{};
+			engine.render_audio(audio.data(), 1);
+			return audio[0];
+		};
+
+		const float full = render_one(127);
+		for (const uint8_t velocity : {uint8_t{64}, uint8_t{1}})
+		{
+			const float actual = render_one(velocity) / full;
+			const float expected = std::pow(static_cast<float>(velocity) / 127.0f, 1.7f);
+			check(std::abs(actual - expected) < 1e-6f,
+				"MIDI velocity follows the reference velocity^1.7 amplitude curve");
+		}
+	}
+}
+
 void test_independent_instances()
 {
 	auto bank = make_constant_bank();
@@ -578,6 +604,7 @@ void test_float_wav(const std::filesystem::path& directory)
 int main(int argc, char** argv)
 {
 	const std::filesystem::path test_directory = argc > 1 ? argv[1] : "test-data";
+	test_velocity_response();
 	test_independent_instances();
 	test_release_and_sustain();
 	test_controller_contract();
