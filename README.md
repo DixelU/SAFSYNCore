@@ -18,7 +18,8 @@ default so DSP experiments retain a reproducible baseline.
 
 The coherent engine supports the preserved fixed individual-voice reference
 path plus dynamically growing exact onset cohorts for normal offline SMF
-rendering, deterministic safety-limit stealing, pitch and pitch bend, linear interpolation, AHDSR envelopes,
+rendering, bounded channel-scoped safety-limit stealing, O(1) pitch automation,
+an opt-in persistent threaded cohort mixer, linear interpolation, AHDSR envelopes,
 note-off and sustain behavior, forward and ping-pong loops, stereo samples,
 constant-power panning, 14-bit volume/pan/expression pairs, universal master
 volume, per-channel retention of all 128 CC values, RPN/NRPN selection,
@@ -83,6 +84,8 @@ exact cohorts by default. `--individual-voices --voices N` selects the fixed
 reference path, while `--max-cohorts N` gives cohorts an explicit deterministic
 safety ceiling; zero means dynamic offline growth. `--drain-tail` renders until
 all represented logical voices finish or `--max-tail-seconds` is reached.
+`--render-threads N` enables the fast cohort mixer; the default of one retains
+the scalar accumulation order used by the reference hashes.
 
 Run an opt-in phase experiment with the same scripted events:
 

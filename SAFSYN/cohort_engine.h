@@ -21,6 +21,8 @@ public:
 	CohortEngine& operator=(CohortEngine&&) noexcept;
 
 	void configure(SynthEngine& owner, size_t maximum_cohorts) noexcept;
+	void set_render_threads(size_t threads) noexcept;
+	size_t render_threads() const noexcept;
 	void clear(SynthEngine& owner) noexcept;
 	void note_on_batch(SynthEngine& owner, uint8_t channel, uint8_t note,
 		uint8_t velocity, uint64_t count) noexcept;
@@ -30,7 +32,6 @@ public:
 	void all_notes_off(SynthEngine& owner, uint8_t channel) noexcept;
 	void all_sound_off(SynthEngine& owner, uint8_t channel) noexcept;
 	void update_channel_gains(SynthEngine& owner, uint8_t channel) noexcept;
-	void update_channel_pitch(SynthEngine& owner, uint8_t channel) noexcept;
 	void invalidate_onset_merges(uint8_t channel) noexcept;
 	void invalidate_all_onset_merges() noexcept;
 	void render_audio(SynthEngine& owner, float* interleaved_stereo,

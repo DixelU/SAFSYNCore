@@ -3,8 +3,8 @@
 This milestone turns the deterministic sample engine into a streaming SMF
 converter while retaining coherent playback as the default. A later milestone
 adds optional post-mix gain and sample-peak limiting; the raw float path remains
-the default. Filtering, multithreaded rendering, realtime audio, and a
-production phase policy remain out of scope.
+the default. A subsequent optimization adds opt-in persistent cohort workers.
+Filtering, realtime audio, and a production phase policy remain out of scope.
 
 ## Parsing and scheduling architecture
 
@@ -57,6 +57,13 @@ patches actual sizes at close. RF64 writes a `ds64` chunk and 32-bit sentinels.
 The legacy in-memory `write_float_wav` helper now delegates to the same writer
 and retains its canonical RIFF bytes.
 
+`--render-threads 1..64` enables persistent cohort workers. Each worker mutates
+a disjoint slot range and accumulates into a private stereo buffer; the owner
+thread performs SIMD buffer reduction and cohort retirement after all workers
+finish. One thread remains the default and preserves the reference accumulation
+order. A fixed thread count is repeatable, but parallel reduction is validated
+by tolerance rather than the scalar SHA.
+
 At natural end, sustain is lifted on all channels, all non-one-shot notes are
 released, and the configured tail is streamed. `--max-render-seconds` is an
 exclusive hard boundary and can truncate both the event sequence and tail.
@@ -79,8 +86,9 @@ safsyn-render input.mid --analyze --sample-rate 48000 --tail-seconds 2
 
 The report includes format, tracks, division, duration, total/channel/note/meta
 counts, tempo changes, bank/program use at note-on, maximum events sharing a
-tick and output sample, parser-state bytes, estimated output/container, scan
-time, throughput, and malformed/truncated diagnostics. Analysis performs the
+tick and output sample, distinct event-sample groups, parser-state bytes,
+estimated output/container, scan time, throughput, and malformed/truncated
+diagnostics. Analysis performs the
 same incremental scheduling pass used for rendering.
 
 ## `Hypernova.mid` integration (initial milestone)

@@ -181,34 +181,63 @@ duplicate bursts and establish the logical/physical separation needed by a
 later event-domain or convolution-style renderer, but that more radical design
 is outside this milestone.
 
-## Performance direction
+## Performance optimization
 
 The corrected 4,096-cohort Hypernova pass performed 36,115,807 capacity steals.
 An exact full-pool victim scan therefore visited approximately 147.93 billion
 slots. That work happens during event dispatch and is outside the reported
-`render_audio_ms`. Dense pitch automation also currently recomputes increments
-by scanning every cohort. These event-domain costs should be removed before
-optimizing sample arithmetic:
+`render_audio_ms`. Dense pitch automation also performed one exponential for
+every cohort on every pitch event.
 
-1. Maintain intrusive per-channel active/release lists and a rotating bounded
-   victim probe. Pick an over-reserve donor from sixteen maintained counts, then
-   inspect a small deterministic sample instead of all 4,096 slots.
-2. Store a bend-free increment per cohort and one pitch ratio per channel. A
-   pitch event then computes one exponential; the render interval applies that
-   ratio without per-event cohort scans.
-3. Split hot render state into structure-of-arrays batches and specialize kernels
-   by phase representation, channel layout, and loop/envelope state. AVX2 can
-   advance and interpolate several cohorts at the same output frame; this is more
-   useful for Hypernova than across-frame SIMD because events occur at extremely
-   dense sample boundaries.
-4. Feed persistent worker threads fixed-size time tiles. Workers render disjoint
-   cohort batches into private stereo tile buffers, followed by a fixed-order
-   reduction. Static channel-to-thread assignment is unsuitable because the MIDI
-   is heavily channel-skewed.
+Both event-domain multipliers are now removed. Intrusive per-channel and
+per-note lists support O(1) insertion/removal and a rotating deterministic
+32-candidate victim probe. Donor selection examines only sixteen maintained
+channel counts. Cohorts store a bend-free increment while each channel stores
+one pitch ratio, so a pitch event performs one exponential and no cohort scan.
+Counters report searches, candidate visits, and maximum probe length.
 
-The existing scalar path and coherent SHA should remain the reference mode.
-Parallel/SIMD output needs an explicit fast mode until fixed partitioning and
-reduction have their own repeatability and tolerance tests.
+The optional `--render-threads N` path owns a persistent worker pool. Workers
+render disjoint cohort-index ranges into private stereo buffers; the caller
+renders one range, performs fixed lane-order SIMD reduction, then retires ended
+cohorts serially. Static channel ownership is deliberately avoided because the
+MIDI is heavily channel-skewed. The scalar path remains the default reference.
+
+Release microbenchmarks on this 24-logical-processor host measure:
+
+| Workload | Before | Optimized |
+|---|---:|---:|
+| 4,096-slot steal | 59.4 us/event | 0.62-0.68 us/event |
+| 4,096-cohort pitch bend | 65.8 us/event | approximately 0.018 us/event |
+| 1,024-frame coherent mix | approximately 21.2 ms scalar | approximately 3.1 ms, 24 threads |
+| 1,024 frames in 9-frame intervals | approximately 22.0 ms scalar | approximately 8.7 ms, 24 threads |
+
+Hypernova contains 666,043 distinct event-sample groups across 6,285,797
+musical frames, an average render interval of about 9.44 frames. This explains
+why persistent workers help while thread creation per event would not.
+
+A paired coherent render through 70 seconds exercises the first 1,475,666
+capacity steals under the real event distribution. Both paths produce identical
+event/cohort counts and allocator decisions:
+
+| Measurement | Scalar | 24 threads |
+|---|---:|---:|
+| Total render pass (analysis excluded) | 57.654 s | 26.962 s |
+| `render_audio` time | 52.006 s | 19.028 s |
+| End-to-end / mixer speedup | 1x / 1x | 2.14x / 2.73x |
+| Steal candidate visits | 47,221,312 | 47,221,312 |
+| Raw peak / RMS | 8.63580513 / 1.12831838 | 8.63580513 / 1.12831837 |
+
+The same workload would have visited approximately 6.044 billion candidates
+with a 4,096-wide search. The parallel WAV has a different hash because lane
+partial sums change floating addition order; fixed-thread regression tests
+require bit-identical repeats and tolerance-equivalence to scalar output.
+
+The remaining mixer optimization is a hot/cold structure-of-arrays split with
+specialized coherent/analytic and loop/envelope kernels. That layout can apply
+AVX2 across cohorts at one output frame without changing the scalar reference
+path. It should be driven by a new full-pass profile because short-interval
+worker synchronization, phase-cache reads, and sample gathers now compete for
+the remaining time.
 
 ## Tail drain and validation
 

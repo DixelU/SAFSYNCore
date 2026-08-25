@@ -568,6 +568,11 @@ void test_voice_stealing_and_midi_messages()
 			reserved.stats().channel_scoped_steals == 1 &&
 			reserved.stats().global_fallback_steals == 0,
 			"an under-reserve channel borrows from an over-reserve channel then self-recycles");
+		if (model == safsyn::VoiceModel::Cohorts)
+			check(reserved.stats().steal_searches == 3 &&
+				reserved.stats().steal_candidate_visits <= 99 &&
+				reserved.stats().maximum_steal_probe <= 33,
+				"cohort victim selection remains bounded independently of pool capacity");
 		reserved.control_change(0, 120, 0);
 		check(reserved.active_voice_count() == 2,
 			"the per-channel reserve survives another channel's dense allocation");

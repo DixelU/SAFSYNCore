@@ -208,6 +208,7 @@ struct SmfAnalysis
 	uint64_t estimated_output_bytes = 0;
 	uint64_t maximum_events_same_tick = 0;
 	uint64_t maximum_events_same_sample = 0;
+	uint64_t event_sample_groups = 0;
 	uint64_t maximum_events_tick_location = 0;
 	uint64_t maximum_events_sample_location = 0;
 	uint64_t note_on_groups = 0;

@@ -19,6 +19,7 @@ struct SmfRenderOptions
 	VoiceModel voice_model = VoiceModel::Cohorts;
 	// Zero gives the offline cohort engine dynamic growth without stealing.
 	size_t maximum_cohorts = 0;
+	size_t render_threads = 1;
 	uint16_t initial_bank = 0;
 	uint8_t initial_program = 0;
 	uint64_t tail_frames = 0;
@@ -43,6 +44,7 @@ struct SmfRenderResult
 	uint64_t raw_metric_samples = 0;
 	size_t active_voices_at_end = 0;
 	size_t active_cohorts_at_end = 0;
+	size_t render_threads = 1;
 	uint64_t tail_frames_written = 0;
 	float peak = 0.0f;
 	double rms = 0.0;

@@ -3,6 +3,7 @@ project(SAFSYNCore VERSION 0.1.0 LANGUAGES CXX)
 
 option(SAFSYN_BUILD_TESTS "Build the automated test suite" ON)
 option(SAFSYN_BUILD_WINMM "Build the experimental Windows DLL shell" OFF)
+option(SAFSYN_BUILD_BENCHMARKS "Build deterministic engine microbenchmarks" OFF)
 
 add_library(safsyn STATIC
 	SAFSYN/core.cpp
@@ -15,10 +16,21 @@ add_library(safsyn STATIC
 	SAFSYN/wav_writer.cpp
 )
 add_library(SAFSYN::safsyn ALIAS safsyn)
+find_package(Threads REQUIRED)
+target_link_libraries(safsyn PRIVATE Threads::Threads)
 target_include_directories(safsyn PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/SAFSYN")
 set(SAFSYN_UTILITY_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/utility/include")
 if(NOT EXISTS "${SAFSYN_UTILITY_INCLUDE}/long_uint.h")
 	message(FATAL_ERROR "Missing utility submodule; run git submodule update --init --recursive")
+endif()
+
+if(SAFSYN_BUILD_BENCHMARKS)
+	add_executable(safsyn-engine-benchmark benchmarks/engine_benchmark.cpp)
+	target_link_libraries(safsyn-engine-benchmark PRIVATE SAFSYN::safsyn)
+	target_compile_features(safsyn-engine-benchmark PRIVATE cxx_std_20)
+	if(MSVC)
+		target_compile_options(safsyn-engine-benchmark PRIVATE /EHsc)
+	endif()
 endif()
 target_include_directories(safsyn PRIVATE "${SAFSYN_UTILITY_INCLUDE}")
 target_compile_features(safsyn PUBLIC cxx_std_20)

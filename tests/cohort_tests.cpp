@@ -448,6 +448,44 @@ void test_safety_limit_stealing()
 		first.active_voice_count() == 5,
 		"explicit cohort ceiling steals deterministically and accounts logical multiplicity");
 }
+
+void test_parallel_cohort_render()
+{
+	constexpr uint32_t cohort_count = 1024;
+	auto bank = make_bank(4000, true);
+	safsyn::SynthEngine scalar(4000, cohort_count), parallel(4000, cohort_count),
+		repeat(4000, cohort_count);
+	for (auto* engine : {&scalar, &parallel, &repeat})
+	{
+		engine->set_voice_model(safsyn::VoiceModel::Cohorts, cohort_count);
+		engine->set_soundfont(&bank);
+	}
+	parallel.set_render_threads(4);
+	repeat.set_render_threads(4);
+	for (uint32_t index = 0; index < cohort_count; ++index)
+	{
+		for (auto* engine : {&scalar, &parallel, &repeat})
+		{
+			engine->control_change(0, 1, static_cast<uint8_t>(index & 0x7f));
+			engine->note_on(0, static_cast<uint8_t>(index & 0x7f),
+				static_cast<uint8_t>(64 + (index & 0x3f)));
+		}
+	}
+	const auto expected = render(scalar, 27, 9);
+	const auto actual = render(parallel, 27, 9);
+	const auto repeated = render(repeat, 27, 9);
+	check(close_audio(expected, actual) && actual == repeated &&
+		parallel.render_threads() == 4 &&
+		parallel.stats().parallel_render_calls == 3 &&
+		parallel.stats().parallel_rendered_frames == 27,
+		"persistent threaded cohort rendering matches scalar output within tolerance");
+	scalar.control_change(0, 120, 0);
+	parallel.control_change(0, 120, 0);
+	repeat.control_change(0, 120, 0);
+	check(scalar.active_voice_count() == 0 && parallel.active_voice_count() == 0 &&
+		repeat.active_voice_count() == 0,
+		"threaded rendering retires and clears cohorts on the serial owner thread");
+}
 }
 
 int main()
@@ -460,6 +498,7 @@ int main()
 	test_cross_run_merging_and_dynamic_growth();
 	test_block_and_seed_determinism();
 	test_safety_limit_stealing();
+	test_parallel_cohort_render();
 	if (failures != 0)
 	{
 		std::cerr << failures << " cohort test(s) failed\n";

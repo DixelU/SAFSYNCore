@@ -186,6 +186,7 @@ void print_smf_analysis(const safsyn::SmfAnalysis& analysis, uint32_t sample_rat
 		<< " max_events_tick_at=" << analysis.maximum_events_tick_location
 		<< " max_events_sample=" << analysis.maximum_events_same_sample
 		<< " max_events_sample_at=" << analysis.maximum_events_sample_location
+		<< " event_sample_groups=" << analysis.event_sample_groups
 		<< " note_on_groups=" << analysis.note_on_groups
 		<< " largest_note_on_group=" << analysis.largest_identical_note_on_group
 		<< " largest_note_on_group_at=" << analysis.largest_note_on_group_sample
@@ -284,6 +285,7 @@ int run_smf(int argc, char** argv)
 		uint32_t sample_rate = 48000;
 		size_t voice_capacity = 256;
 		size_t maximum_cohorts = 0;
+		size_t render_threads = 1;
 		safsyn::VoiceModel voice_model = safsyn::VoiceModel::Cohorts;
 		uint32_t bank = 0;
 		uint32_t program = 0;
@@ -310,6 +312,8 @@ int run_smf(int argc, char** argv)
 				voice_capacity = static_cast<size_t>(std::stoull(argv[++index]));
 			else if (option == "--max-cohorts" && index + 1 < argc)
 				maximum_cohorts = static_cast<size_t>(std::stoull(argv[++index]));
+			else if (option == "--render-threads" && index + 1 < argc)
+				render_threads = static_cast<size_t>(std::stoull(argv[++index]));
 			else if (option == "--individual-voices")
 				voice_model = safsyn::VoiceModel::Individual;
 			else if (option == "--cohorts")
@@ -373,6 +377,7 @@ int run_smf(int argc, char** argv)
 		uint64_t controller_trace_frames = 0;
 		uint64_t controller_trace_start_frame = 0;
 		if (sample_rate < 8000 || sample_rate > 384000 || voice_capacity == 0 ||
+			render_threads == 0 || render_threads > 64 ||
 			bank > 16383 || program > 127 || block_frames == 0 || block_frames > 1'048'576U ||
 			phase_settings.strength < 0.0f || phase_settings.strength > 1.0f ||
 			phase_settings.pool_size == 0 || phase_settings.pool_size > 64 ||
@@ -438,6 +443,7 @@ int run_smf(int argc, char** argv)
 		render_options.voice_capacity = voice_capacity;
 		render_options.voice_model = voice_model;
 		render_options.maximum_cohorts = maximum_cohorts;
+		render_options.render_threads = render_threads;
 		render_options.initial_bank = static_cast<uint16_t>(bank);
 		render_options.initial_program = static_cast<uint8_t>(program);
 		render_options.tail_frames = tail_frames;
@@ -473,6 +479,7 @@ int run_smf(int argc, char** argv)
 			<< " active_end=" << result.active_voices_at_end
 			<< " stolen=" << result.engine.stolen_voices
 			<< " voice_model=" << (voice_model == safsyn::VoiceModel::Cohorts ? "cohorts" : "individual")
+			<< " render_threads=" << result.render_threads
 			<< " logical_started=" << result.engine.logical_voices_started
 			<< " peak_logical=" << result.engine.peak_active_logical_voices
 			<< " cohorts_created=" << result.engine.cohorts_created
@@ -486,6 +493,11 @@ int run_smf(int argc, char** argv)
 			<< " channel_scoped_steals=" << result.engine.channel_scoped_steals
 			<< " channel_reserve_steals=" << result.engine.channel_reserve_steals
 			<< " global_fallback_steals=" << result.engine.global_fallback_steals
+			<< " steal_searches=" << result.engine.steal_searches
+			<< " steal_candidate_visits=" << result.engine.steal_candidate_visits
+			<< " max_steal_probe=" << result.engine.maximum_steal_probe
+			<< " parallel_render_calls=" << result.engine.parallel_render_calls
+			<< " parallel_rendered_frames=" << result.engine.parallel_rendered_frames
 			<< " avg_cohort_multiplicity=" << result.engine.average_cohort_multiplicity
 			<< " max_cohort_multiplicity=" << result.engine.maximum_cohort_multiplicity
 			<< " tail_frames=" << result.tail_frames_written
@@ -586,6 +598,7 @@ void print_usage()
 		"      [--phase-preserve-attack-ms N]\n"
 		"  SMF: [--tail-seconds N] [--max-render-seconds N] [--analyze|--dry-run]\n"
 		"      [--block-size N] [--cohorts|--individual-voices] [--max-cohorts N]\n"
+		"      [--render-threads 1..64]\n"
 		"      [--drain-tail] [--max-tail-seconds N]\n"
 		"      [--controller-trace-start-seconds N] [--controller-trace-seconds N]\n"
 		"      [--controller-trace-cc 0..127] [--controller-trace-limit N]\n"

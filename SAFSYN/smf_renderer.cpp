@@ -26,6 +26,7 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 		analysis.sample_rate != options.sample_rate ||
 		options.voice_capacity == 0 || options.block_frames == 0 ||
 		options.block_frames > 1'048'576U ||
+		options.render_threads == 0 || options.render_threads > 64 ||
 		!mastering_settings_valid(options.mastering) ||
 		(options.drain_tail && options.maximum_tail_frames == 0))
 	{
@@ -54,6 +55,8 @@ bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 
 		SynthEngine engine(options.sample_rate, options.voice_capacity);
 		engine.set_voice_model(options.voice_model, options.maximum_cohorts);
+		engine.set_render_threads(options.render_threads);
+		result.render_threads = engine.render_threads();
 		engine.set_soundfont(&soundfont);
 		engine.set_phase_settings(options.phase);
 		engine.set_all_regions_mode(options.all_regions);

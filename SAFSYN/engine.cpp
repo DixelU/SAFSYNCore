@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 
 namespace safsyn
 {
@@ -106,6 +107,11 @@ SynthEngine::Voice* SynthEngine::allocate_voice(uint8_t request_channel,
 		if (voice.active())
 			++channel_counts[voice.channel];
 	const size_t channel_reserve = voices_.size() / channel_counts.size();
+	++stats_.steal_searches;
+	stats_.steal_candidate_visits += voices_.size();
+	stats_.maximum_steal_probe = (std::max)(stats_.maximum_steal_probe,
+		static_cast<uint32_t>((std::min)(voices_.size(),
+			static_cast<size_t>((std::numeric_limits<uint32_t>::max)()))));
 
 	auto estimated_level = [&](const Voice& voice) {
 		const auto& channel = channels_[voice.channel];
@@ -171,14 +177,13 @@ SynthEngine::Voice* SynthEngine::allocate_voice(uint8_t request_channel,
 	return candidate;
 }
 
-double SynthEngine::compute_increment(const SampleRegion& region, uint8_t note,
-	float bend_semitones) const noexcept
+double SynthEngine::compute_base_increment(const SampleRegion& region,
+	uint8_t note) const noexcept
 {
 	const double tracked_cents =
 		(static_cast<int>(note) - static_cast<int>(region.root_key)) *
 		static_cast<double>(region.scale_tuning);
-	const double cents = tracked_cents + region.coarse_tune * 100.0 +
-		region.fine_tune + bend_semitones * 100.0;
+	const double cents = tracked_cents + region.coarse_tune * 100.0 + region.fine_tune;
 	return std::pow(2.0, cents / 1200.0) *
 		(static_cast<double>(region.sample_rate) / sample_rate_);
 }
@@ -346,7 +351,7 @@ void SynthEngine::note_on(uint8_t channel, uint8_t note, uint8_t velocity) noexc
 		voice->note = note;
 		voice->velocity = velocity;
 		voice->channel = channel;
-		voice->inc = compute_increment(region, note, channels_[channel].pitch_bend_semitones);
+		voice->base_inc = compute_base_increment(region, note);
 		voice->serial = serial;
 		voice->phase = phase_processor_.assign(region, region_id, serial, channel, note);
 		compute_gains(region, channel, velocity, voice->gain_l, voice->gain_r);
@@ -436,6 +441,17 @@ void SynthEngine::update_channel_voice_gains(uint8_t channel) noexcept
 			compute_gains(*voice.region, channel, voice.velocity, voice.gain_l, voice.gain_r);
 }
 
+void SynthEngine::set_render_threads(size_t threads) noexcept
+{
+	if (cohort_engine_)
+		cohort_engine_->set_render_threads(threads);
+}
+
+size_t SynthEngine::render_threads() const noexcept
+{
+	return cohort_engine_ ? cohort_engine_->render_threads() : 1;
+}
+
 void SynthEngine::update_channel_pitch_bend(uint8_t channel) noexcept
 {
 	auto& state = channels_[channel];
@@ -444,21 +460,8 @@ void SynthEngine::update_channel_pitch_bend(uint8_t channel) noexcept
 		? displacement / 8192.0f
 		: displacement / 8191.0f;
 	state.pitch_bend_semitones = normalized * state.pitch_bend_range_semitones;
-	update_channel_pitch(channel);
-}
-
-void SynthEngine::update_channel_pitch(uint8_t channel) noexcept
-{
-	if (voice_model_ == VoiceModel::Cohorts)
-	{
-		if (cohort_engine_)
-			cohort_engine_->update_channel_pitch(*this, channel);
-		return;
-	}
-	for (auto& voice : voices_)
-		if (voice.active() && voice.channel == channel)
-			voice.inc = compute_increment(*voice.region, voice.note,
-				channels_[channel].pitch_bend_semitones);
+	state.pitch_bend_ratio = std::pow(2.0,
+		static_cast<double>(state.pitch_bend_semitones) / 12.0);
 }
 
 void SynthEngine::all_notes_off(uint8_t channel) noexcept
@@ -606,7 +609,6 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 						begin_release(voice);
 		}
 		update_channel_voice_gains(channel);
-		update_channel_pitch(channel);
 		break;
 	}
 	case 123:
@@ -758,6 +760,8 @@ void SynthEngine::render_audio(float* out, uint32_t frames) noexcept
 		if (!voice.active() || !voice.region)
 			continue;
 		const SampleRegion& region = *voice.region;
+		const ChannelState& channel = channels_[voice.channel];
+		const double increment = voice.base_inc * channel.pitch_bend_ratio;
 		const bool looping = region.loop_mode == LoopMode::Forward ||
 			region.loop_mode == LoopMode::PingPong ||
 			(region.loop_mode == LoopMode::Sustain && voice.stage != Voice::Stage::Release);
@@ -807,13 +811,12 @@ void SynthEngine::render_audio(float* out, uint32_t frames) noexcept
 				sample_r = source_r0 + (source_r1 - source_r0) * fraction;
 			}
 
-			const ChannelState& channel = channels_[voice.channel];
 			const float amplitude = envelope * channel.volume * channel.expression *
 				master_volume_;
 			out[static_cast<size_t>(frame) * 2] += sample_l * voice.gain_l * amplitude;
 			out[static_cast<size_t>(frame) * 2 + 1] += sample_r * voice.gain_r * amplitude;
 
-			voice.pos += voice.loop_dir_fwd ? voice.inc : -voice.inc;
+			voice.pos += voice.loop_dir_fwd ? increment : -increment;
 			if (valid_loop && (region.loop_mode == LoopMode::Forward ||
 				region.loop_mode == LoopMode::Sustain) && voice.pos >= region.loop_end)
 			{

@@ -103,6 +103,11 @@ struct RenderStats
 	uint64_t channel_scoped_steals = 0;
 	uint64_t channel_reserve_steals = 0;
 	uint64_t global_fallback_steals = 0;
+	uint64_t steal_searches = 0;
+	uint64_t steal_candidate_visits = 0;
+	uint32_t maximum_steal_probe = 0;
+	uint64_t parallel_render_calls = 0;
+	uint64_t parallel_rendered_frames = 0;
 	double average_cohort_multiplicity = 0.0;
 	uint64_t maximum_cohort_multiplicity = 0;
 };
@@ -168,6 +173,10 @@ public:
 	void set_voice_model(VoiceModel model, size_t maximum_cohorts = 0) noexcept;
 	VoiceModel voice_model() const noexcept { return voice_model_; }
 	size_t maximum_cohorts() const noexcept { return maximum_cohorts_; }
+	// Threaded cohort mixing is an opt-in fast path. One preserves the scalar
+	// accumulation order used by the reference hashes.
+	void set_render_threads(size_t threads) noexcept;
+	size_t render_threads() const noexcept;
 
 	// Explicit compatibility/stress path for reproducing the old flattened SF2
 	// behavior. Normal playback always selects the channel bank and program.
@@ -184,7 +193,7 @@ private:
 		uint8_t velocity = 0;
 		uint8_t channel = 0;
 		double pos = 0.0;
-		double inc = 0.0;
+		double base_inc = 0.0;
 		bool loop_dir_fwd = true;
 		Stage stage = Stage::Off;
 		float env = 0.0f;
@@ -220,6 +229,7 @@ private:
 		float pan = 0.0f;
 		float pitch_bend_semitones = 0.0f;
 		float pitch_bend_range_semitones = 2.0f;
+		double pitch_bend_ratio = 1.0;
 		uint16_t pitch_bend_value = 8192;
 		ParameterSelection parameter_selection = ParameterSelection::None;
 		bool sustain_pedal = false;
@@ -227,8 +237,7 @@ private:
 	};
 
 	Voice* allocate_voice(uint8_t request_channel, uint8_t request_note) noexcept;
-	double compute_increment(const SampleRegion& region, uint8_t note,
-		float bend_semitones) const noexcept;
+	double compute_base_increment(const SampleRegion& region, uint8_t note) const noexcept;
 	void compute_gains(const SampleRegion& region, uint8_t channel, uint8_t velocity,
 		float& left, float& right) const noexcept;
 	void begin_release(Voice& voice, float seconds_override = -1.0f) noexcept;
@@ -236,7 +245,6 @@ private:
 	float advance_envelope(Voice& voice) noexcept;
 	void update_channel_voice_gains(uint8_t channel) noexcept;
 	void update_channel_pitch_bend(uint8_t channel) noexcept;
-	void update_channel_pitch(uint8_t channel) noexcept;
 	void all_notes_off(uint8_t channel) noexcept;
 	void all_sound_off(uint8_t channel) noexcept;
 	void silence_all() noexcept;

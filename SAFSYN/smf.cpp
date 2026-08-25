@@ -946,6 +946,7 @@ bool analyze_smf(const SmfFile& file, const SmfAnalysisOptions& options,
 			{
 				sample_group = 0;
 				group_sample = scheduled.sample;
+				++analysis.event_sample_groups;
 			}
 			first = false;
 			++tick_group;
