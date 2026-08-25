@@ -100,6 +100,9 @@ struct RenderStats
 	uint64_t cohort_splits = 0;
 	uint64_t cohort_merges = 0;
 	uint64_t cohort_capacity_steals = 0;
+	uint64_t channel_scoped_steals = 0;
+	uint64_t channel_reserve_steals = 0;
+	uint64_t global_fallback_steals = 0;
 	double average_cohort_multiplicity = 0.0;
 	uint64_t maximum_cohort_multiplicity = 0;
 };
@@ -223,7 +226,7 @@ private:
 		uint8_t program = 0;
 	};
 
-	Voice* allocate_voice() noexcept;
+	Voice* allocate_voice(uint8_t request_channel, uint8_t request_note) noexcept;
 	double compute_increment(const SampleRegion& region, uint8_t note,
 		float bend_semitones) const noexcept;
 	void compute_gains(const SampleRegion& region, uint8_t channel, uint8_t velocity,

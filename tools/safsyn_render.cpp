@@ -483,6 +483,9 @@ int run_smf(int argc, char** argv)
 			<< " cohort_splits=" << result.engine.cohort_splits
 			<< " cohort_merges=" << result.engine.cohort_merges
 			<< " cohort_capacity_steals=" << result.engine.cohort_capacity_steals
+			<< " channel_scoped_steals=" << result.engine.channel_scoped_steals
+			<< " channel_reserve_steals=" << result.engine.channel_reserve_steals
+			<< " global_fallback_steals=" << result.engine.global_fallback_steals
 			<< " avg_cohort_multiplicity=" << result.engine.average_cohort_multiplicity
 			<< " max_cohort_multiplicity=" << result.engine.maximum_cohort_multiplicity
 			<< " tail_frames=" << result.tail_frames_written

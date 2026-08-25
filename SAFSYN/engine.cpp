@@ -94,32 +94,81 @@ void SynthEngine::silence_all() noexcept
 		cohort_engine_->clear(*this);
 }
 
-SynthEngine::Voice* SynthEngine::allocate_voice() noexcept
+SynthEngine::Voice* SynthEngine::allocate_voice(uint8_t request_channel,
+	uint8_t request_note) noexcept
 {
 	for (auto& voice : voices_)
 		if (!voice.active())
 			return &voice;
+
+	std::array<size_t, 16> channel_counts{};
+	for (const auto& voice : voices_)
+		if (voice.active())
+			++channel_counts[voice.channel];
+	const size_t channel_reserve = voices_.size() / channel_counts.size();
 
 	auto estimated_level = [&](const Voice& voice) {
 		const auto& channel = channels_[voice.channel];
 		return voice.env * channel.volume * channel.expression * master_volume_ *
 			(std::max)(std::abs(voice.gain_l), std::abs(voice.gain_r));
 	};
-	auto candidate = voices_.begin();
-	for (auto it = voices_.begin(); it != voices_.end(); ++it)
+	auto prefer = [&](const Voice* current, const Voice& challenger) {
+		if (!current)
+			return true;
+		const bool challenger_releasing = challenger.stage == Voice::Stage::Release;
+		const bool current_releasing = current->stage == Voice::Stage::Release;
+		const float challenger_level = estimated_level(challenger);
+		const float current_level = estimated_level(*current);
+		return (challenger_releasing && !current_releasing) ||
+			(challenger_releasing == current_releasing &&
+				(challenger_level < current_level ||
+					(challenger_level == current_level &&
+						challenger.serial > current->serial)));
+	};
+	Voice* same_channel = nullptr;
+	Voice* same_channel_different_key = nullptr;
+	Voice* over_reserve = nullptr;
+	Voice* global = nullptr;
+	Voice* global_different_key = nullptr;
+	for (auto& voice : voices_)
 	{
-		const bool it_releasing = it->stage == Voice::Stage::Release;
-		const bool candidate_releasing = candidate->stage == Voice::Stage::Release;
-		const float it_level = estimated_level(*it);
-		const float candidate_level = estimated_level(*candidate);
-		if ((it_releasing && !candidate_releasing) ||
-			(it_releasing == candidate_releasing &&
-				(it_level < candidate_level ||
-					(it_level == candidate_level && it->serial > candidate->serial))))
-			candidate = it;
+		const bool same_key = voice.channel == request_channel && voice.note == request_note;
+		if (prefer(global, voice))
+			global = &voice;
+		if (!same_key && prefer(global_different_key, voice))
+			global_different_key = &voice;
+		if (voice.channel == request_channel)
+		{
+			if (prefer(same_channel, voice))
+				same_channel = &voice;
+			if (!same_key && prefer(same_channel_different_key, voice))
+				same_channel_different_key = &voice;
+		}
+		if (channel_counts[voice.channel] > channel_reserve &&
+			prefer(over_reserve, voice))
+			over_reserve = &voice;
+	}
+
+	Voice* candidate = nullptr;
+	if (channel_counts[request_channel] != 0 &&
+		channel_counts[request_channel] >= channel_reserve)
+	{
+		candidate = same_channel_different_key ? same_channel_different_key : same_channel;
+		if (candidate)
+			++stats_.channel_scoped_steals;
+	}
+	else if (channel_counts[request_channel] < channel_reserve && over_reserve)
+	{
+		candidate = over_reserve;
+		++stats_.channel_reserve_steals;
+	}
+	if (!candidate)
+	{
+		candidate = global_different_key ? global_different_key : global;
+		++stats_.global_fallback_steals;
 	}
 	++stats_.stolen_voices;
-	return &*candidate;
+	return candidate;
 }
 
 double SynthEngine::compute_increment(const SampleRegion& region, uint8_t note,
@@ -291,7 +340,7 @@ void SynthEngine::note_on(uint8_t channel, uint8_t note, uint8_t velocity) noexc
 					existing.region->exclusive_class == region.exclusive_class)
 					begin_release(existing, 0.005f);
 
-		Voice* voice = allocate_voice();
+		Voice* voice = allocate_voice(channel, note);
 		*voice = Voice{};
 		voice->region = &region;
 		voice->note = note;

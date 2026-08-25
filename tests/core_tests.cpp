@@ -553,6 +553,38 @@ void test_voice_stealing_and_midi_messages()
 		long_held.render_audio(release_tie_test.data(), 4);
 		check(long_held.active_voice_count() == 1,
 			"equal-audibility stealing preserves the older long-held voice");
+
+		safsyn::SynthEngine reserved(1000, 32);
+		reserved.set_soundfont(&bank);
+		reserved.set_voice_model(model, 32);
+		for (uint8_t note = 0; note < 32; ++note)
+			reserved.note_on(0, note, 100);
+		reserved.note_on(1, 64, 1);
+		reserved.note_on(1, 65, 127);
+		std::array<float, 2> establish_reserve_levels{};
+		reserved.render_audio(establish_reserve_levels.data(), 1);
+		reserved.note_on(1, 64, 127);
+		check(reserved.stats().channel_reserve_steals == 2 &&
+			reserved.stats().channel_scoped_steals == 1 &&
+			reserved.stats().global_fallback_steals == 0,
+			"an under-reserve channel borrows from an over-reserve channel then self-recycles");
+		reserved.control_change(0, 120, 0);
+		check(reserved.active_voice_count() == 2,
+			"the per-channel reserve survives another channel's dense allocation");
+		reserved.note_off(1, 65);
+		std::array<float, 10> protected_key_release{};
+		reserved.render_audio(protected_key_release.data(), 5);
+		check(reserved.active_voice_count() == 2,
+			"same-channel stealing protects an existing carrier of the requested key");
+
+		safsyn::SynthEngine fallback(1000, 2);
+		fallback.set_soundfont(&bank);
+		fallback.set_voice_model(model, 2);
+		fallback.note_on(0, 60, 100);
+		fallback.note_on(0, 61, 100);
+		fallback.note_on(1, 62, 100);
+		check(fallback.stats().global_fallback_steals == 1,
+			"a previously empty channel uses the global fallback when the cap is below 16");
 	}
 }
 

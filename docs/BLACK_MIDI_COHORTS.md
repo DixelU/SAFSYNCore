@@ -32,13 +32,24 @@ Offline cohort growth has no implicit limit. `--max-cohorts N` installs an
 explicit safety ceiling and enables deterministic cohort stealing; a zero
 ceiling means dynamic growth without stealing.
 
-Capacity stealing first prefers release-stage cohorts and then the smallest
-estimated audible contribution. The estimate includes envelope, channel volume
-and expression, velocity/region gain, master volume, and cohort multiplicity.
-Exact ties discard the newer cohort so older held tones are not systematically
-removed before a dense burst ends. This policy improves bounded listening
-renders, but no victim heuristic can exactly represent Hypernova's roughly
-55,000-cohort peak in 4,096 physical slots.
+Capacity stealing reserves an equal floor of `maximum_cohorts / 16` physical
+slots for each MIDI channel. A channel below that floor takes its victim from a
+channel above the floor. Once at the floor, it recycles its own cohorts first;
+a global candidate is retained as a fallback for small ceilings and pathological
+states. Unused channel shares remain borrowable because the reserve is enforced
+only when a full pool must steal. The individual reference model applies the
+same policy to its fixed voice pool.
+
+Within the selected scope, stealing first prefers release-stage cohorts and then
+the smallest estimated audible contribution. The estimate includes envelope,
+channel volume and expression, velocity/region gain, master volume, and cohort
+multiplicity. Exact ties discard the newer cohort so older held tones are not
+systematically removed before a dense burst ends. A different-key victim is
+preferred so a repeated note does not erase its own existing carrier unless no
+other scoped victim exists. Render statistics split decisions into channel-local,
+reserve-balancing, and global-fallback steals. This policy improves bounded
+listening renders, but no victim heuristic can exactly represent Hypernova's
+roughly 55,000-cohort peak in 4,096 physical slots.
 
 ## Phase aggregation
 
@@ -169,6 +180,35 @@ same-onset cohorts do not eliminate most steals. They remain valuable for
 duplicate bursts and establish the logical/physical separation needed by a
 later event-domain or convolution-style renderer, but that more radical design
 is outside this milestone.
+
+## Performance direction
+
+The corrected 4,096-cohort Hypernova pass performed 36,115,807 capacity steals.
+An exact full-pool victim scan therefore visited approximately 147.93 billion
+slots. That work happens during event dispatch and is outside the reported
+`render_audio_ms`. Dense pitch automation also currently recomputes increments
+by scanning every cohort. These event-domain costs should be removed before
+optimizing sample arithmetic:
+
+1. Maintain intrusive per-channel active/release lists and a rotating bounded
+   victim probe. Pick an over-reserve donor from sixteen maintained counts, then
+   inspect a small deterministic sample instead of all 4,096 slots.
+2. Store a bend-free increment per cohort and one pitch ratio per channel. A
+   pitch event then computes one exponential; the render interval applies that
+   ratio without per-event cohort scans.
+3. Split hot render state into structure-of-arrays batches and specialize kernels
+   by phase representation, channel layout, and loop/envelope state. AVX2 can
+   advance and interpolate several cohorts at the same output frame; this is more
+   useful for Hypernova than across-frame SIMD because events occur at extremely
+   dense sample boundaries.
+4. Feed persistent worker threads fixed-size time tiles. Workers render disjoint
+   cohort batches into private stereo tile buffers, followed by a fixed-order
+   reduction. Static channel-to-thread assignment is unsuitable because the MIDI
+   is heavily channel-skewed.
+
+The existing scalar path and coherent SHA should remain the reference mode.
+Parallel/SIMD output needs an explicit fast mode until fixed partitioning and
+reduction have their own repeatability and tolerance tests.
 
 ## Tail drain and validation
 

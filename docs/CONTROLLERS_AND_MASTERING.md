@@ -133,12 +133,13 @@ bursts that otherwise force ordinary playback chains into hard clipping.
 
 ## Corrected RPN and 4,096-cohort Hypernova render
 
-The corrected evidence pass uses continuous analytic phase assignment with
-seed 7, the MIDI's per-channel RPN 0 sensitivity of 12 semitones, a 4,096-cohort
-ceiling, a two-second tail, and the same -1 dBFS limiter settings. Capacity
-stealing now prefers release-stage cohorts and then the smallest estimated
-audible contribution (envelope, channel volume/expression, gain, master volume,
-and cohort multiplicity). Exact ties preserve the older sustained carrier.
+The recorded corrected evidence pass uses continuous analytic phase assignment
+with seed 7, the MIDI's per-channel RPN 0 sensitivity of 12 semitones, a
+4,096-cohort ceiling, a two-second tail, and the same -1 dBFS limiter settings.
+It predates the later channel-scoped reserve policy and used a global victim
+search that preferred release-stage cohorts and then the smallest estimated
+audible contribution. The artifact remains useful as the controller/RPN
+baseline, but it is not evidence for the current allocator.
 
 | Measurement | Corrected result |
 |---|---:|

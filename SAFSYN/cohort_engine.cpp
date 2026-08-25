@@ -298,6 +298,7 @@ struct CohortEngineState
 	std::unordered_map<OnsetKey, StableHandle, OnsetKeyHash> onset_candidates;
 	uint64_t active_logical = 0;
 	size_t active_cohort_count = 0;
+	std::array<size_t, 16> active_cohorts_by_channel{};
 	size_t maximum_cohorts = 0;
 
 	static size_t note_index(uint8_t channel, uint8_t note) noexcept
@@ -347,6 +348,7 @@ struct CohortEngineState
 			return;
 		if (logical_ends)
 			active_logical -= slot.cohort.phase.multiplicity;
+		--active_cohorts_by_channel[slot.cohort.channel];
 		slot.occupied = false;
 		slot.cohort = {};
 		free_cohorts.push_back(index);
@@ -354,7 +356,14 @@ struct CohortEngineState
 		(void)owner;
 	}
 
-	uint32_t steal_candidate(const SynthEngine& owner) const noexcept
+	struct StealCandidate
+	{
+		uint32_t index = invalid_index;
+		enum class Scope : uint8_t { Channel, Reserve, Global } scope = Scope::Global;
+	};
+
+	StealCandidate steal_candidate(const SynthEngine& owner, uint8_t request_channel,
+		uint8_t request_note) const noexcept
 	{
 		auto estimated_level = [&](const RenderCohort& cohort) {
 			const auto& channel = owner.channels_[cohort.channel];
@@ -362,30 +371,65 @@ struct CohortEngineState
 			return static_cast<double>(cohort.env) * channel.volume * channel.expression *
 				owner.master_volume_ * gain * cohort.phase.multiplicity;
 		};
-		uint32_t candidate = invalid_index;
+		auto prefer = [&](uint32_t selected, uint32_t challenger) {
+			if (selected == invalid_index)
+				return true;
+			const auto& current = cohorts[challenger].cohort;
+			const auto& candidate = cohorts[selected].cohort;
+			const bool current_releasing = current.stage == CohortStage::Release;
+			const bool candidate_releasing = candidate.stage == CohortStage::Release;
+			const double current_level = estimated_level(current);
+			const double candidate_level = estimated_level(candidate);
+			return (current_releasing && !candidate_releasing) ||
+				(current_releasing == candidate_releasing &&
+					(current_level < candidate_level ||
+						(current_level == candidate_level &&
+							current.oldest_serial > candidate.oldest_serial)));
+		};
+		const size_t channel_reserve = maximum_cohorts /
+			active_cohorts_by_channel.size();
+		uint32_t same_channel = invalid_index;
+		uint32_t same_channel_different_key = invalid_index;
+		uint32_t over_reserve = invalid_index;
+		uint32_t global = invalid_index;
+		uint32_t global_different_key = invalid_index;
 		for (uint32_t index = 0; index < cohorts.size(); ++index)
 		{
 			if (!cohorts[index].occupied)
 				continue;
-			if (candidate == invalid_index)
+			const auto& cohort = cohorts[index].cohort;
+			const bool same_key = cohort.channel == request_channel &&
+				cohort.note == request_note;
+			if (prefer(global, index))
+				global = index;
+			if (!same_key && prefer(global_different_key, index))
+				global_different_key = index;
+			if (cohort.channel == request_channel)
 			{
-				candidate = index;
-				continue;
+				if (prefer(same_channel, index))
+					same_channel = index;
+				if (!same_key && prefer(same_channel_different_key, index))
+					same_channel_different_key = index;
 			}
-			const auto& current = cohorts[index].cohort;
-			const auto& selected = cohorts[candidate].cohort;
-			const bool current_releasing = current.stage == CohortStage::Release;
-			const bool selected_releasing = selected.stage == CohortStage::Release;
-			const double current_level = estimated_level(current);
-			const double selected_level = estimated_level(selected);
-			if ((current_releasing && !selected_releasing) ||
-				(current_releasing == selected_releasing &&
-					(current_level < selected_level ||
-						(current_level == selected_level &&
-							current.oldest_serial > selected.oldest_serial))))
-				candidate = index;
+			if (active_cohorts_by_channel[cohort.channel] > channel_reserve &&
+				prefer(over_reserve, index))
+				over_reserve = index;
 		}
-		return candidate;
+
+		if (active_cohorts_by_channel[request_channel] != 0 &&
+			active_cohorts_by_channel[request_channel] >= channel_reserve)
+		{
+			const uint32_t candidate = same_channel_different_key != invalid_index
+				? same_channel_different_key : same_channel;
+			if (candidate != invalid_index)
+				return {candidate, StealCandidate::Scope::Channel};
+		}
+		if (active_cohorts_by_channel[request_channel] < channel_reserve &&
+			over_reserve != invalid_index)
+			return {over_reserve, StealCandidate::Scope::Reserve};
+		const uint32_t candidate = global_different_key != invalid_index
+			? global_different_key : global;
+		return {candidate, StealCandidate::Scope::Global};
 	}
 
 	StableHandle allocate_cohort(SynthEngine& owner, RenderCohort cohort,
@@ -393,12 +437,24 @@ struct CohortEngineState
 	{
 		if (maximum_cohorts != 0 && active_cohort_count >= maximum_cohorts)
 		{
-			const uint32_t victim = steal_candidate(owner);
-			if (victim != invalid_index)
+			const StealCandidate victim = steal_candidate(owner, cohort.channel, cohort.note);
+			if (victim.index != invalid_index)
 			{
-				owner.stats_.stolen_voices += cohorts[victim].cohort.phase.multiplicity;
+				owner.stats_.stolen_voices += cohorts[victim.index].cohort.phase.multiplicity;
 				++owner.stats_.cohort_capacity_steals;
-				retire_cohort(owner, victim, true);
+				switch (victim.scope)
+				{
+				case StealCandidate::Scope::Channel:
+					++owner.stats_.channel_scoped_steals;
+					break;
+				case StealCandidate::Scope::Reserve:
+					++owner.stats_.channel_reserve_steals;
+					break;
+				case StealCandidate::Scope::Global:
+					++owner.stats_.global_fallback_steals;
+					break;
+				}
+				retire_cohort(owner, victim.index, true);
 			}
 		}
 		uint32_t index = invalid_index;
@@ -420,6 +476,7 @@ struct CohortEngineState
 		auto& slot = cohorts[index];
 		slot.cohort = std::move(cohort);
 		slot.occupied = true;
+		++active_cohorts_by_channel[slot.cohort.channel];
 		++active_cohort_count;
 		++owner.stats_.cohorts_created;
 		if (starts_logical_voices)
@@ -1065,6 +1122,7 @@ struct CohortEngineState
 		onset_candidates.clear();
 		active_logical = 0;
 		active_cohort_count = 0;
+		active_cohorts_by_channel.fill(0);
 	}
 };
 
