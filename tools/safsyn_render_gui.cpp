@@ -652,8 +652,8 @@ void render_worker(HWND window, std::atomic_bool& cancel, RenderRequest request)
 		}
 
 		std::wostringstream bank_detail;
-		bank_detail << done->analysis.header.track_count << L" tracks • "
-			<< format_count(done->analysis.total_events) << L" events • "
+		bank_detail << done->analysis.header.track_count << L" tracks : "
+			<< format_count(done->analysis.total_events) << L" events : "
 			<< format_duration(static_cast<double>(done->analysis.duration_frames) /
 				request.options.sample_rate) << L" source duration";
 		post_stage(window, L"Loading sound bank...", bank_detail.str());
@@ -889,7 +889,7 @@ void create_ui(AppState& state)
 		rows[4] - 4, 250);
 	add_page_label(state, 1, L"Seed", right_label, rows[1], 180);
 	add_page_edit(state, 1, PhaseSeed, L"0", right_field, rows[1] - 3, 160);
-	add_page_label(state, 1, L"Correlation (Hz)", right_label, rows[2], 180);
+	add_page_label(state, 1, L"Correlation (Smooth Field only, Hz)", right_label, rows[2], 180);
 	add_page_edit(state, 1, PhaseCorrelation, L"250", right_field, rows[2] - 3, 160);
 	add_page_label(state, 1, L"Preserve attack (ms)", right_label, rows[3], 180);
 	add_page_edit(state, 1, PhaseAttack, L"0", right_field, rows[3] - 3, 160);
@@ -954,19 +954,19 @@ void update_progress_ui(AppState& state, const ProgressUpdate& update)
 	SendMessageW(state.progress, PBM_SETPOS, position, 0);
 
 	std::wostringstream detail;
-	detail << static_cast<int>(fraction * 100.0) << L"%  •  "
+	detail << static_cast<int>(fraction * 100.0) << L"%  :  "
 		<< format_count(progress.frames_rendered) << L" / "
-		<< format_count(progress.total_frames) << L" frames  •  elapsed "
+		<< format_count(progress.total_frames) << L" frames  :  elapsed "
 		<< format_duration(update.elapsed_seconds);
 	if (fraction > 0.002 && fraction < 1.0)
-		detail << L"  •  about " << format_duration(update.elapsed_seconds / fraction -
+		detail << L"  :  about " << format_duration(update.elapsed_seconds / fraction -
 			update.elapsed_seconds) << L" remaining";
 	set_text(state.status_detail, detail.str());
 
 	std::wostringstream live;
-	live << format_count(progress.scheduled_events) << L" scheduled events  •  "
-		<< format_count(progress.active_voices) << L" active voices  •  "
-		<< format_count(progress.active_cohorts) << L" active cohorts  •  peak "
+	live << format_count(progress.scheduled_events) << L" scheduled events  :  "
+		<< format_count(progress.active_voices) << L" active voices  :  "
+		<< format_count(progress.active_cohorts) << L" active cohorts  :  peak "
 		<< format_peak(progress.raw_peak);
 	set_text(state.status_metrics, live.str());
 }
@@ -1000,14 +1000,14 @@ void handle_done(AppState& state, DoneUpdate& done)
 		set_text(state.status_title, L"Render complete");
 		std::wostringstream detail;
 		detail << format_duration(static_cast<double>(done.result.frames_written) /
-			done.analysis.sample_rate) << L" audio  •  " << format_bytes(done.output_bytes)
-			<< L"  •  completed in " << format_duration(done.elapsed_seconds);
+			done.analysis.sample_rate) << L" audio  :  " << format_bytes(done.output_bytes)
+			<< L"  :  completed in " << format_duration(done.elapsed_seconds);
 		set_text(state.status_detail, detail.str());
 		std::wostringstream summary;
-		summary << format_count(done.result.scheduled_events) << L" events  •  "
+		summary << format_count(done.result.scheduled_events) << L" events  :  "
 			<< format_count(done.result.engine.peak_active_logical_voices)
-			<< L" peak logical voices  •  peak " << format_peak(done.result.peak)
-			<< L"  •  audio engine " << format_duration(done.result.render_ms / 1000.0);
+			<< L" peak logical voices  :  peak " << format_peak(done.result.peak)
+			<< L"  :  audio engine " << format_duration(done.result.render_ms / 1000.0);
 		set_text(state.status_metrics, summary.str());
 	}
 	if (state.closing) DestroyWindow(state.window);
