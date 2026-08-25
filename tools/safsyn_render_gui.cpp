@@ -184,7 +184,8 @@ std::wstring lowercase_extension(const std::wstring& path)
 std::wstring widen(const std::string& value)
 {
 	if (value.empty()) return {};
-	auto convert = [&](UINT code_page) -> std::wstring {
+	auto convert = [&](UINT code_page) -> std::wstring
+	{
 		const int count = MultiByteToWideChar(code_page, 0, value.data(),
 			static_cast<int>(value.size()), nullptr, 0);
 		if (count <= 0) return {};
@@ -356,7 +357,7 @@ void set_running(AppState& state, bool running)
 	{
 		set_marquee(state.progress, true);
 		SendMessageW(state.progress, PBM_SETPOS, 0, 0);
-		set_text(state.status_title, L"Preparing render…");
+		set_text(state.status_title, L"Preparing render...");
 		set_text(state.status_detail, L"Validating files and settings");
 		set_text(state.status_metrics, L"");
 	}
@@ -612,7 +613,7 @@ void render_worker(HWND window, std::atomic_bool& cancel, RenderRequest request)
 		const std::string midi_path = std::filesystem::path(request.midi_path).string();
 		const std::string bank_path = std::filesystem::path(request.bank_path).string();
 		const std::string output_path = std::filesystem::path(request.output_path).string();
-		post_stage(window, L"Reading MIDI…", L"Validating the file and track structure");
+		post_stage(window, L"Reading MIDI...", L"Validating the file and track structure");
 		safsyn::SmfFile midi;
 		if (!midi.load(midi_path.c_str()))
 		{
@@ -628,7 +629,7 @@ void render_worker(HWND window, std::atomic_bool& cancel, RenderRequest request)
 			return;
 		}
 
-		post_stage(window, L"Analyzing timeline…",
+		post_stage(window, L"Analyzing timeline...",
 			L"Counting events and calculating the exact output duration");
 		safsyn::SmfAnalysisOptions analysis_options;
 		analysis_options.sample_rate = request.options.sample_rate;
@@ -655,7 +656,7 @@ void render_worker(HWND window, std::atomic_bool& cancel, RenderRequest request)
 			<< format_count(done->analysis.total_events) << L" events • "
 			<< format_duration(static_cast<double>(done->analysis.duration_frames) /
 				request.options.sample_rate) << L" source duration";
-		post_stage(window, L"Loading sound bank…", bank_detail.str());
+		post_stage(window, L"Loading sound bank...", bank_detail.str());
 		safsyn::Soundfont soundfont;
 		const std::wstring extension = lowercase_extension(request.bank_path);
 		const bool loaded = extension == L".sfz"
@@ -829,7 +830,7 @@ void create_ui(AppState& state)
 	state.output_path = create_control(state, L"EDIT", L"",
 		ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, OutputPath, 150, 166, 600, 27);
 	for (int id : {BrowseMidi, BrowseBank, BrowseOutput})
-		create_control(state, L"BUTTON", L"Browse…", BS_PUSHBUTTON | WS_TABSTOP,
+		create_control(state, L"BUTTON", L"Browse...", BS_PUSHBUTTON | WS_TABSTOP,
 			0, id, 770, id == BrowseMidi ? 85 : id == BrowseBank ? 125 : 165, 98, 29);
 
 	state.tabs = create_control(state, WC_TABCONTROLW, L"", WS_TABSTOP, 0,
@@ -880,9 +881,9 @@ void create_ui(AppState& state)
 	add_page_combo(state, 1, PhaseMode, left_field, rows[1] - 3, 190,
 		{L"Coherent", L"Random polarity", L"Analytic", L"Smooth field",
 			L"Independent bins"}, 0);
-	add_page_label(state, 1, L"Strength (0–1)", left_label, rows[2], 145);
+	add_page_label(state, 1, L"Strength (0-1)", left_label, rows[2], 145);
 	add_page_edit(state, 1, PhaseStrength, L"1", left_field, rows[2] - 3, 160);
-	add_page_label(state, 1, L"Variant pool (1–64)", left_label, rows[3], 145);
+	add_page_label(state, 1, L"Variant pool (1-64)", left_label, rows[3], 145);
 	add_page_edit(state, 1, PhasePool, L"64", left_field, rows[3] - 3, 160);
 	add_page_check(state, 1, PhaseContinuous, L"Continuous assignment", left_label,
 		rows[4] - 4, 250);
@@ -937,14 +938,14 @@ void update_progress_ui(AppState& state, const ProgressUpdate& update)
 {
 	set_marquee(state.progress, false);
 	const auto& progress = update.progress;
-	const wchar_t* stage = L"Preparing render…";
+	const wchar_t* stage = L"Preparing render...";
 	switch (progress.stage)
 	{
-	case safsyn::SmfRenderProgressStage::Preparing: stage = L"Preparing audio engine…"; break;
-	case safsyn::SmfRenderProgressStage::RenderingEvents: stage = L"Rendering MIDI events…"; break;
-	case safsyn::SmfRenderProgressStage::RenderingTail: stage = L"Rendering release tail…"; break;
-	case safsyn::SmfRenderProgressStage::Finalizing: stage = L"Finalizing WAV…"; break;
-	case safsyn::SmfRenderProgressStage::Complete: stage = L"Render complete"; break;
+		case safsyn::SmfRenderProgressStage::Preparing: stage = L"Preparing audio engine..."; break;
+		case safsyn::SmfRenderProgressStage::RenderingEvents: stage = L"Rendering MIDI events..."; break;
+		case safsyn::SmfRenderProgressStage::RenderingTail: stage = L"Rendering release tail..."; break;
+		case safsyn::SmfRenderProgressStage::Finalizing: stage = L"Finalizing WAV..."; break;
+		case safsyn::SmfRenderProgressStage::Complete: stage = L"Render complete"; break;
 	}
 	set_text(state.status_title, stage);
 	const double fraction = progress.total_frames == 0 ? 0.0 :
@@ -981,7 +982,7 @@ void handle_done(AppState& state, DoneUpdate& done)
 		std::wstring detail = done.result.frames_written == 0
 			? L"No audio was rendered."
 			: L"A valid partial WAV was finalized with " +
-				format_count(done.result.frames_written) + L" frames.";
+			format_count(done.result.frames_written) + L" frames.";
 		set_text(state.status_detail, detail);
 		set_text(state.status_metrics, L"Adjust the settings or choose Render WAV to try again.");
 	}
@@ -1017,148 +1018,148 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
 	AppState* state = state_from(window);
 	switch (message)
 	{
-	case WM_NCCREATE:
-	{
-		auto* created = reinterpret_cast<CREATESTRUCTW*>(lparam);
-		state = static_cast<AppState*>(created->lpCreateParams);
-		state->window = window;
-		SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
-		return TRUE;
-	}
-	case WM_CREATE:
-		create_ui(*state);
-		return 0;
-	case WM_GETMINMAXINFO:
-	{
-		auto* limits = reinterpret_cast<MINMAXINFO*>(lparam);
-		limits->ptMinTrackSize = {940, 720};
-		return 0;
-	}
-	case WM_SIZE:
-		if (state) layout(*state, LOWORD(lparam), HIWORD(lparam));
-		return 0;
-	case WM_CTLCOLORSTATIC:
-		if (state)
+		case WM_NCCREATE:
 		{
-			SetBkMode(reinterpret_cast<HDC>(wparam), TRANSPARENT);
-			SetTextColor(reinterpret_cast<HDC>(wparam), RGB(31, 41, 55));
-			return reinterpret_cast<LRESULT>(state->background);
+			auto* created = reinterpret_cast<CREATESTRUCTW*>(lparam);
+			state = static_cast<AppState*>(created->lpCreateParams);
+			state->window = window;
+			SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+			return TRUE;
 		}
-		break;
-	case WM_ERASEBKGND:
-		if (state && state->background)
+		case WM_CREATE:
+			create_ui(*state);
+			return 0;
+		case WM_GETMINMAXINFO:
 		{
-			RECT bounds{};
-			GetClientRect(window, &bounds);
-			FillRect(reinterpret_cast<HDC>(wparam), &bounds, state->background);
-			return 1;
-		}
-		break;
-	case WM_NOTIFY:
-		if (state && reinterpret_cast<NMHDR*>(lparam)->idFrom == SettingsTabs &&
-			reinterpret_cast<NMHDR*>(lparam)->code == TCN_SELCHANGE)
-		{
-			show_page(*state, TabCtrl_GetCurSel(state->tabs));
+			auto* limits = reinterpret_cast<MINMAXINFO*>(lparam);
+			limits->ptMinTrackSize = {940, 720};
 			return 0;
 		}
-		break;
-	case WM_DROPFILES:
-		if (state && !state->running) handle_drop(*state, reinterpret_cast<HDROP>(wparam));
-		return 0;
-	case WM_COMMAND:
-		if (!state) break;
-		switch (LOWORD(wparam))
-		{
-		case BrowseMidi:
-		{
-			const wchar_t filter[] = L"MIDI files (*.mid)\0*.mid\0All files (*.*)\0*.*\0\0";
-			const std::wstring path = choose_open_file(window, filter, state->midi_path);
-			if (!path.empty()) { set_text(state->midi_path, path); suggest_output(*state); }
+		case WM_SIZE:
+			if (state) layout(*state, LOWORD(lparam), HIWORD(lparam));
 			return 0;
-		}
-		case BrowseBank:
-		{
-			const wchar_t filter[] =
-				L"Sound banks (*.sf2;*.sfz)\0*.sf2;*.sfz\0SoundFont 2 (*.sf2)\0*.sf2\0SFZ (*.sfz)\0*.sfz\0All files (*.*)\0*.*\0\0";
-			const std::wstring path = choose_open_file(window, filter, state->bank_path);
-			if (!path.empty()) set_text(state->bank_path, path);
-			return 0;
-		}
-		case BrowseOutput:
-		{
-			const std::wstring path = choose_output_file(window, state->output_path);
-			if (!path.empty()) set_text(state->output_path, path);
-			return 0;
-		}
-		case RenderButton:
-		{
-			RenderRequest request;
-			if (!read_request(*state, request)) return 0;
-			if (state->worker.joinable()) state->worker.join();
-			state->cancel.store(false, std::memory_order_relaxed);
-			SendMessageW(state->progress, PBM_SETSTATE, PBST_NORMAL, 0);
-			set_running(*state, true);
-			state->worker = std::thread(render_worker, window, std::ref(state->cancel),
-				std::move(request));
-			return 0;
-		}
-		case CancelButton:
-			state->cancel.store(true, std::memory_order_relaxed);
-			EnableWindow(state->cancel_button, FALSE);
-			set_text(state->status_title, L"Cancelling…");
-			set_text(state->status_detail, L"Finishing the current block and finalizing partial audio.");
-			return 0;
-		}
-		break;
-	case kStageMessage:
-		if (state)
-		{
-			std::unique_ptr<StageUpdate> update(reinterpret_cast<StageUpdate*>(lparam));
-			set_marquee(state->progress, true);
-			set_text(state->status_title, update->title);
-			set_text(state->status_detail, update->detail);
-		}
-		return 0;
-	case kProgressMessage:
-		if (state)
-		{
-			std::unique_ptr<ProgressUpdate> update(reinterpret_cast<ProgressUpdate*>(lparam));
-			update_progress_ui(*state, *update);
-		}
-		return 0;
-	case kDoneMessage:
-		if (state)
-		{
-			std::unique_ptr<DoneUpdate> update(reinterpret_cast<DoneUpdate*>(lparam));
-			handle_done(*state, *update);
-		}
-		return 0;
-	case WM_CLOSE:
-		if (state && state->running)
-		{
-			if (MessageBoxW(window, L"Cancel the active render and close the window?",
-				L"SAFSYN Renderer", MB_YESNO | MB_ICONQUESTION) == IDYES)
+		case WM_CTLCOLORSTATIC:
+			if (state)
 			{
-				state->closing = true;
-				state->cancel.store(true, std::memory_order_relaxed);
-				EnableWindow(state->cancel_button, FALSE);
-				set_text(state->status_title, L"Cancelling before close…");
+				SetBkMode(reinterpret_cast<HDC>(wparam), TRANSPARENT);
+				SetTextColor(reinterpret_cast<HDC>(wparam), RGB(31, 41, 55));
+				return reinterpret_cast<LRESULT>(state->background);
+			}
+			break;
+		case WM_ERASEBKGND:
+			if (state && state->background)
+			{
+				RECT bounds{};
+				GetClientRect(window, &bounds);
+				FillRect(reinterpret_cast<HDC>(wparam), &bounds, state->background);
+				return 1;
+			}
+			break;
+		case WM_NOTIFY:
+			if (state && reinterpret_cast<NMHDR*>(lparam)->idFrom == SettingsTabs &&
+				reinterpret_cast<NMHDR*>(lparam)->code == TCN_SELCHANGE)
+			{
+				show_page(*state, TabCtrl_GetCurSel(state->tabs));
+				return 0;
+			}
+			break;
+		case WM_DROPFILES:
+			if (state && !state->running) handle_drop(*state, reinterpret_cast<HDROP>(wparam));
+			return 0;
+		case WM_COMMAND:
+			if (!state) break;
+			switch (LOWORD(wparam))
+			{
+				case BrowseMidi:
+				{
+					const wchar_t filter[] = L"MIDI files (*.mid)\0*.mid\0All files (*.*)\0*.*\0\0";
+					const std::wstring path = choose_open_file(window, filter, state->midi_path);
+					if (!path.empty()) { set_text(state->midi_path, path); suggest_output(*state); }
+					return 0;
+				}
+				case BrowseBank:
+				{
+					const wchar_t filter[] =
+						L"Sound banks (*.sf2;*.sfz)\0*.sf2;*.sfz\0SoundFont 2 (*.sf2)\0*.sf2\0SFZ (*.sfz)\0*.sfz\0All files (*.*)\0*.*\0\0";
+					const std::wstring path = choose_open_file(window, filter, state->bank_path);
+					if (!path.empty()) set_text(state->bank_path, path);
+					return 0;
+				}
+				case BrowseOutput:
+				{
+					const std::wstring path = choose_output_file(window, state->output_path);
+					if (!path.empty()) set_text(state->output_path, path);
+					return 0;
+				}
+				case RenderButton:
+				{
+					RenderRequest request;
+					if (!read_request(*state, request)) return 0;
+					if (state->worker.joinable()) state->worker.join();
+					state->cancel.store(false, std::memory_order_relaxed);
+					SendMessageW(state->progress, PBM_SETSTATE, PBST_NORMAL, 0);
+					set_running(*state, true);
+					state->worker = std::thread(render_worker, window, std::ref(state->cancel),
+						std::move(request));
+					return 0;
+				}
+				case CancelButton:
+					state->cancel.store(true, std::memory_order_relaxed);
+					EnableWindow(state->cancel_button, FALSE);
+					set_text(state->status_title, L"Cancelling...");
+					set_text(state->status_detail, L"Finishing the current block and finalizing partial audio.");
+					return 0;
+			}
+			break;
+		case kStageMessage:
+			if (state)
+			{
+				std::unique_ptr<StageUpdate> update(reinterpret_cast<StageUpdate*>(lparam));
+				set_marquee(state->progress, true);
+				set_text(state->status_title, update->title);
+				set_text(state->status_detail, update->detail);
 			}
 			return 0;
-		}
-		DestroyWindow(window);
-		return 0;
-	case WM_DESTROY:
-		if (state)
-		{
-			if (state->worker.joinable()) state->worker.join();
-			DeleteObject(state->font);
-			DeleteObject(state->font_bold);
-			DeleteObject(state->font_title);
-			DeleteObject(state->background);
-		}
-		PostQuitMessage(0);
-		return 0;
+		case kProgressMessage:
+			if (state)
+			{
+				std::unique_ptr<ProgressUpdate> update(reinterpret_cast<ProgressUpdate*>(lparam));
+				update_progress_ui(*state, *update);
+			}
+			return 0;
+		case kDoneMessage:
+			if (state)
+			{
+				std::unique_ptr<DoneUpdate> update(reinterpret_cast<DoneUpdate*>(lparam));
+				handle_done(*state, *update);
+			}
+			return 0;
+		case WM_CLOSE:
+			if (state && state->running)
+			{
+				if (MessageBoxW(window, L"Cancel the active render and close the window?",
+					L"SAFSYN Renderer", MB_YESNO | MB_ICONQUESTION) == IDYES)
+				{
+					state->closing = true;
+					state->cancel.store(true, std::memory_order_relaxed);
+					EnableWindow(state->cancel_button, FALSE);
+					set_text(state->status_title, L"Cancelling before close...");
+				}
+				return 0;
+			}
+			DestroyWindow(window);
+			return 0;
+		case WM_DESTROY:
+			if (state)
+			{
+				if (state->worker.joinable()) state->worker.join();
+				DeleteObject(state->font);
+				DeleteObject(state->font_bold);
+				DeleteObject(state->font_title);
+				DeleteObject(state->background);
+			}
+			PostQuitMessage(0);
+			return 0;
 	}
 	return DefWindowProcW(window, message, wparam, lparam);
 }
