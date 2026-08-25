@@ -35,6 +35,11 @@ It must not be described or measured as phase-only processing.
 
 - Engine state is instance-local; there is no process-global synthesizer.
 - Events are applied before rendering their target frame.
+- SMF tracks are merged by absolute tick, track index, then track-local ordinal.
+- Tick-to-sample conversion carries an exact rational remainder across every
+  event and tempo segment; event scheduling does not use floating point.
+- Every event assigned to one sample is dispatched in stable order before
+  rendering continues from that sample.
 - Note-on region traversal follows sound-bank region order.
 - A note-off releases all layers belonging to the newest matching note-on.
 - Voice exhaustion prefers the quietest releasing voice, then the oldest voice.
@@ -57,6 +62,9 @@ It must not be described or measured as phase-only processing.
   retain the exact coherent sample path.
 - A sound bank is immutable while attached to an engine.
 - Output is IEEE float32 WAV; values outside `[-1, 1]` are retained as evidence.
+- SMF audio is streamed in fixed blocks. RIFF sizes are finalized at close when
+  they fit; RF64 with a `ds64` chunk is selected from the predicted frame count
+  when ordinary RIFF can exceed 4 GiB.
 - MIDI bank select uses CC 0/32 and program changes use status `0xCn`.
 - Normal SF2 note-on traversal is limited to the channel's selected bank and
   program. The legacy flattened view is reachable only through the explicit
@@ -71,6 +79,28 @@ claim the full SF2 modulator system, filters, LFOs, or every generator.
 Bit identity is currently promised for the same MSVC executable and settings.
 Other supported platforms are expected to be numerically equivalent within a
 future documented tolerance; cross-platform bit identity is not claimed.
+
+## Streaming SMF boundary
+
+SMF types 0 and 1 are supported; type 2 is explicitly rejected. Each track has
+independent running status, absolute tick, and ordinal state. The merger keeps
+one pending decoded event per track in a min-heap, so parser/scheduler memory is
+O(track count), excluding the intentionally buffered input file. Events are not
+materialized into a second sequence.
+
+PPQN scheduling starts at 500,000 microseconds per quarter and applies valid
+tempo meta events after their tick. SMPTE `-24`, `-25`, `-29`, and `-30`
+divisions are supported; `-29` uses the exact `30000/1001` rate and ignores
+tempo for timing. A bounded four-byte VLQ parser is used for delta times and
+meta/SysEx lengths. Unknown meta and SysEx payloads are skipped within their
+declared track bounds; malformed or truncated data is diagnosed and stops the
+render.
+
+At natural end, sustain is lifted and active non-one-shot notes are released
+before the configured tail is rendered. A maximum-render limit is a hard output
+boundary: events on or after its exclusive frame are not dispatched. SMF input
+and decoded PCM remain buffered, so this milestone does not claim constant
+whole-process memory or realtime note-dispatch safety.
 
 ## Piano integration baselines
 

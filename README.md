@@ -1,17 +1,18 @@
 # SAFSYNCore
 
-SAFSYNCore is a deterministic offline sample renderer with a bit-exact coherent
-baseline and opt-in experimental phase-decorrelation modes. The project still
-deliberately stops before Standard MIDI File parsing, normalization, limiting,
+SAFSYNCore is a deterministic streaming Standard MIDI File renderer with a
+bit-exact coherent baseline and opt-in experimental phase-decorrelation modes.
+The project deliberately stops before normalization, limiting, realtime audio,
 and platform audio drivers so DSP experiments retain a reproducible baseline.
 
 ## What is included
 
-- `safsyn`: portable C++20 static library with SF2/SFZ loading and an
+- `safsyn`: static library with a C++20 public API, SF2/SFZ loading, and an
   instance-based synthesizer
 - `safsyn-render`: headless scripted-note renderer producing stereo float32 WAV
 - `safsyn-tests`: engine, MIDI-message, SFZ-loader, determinism, and WAV tests
 - `safsyn-phase-tests`: phase policy, determinism, pool, loop, and cache tests
+- `safsyn-smf-tests`: SMF parsing, timing, merge, streaming, and RF64 tests
 - `SAFSYN/dllmain.cpp`: preserved Windows driver sketch, excluded by default
 
 The coherent engine supports configurable preallocated polyphony, deterministic
@@ -26,10 +27,15 @@ program change choose the active SF2 preset per channel.
 ## Build and test
 
 ```text
+git submodule update --init --recursive
 cmake -S . -B build
 cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
+
+The public library headers remain C++20. The library implementation uses the
+pinned `DixelU/utility` `long_uint` header for exact scheduling arithmetic and
+therefore requires a compiler with C++23 implementation support.
 
 Generate a self-contained coherent baseline without a sound bank:
 
@@ -46,8 +52,27 @@ build/Release/safsyn-render instrument.sfz sfz-baseline.wav
 
 Options are `--bank N`, `--program N`, `--sample-rate N`, and `--voices N`.
 `--all-regions` explicitly selects the legacy flattened SF2 stress view; it is
-not normal instrument playback. The command does not accept MIDI files yet; SMF
-scheduling is milestone 3.
+not normal instrument playback.
+
+Analyze a Standard MIDI File without loading a sound bank:
+
+```text
+build/Release/safsyn-render input.mid --analyze --sample-rate 48000 --tail-seconds 2
+```
+
+Or stream a bounded or complete render directly to RIFF/RF64 WAV:
+
+```text
+build/Release/safsyn-render input.mid piano.sf2 output.wav --bank 0 --program 0 --tail-seconds 2
+build/Release/safsyn-render input.mid piano.sf2 excerpt.wav --max-render-seconds 30 --phase-mode analytic --phase-continuous --phase-seed 7
+```
+
+SMF types 0 and 1, PPQN and SMPTE timing, running status, tempo changes,
+channel events, safely skipped SysEx/meta payloads, and deterministic multi-track
+merge are supported. Type 2 is rejected. Input bytes are buffered, but parser
+and scheduler state is O(track count); audio output is streamed in fixed blocks.
+`--max-render-seconds` bounds both event dispatch and output, while
+`--tail-seconds` controls the natural-end release tail.
 
 Run an opt-in phase experiment with the same scripted events:
 
@@ -68,4 +93,6 @@ has been selected as a production default.
 `SAFSYN_BUILD_WINMM` defaults to `OFF`. Enabling it only compiles the preserved
 DLL shell; it does not claim a functioning WinMM/WASAPI backend. See
 `docs/DSP_CONTRACT.md` for the contract and `docs/PHASE_EXPERIMENT.md` for the
-phase architecture, measurements, and evidence boundaries.
+phase architecture, measurements, and evidence boundaries. See
+`docs/SMF_RENDERER.md` for the file/scheduling contract and the `Hypernova.mid`
+integration evidence.

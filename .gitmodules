@@ -1,0 +1,3 @@
+[submodule "third_party/utility"]
+	path = third_party/utility
+	url = https://github.com/DixelU/utility.git

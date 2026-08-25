@@ -8,11 +8,19 @@ add_library(safsyn STATIC
 	SAFSYN/core.cpp
 	SAFSYN/engine.cpp
 	SAFSYN/phase.cpp
+	SAFSYN/smf.cpp
+	SAFSYN/smf_renderer.cpp
 	SAFSYN/wav_writer.cpp
 )
 add_library(SAFSYN::safsyn ALIAS safsyn)
 target_include_directories(safsyn PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/SAFSYN")
+set(SAFSYN_UTILITY_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/utility/include")
+if(NOT EXISTS "${SAFSYN_UTILITY_INCLUDE}/long_uint.h")
+	message(FATAL_ERROR "Missing utility submodule; run git submodule update --init --recursive")
+endif()
+target_include_directories(safsyn PRIVATE "${SAFSYN_UTILITY_INCLUDE}")
 target_compile_features(safsyn PUBLIC cxx_std_20)
+target_compile_features(safsyn PRIVATE cxx_std_23)
 set_target_properties(safsyn PROPERTIES CXX_EXTENSIONS OFF)
 
 if(MSVC)
@@ -51,6 +59,20 @@ if(SAFSYN_BUILD_TESTS)
 		target_compile_options(safsyn-phase-tests PRIVATE /EHsc)
 	endif()
 	add_test(NAME safsyn-phase COMMAND safsyn-phase-tests)
+	add_executable(safsyn-smf-tests tests/smf_tests.cpp)
+	target_link_libraries(safsyn-smf-tests PRIVATE SAFSYN::safsyn)
+	target_compile_features(safsyn-smf-tests PRIVATE cxx_std_20)
+	if(MSVC)
+		target_compile_options(safsyn-smf-tests PRIVATE /EHsc)
+	endif()
+	add_test(NAME safsyn-smf COMMAND safsyn-smf-tests
+		"${CMAKE_CURRENT_BINARY_DIR}/smf-test-data")
 	add_test(NAME safsyn-demo-render
 		COMMAND safsyn-render --demo "${CMAKE_CURRENT_BINARY_DIR}/coherent-demo.wav")
+	add_test(NAME safsyn-coherent-sha
+		COMMAND "${CMAKE_COMMAND}"
+			"-DRENDERER=$<TARGET_FILE:safsyn-render>"
+			"-DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/coherent-sha.wav"
+			"-DEXPECTED=319EBFEB7C562DD50BD557DDA0DF18E6C462E9395CBFAE8BBB06896AE2595731"
+			-P "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_coherent_sha.cmake")
 endif()
