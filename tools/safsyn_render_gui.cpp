@@ -35,7 +35,7 @@
 
 namespace
 {
-constexpr wchar_t kWindowClass[] = L"SAFSYNRendererGui";
+constexpr wchar_t kWindowClass[] = L"SAFSYNCoreRendererGui";
 constexpr UINT kProgressMessage = WM_APP + 1;
 constexpr UINT kDoneMessage = WM_APP + 2;
 constexpr UINT kStageMessage = WM_APP + 3;
@@ -452,7 +452,7 @@ void set_running(AppState& state, bool running)
 
 void show_error(HWND owner, const std::wstring& message)
 {
-	MessageBoxW(owner, message.c_str(), L"SAFSYN Renderer", MB_OK | MB_ICONERROR);
+	MessageBoxW(owner, message.c_str(), L"SYNCore Renderer", MB_OK | MB_ICONERROR);
 }
 
 bool parse_unsigned(HWND owner, HWND control, const wchar_t* name,
@@ -902,7 +902,7 @@ void create_ui(AppState& state)
 	state.font_title = CreateFontIndirectW(&title);
 	state.background = CreateSolidBrush(RGB(246, 248, 251));
 
-	create_control(state, L"STATIC", L"SAFSYN Renderer", SS_LEFT, 0, 0,
+	create_control(state, L"STATIC", L"SYNCore Renderer", SS_LEFT, 0, 0,
 		32, 20, 500, 34, state.font_title);
 	create_control(state, L"STATIC",
 		L"Turn a Standard MIDI File and sound bank into deterministic stereo audio.",
@@ -1245,7 +1245,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
 			if (state && state->running)
 			{
 				if (MessageBoxW(window, L"Cancel the active render and close the window?",
-					L"SAFSYN Renderer", MB_YESNO | MB_ICONQUESTION) == IDYES)
+					L"SYNCore Renderer", MB_YESNO | MB_ICONQUESTION) == IDYES)
 				{
 					state->closing = true;
 					state->cancel.store(true, std::memory_order_relaxed);
@@ -1291,7 +1291,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command)
 	if (!RegisterClassExW(&window_class)) return 1;
 
 	AppState state;
-	HWND window = CreateWindowExW(0, kWindowClass, L"SAFSYN Renderer",
+	HWND window = CreateWindowExW(0, kWindowClass, L"SYNCore Renderer",
 		WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
 		980, 760, nullptr, nullptr, instance, &state);
 	if (!window) return 1;
