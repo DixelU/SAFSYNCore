@@ -135,12 +135,19 @@ struct AppState
 	HWND status_metrics = nullptr;
 	HWND render_button = nullptr;
 	HWND cancel_button = nullptr;
+	HWND phase_description = nullptr;
 	HFONT font = nullptr;
 	HFONT font_bold = nullptr;
 	HFONT font_title = nullptr;
 	HBRUSH background = nullptr;
 	std::vector<HWND> page_controls[3];
 	std::vector<HWND> input_controls;
+	std::vector<HWND> phase_strength_controls;
+	std::vector<HWND> phase_pool_controls;
+	std::vector<HWND> phase_continuous_controls;
+	std::vector<HWND> phase_seed_controls;
+	std::vector<HWND> phase_correlation_controls;
+	std::vector<HWND> phase_attack_controls;
 	std::thread worker;
 	std::atomic_bool cancel{false};
 	bool running = false;
@@ -332,6 +339,85 @@ void show_page(AppState& state, int page)
 			ShowWindow(control, index == page ? SW_SHOW : SW_HIDE);
 }
 
+safsyn::PhaseMode selected_phase_mode(const AppState& state)
+{
+	const int selection = static_cast<int>(SendDlgItemMessageW(state.window,
+		PhaseMode, CB_GETCURSEL, 0, 0));
+	const safsyn::PhaseMode modes[] = {safsyn::PhaseMode::Coherent,
+		safsyn::PhaseMode::RandomPolarity, safsyn::PhaseMode::Analytic,
+		safsyn::PhaseMode::SmoothField, safsyn::PhaseMode::IndependentBins};
+	return modes[(std::max)(0, (std::min)(selection, 4))];
+}
+
+void enable_controls(const std::vector<HWND>& controls, bool enabled)
+{
+	for (HWND control : controls)
+		EnableWindow(control, enabled ? TRUE : FALSE);
+}
+
+struct PhaseCapabilities
+{
+	bool strength = false;
+	bool pool = false;
+	bool continuous = false;
+	bool seed = false;
+	bool correlation = false;
+	bool attack = false;
+	const wchar_t* description = L"Bit-exact original sample phase. Advanced phase controls do not apply.";
+};
+
+PhaseCapabilities phase_capabilities(safsyn::PhaseMode mode, bool continuous)
+{
+	PhaseCapabilities capabilities;
+	switch (mode)
+	{
+		case safsyn::PhaseMode::Coherent:
+			break;
+		case safsyn::PhaseMode::RandomPolarity:
+			capabilities.seed = capabilities.attack = true;
+			capabilities.description =
+				L"Experimental: deterministically keeps or inverts each note. Seed and attack protection apply.";
+			break;
+		case safsyn::PhaseMode::Analytic:
+			capabilities.strength = capabilities.continuous =
+				capabilities.seed = capabilities.attack = true;
+			capabilities.pool = !continuous;
+			capabilities.description = continuous
+				? L"Experimental: each note gets a unique analytic rotation; the finite pool is bypassed."
+				: L"Experimental: analytic rotations come from a deterministic, reusable variant pool.";
+			break;
+		case safsyn::PhaseMode::SmoothField:
+			capabilities.strength = capabilities.pool = capabilities.seed =
+				capabilities.correlation = capabilities.attack = true;
+			capabilities.description =
+				L"Experimental: FFT phase offsets vary smoothly; correlation controls their bandwidth.";
+			break;
+		case safsyn::PhaseMode::IndependentBins:
+			capabilities.strength = capabilities.pool =
+				capabilities.seed = capabilities.attack = true;
+			capabilities.description =
+				L"Experimental: each FFT bin gets an independent offset from a deterministic variant pool.";
+			break;
+	}
+	return capabilities;
+}
+
+void update_phase_controls(AppState& state)
+{
+	const safsyn::PhaseMode mode = selected_phase_mode(state);
+	const bool continuous = SendDlgItemMessageW(state.window, PhaseContinuous,
+		BM_GETCHECK, 0, 0) == BST_CHECKED;
+	const PhaseCapabilities capabilities = phase_capabilities(mode, continuous);
+	set_text(state.phase_description, capabilities.description);
+	const bool editable = !state.running;
+	enable_controls(state.phase_strength_controls, editable && capabilities.strength);
+	enable_controls(state.phase_pool_controls, editable && capabilities.pool);
+	enable_controls(state.phase_continuous_controls, editable && capabilities.continuous);
+	enable_controls(state.phase_seed_controls, editable && capabilities.seed);
+	enable_controls(state.phase_correlation_controls, editable && capabilities.correlation);
+	enable_controls(state.phase_attack_controls, editable && capabilities.attack);
+}
+
 void set_marquee(HWND progress, bool enabled)
 {
 	LONG_PTR style = GetWindowLongPtrW(progress, GWL_STYLE);
@@ -353,6 +439,7 @@ void set_running(AppState& state, bool running)
 	EnableWindow(state.tabs, !running);
 	EnableWindow(state.render_button, !running);
 	EnableWindow(state.cancel_button, running);
+	update_phase_controls(state);
 	if (running)
 	{
 		set_marquee(state.progress, true);
@@ -505,32 +592,35 @@ bool read_request(AppState& state, RenderRequest& request)
 	options.all_regions = SendDlgItemMessageW(state.window, AllRegions,
 		BM_GETCHECK, 0, 0) == BST_CHECKED;
 
-	const int phase_mode = static_cast<int>(SendDlgItemMessageW(state.window,
-		PhaseMode, CB_GETCURSEL, 0, 0));
-	const safsyn::PhaseMode phase_modes[] = {safsyn::PhaseMode::Coherent,
-		safsyn::PhaseMode::RandomPolarity, safsyn::PhaseMode::Analytic,
-		safsyn::PhaseMode::SmoothField, safsyn::PhaseMode::IndependentBins};
-	options.phase.mode = phase_modes[(std::max)(0, (std::min)(phase_mode, 4))];
-	double phase_strength = 0.0, correlation = 0.0, attack = 0.0;
-	uint64_t pool = 0, seed = 0;
-	if (!parse_number(state.window, GetDlgItem(state.window, PhaseStrength),
-		L"Phase strength", 0.0, 1.0, phase_strength) ||
-		!parse_unsigned(state.window, GetDlgItem(state.window, PhasePool),
-			L"Phase pool", 1, 64, pool) ||
-		!parse_unsigned(state.window, GetDlgItem(state.window, PhaseSeed),
-			L"Phase seed", 0, (std::numeric_limits<uint64_t>::max)(), seed) ||
-		!parse_number(state.window, GetDlgItem(state.window, PhaseCorrelation),
-			L"Phase correlation", 0.001, 1000000.0, correlation) ||
-		!parse_number(state.window, GetDlgItem(state.window, PhaseAttack),
-			L"Preserved attack", 0.0, 60000.0, attack))
+	options.phase = {};
+	options.phase.mode = selected_phase_mode(state);
+	options.phase.continuous = options.phase.mode == safsyn::PhaseMode::Analytic &&
+		SendDlgItemMessageW(state.window, PhaseContinuous, BM_GETCHECK, 0, 0) == BST_CHECKED;
+	const PhaseCapabilities capabilities = phase_capabilities(options.phase.mode,
+		options.phase.continuous);
+	double phase_strength = options.phase.strength;
+	double correlation = options.phase.correlation_hz;
+	double attack = options.phase.preserve_attack_ms;
+	uint64_t pool = options.phase.pool_size;
+	uint64_t seed = options.phase.seed;
+	if ((capabilities.strength && !parse_number(state.window,
+		GetDlgItem(state.window, PhaseStrength),
+		L"Phase strength", 0.0, 1.0, phase_strength)) ||
+		(capabilities.pool && !parse_unsigned(state.window, GetDlgItem(state.window, PhasePool),
+			L"Phase pool", 1, 64, pool)) ||
+		(capabilities.seed && !parse_unsigned(state.window, GetDlgItem(state.window, PhaseSeed),
+			L"Phase seed", 0, (std::numeric_limits<uint64_t>::max)(), seed)) ||
+		(capabilities.correlation && !parse_number(state.window,
+			GetDlgItem(state.window, PhaseCorrelation), L"Phase correlation",
+			0.001, 1000000.0, correlation)) ||
+		(capabilities.attack && !parse_number(state.window, GetDlgItem(state.window, PhaseAttack),
+			L"Preserved attack", 0.0, 60000.0, attack)))
 		return false;
 	options.phase.strength = static_cast<float>(phase_strength);
 	options.phase.pool_size = static_cast<uint32_t>(pool);
 	options.phase.seed = seed;
 	options.phase.correlation_hz = static_cast<float>(correlation);
 	options.phase.preserve_attack_ms = static_cast<float>(attack);
-	options.phase.continuous = SendDlgItemMessageW(state.window, PhaseContinuous,
-		BM_GETCHECK, 0, 0) == BST_CHECKED;
 
 	double gain = 0.0, ceiling = 0.0, lookahead = 0.0, release = 0.0;
 	if (!parse_number(state.window, GetDlgItem(state.window, OutputGain),
@@ -874,25 +964,31 @@ void create_ui(AppState& state)
 	add_page_check(state, 0, AllRegions, L"All-regions stress mode", right_label,
 		rows[5] - 4, 250);
 
-	add_page_label(state, 1,
-		L"Coherent is the bit-exact baseline. Other modes are experimental phase-decorrelation policies.",
+	state.phase_description = add_page_label(state, 1,
+		L"Bit-exact original sample phase. Advanced phase controls do not apply.",
 		54, rows[0], 820, 24);
 	add_page_label(state, 1, L"Phase mode", left_label, rows[1], 145);
 	add_page_combo(state, 1, PhaseMode, left_field, rows[1] - 3, 190,
 		{L"Coherent", L"Random polarity", L"Analytic", L"Smooth field",
 			L"Independent bins"}, 0);
-	add_page_label(state, 1, L"Strength (0-1)", left_label, rows[2], 145);
-	add_page_edit(state, 1, PhaseStrength, L"1", left_field, rows[2] - 3, 160);
-	add_page_label(state, 1, L"Variant pool (1-64)", left_label, rows[3], 145);
-	add_page_edit(state, 1, PhasePool, L"64", left_field, rows[3] - 3, 160);
-	add_page_check(state, 1, PhaseContinuous, L"Continuous assignment", left_label,
-		rows[4] - 4, 250);
-	add_page_label(state, 1, L"Seed", right_label, rows[1], 180);
-	add_page_edit(state, 1, PhaseSeed, L"0", right_field, rows[1] - 3, 160);
-	add_page_label(state, 1, L"Correlation (Smooth Field only, Hz)", right_label, rows[2], 180);
-	add_page_edit(state, 1, PhaseCorrelation, L"250", right_field, rows[2] - 3, 160);
-	add_page_label(state, 1, L"Preserve attack (ms)", right_label, rows[3], 180);
-	add_page_edit(state, 1, PhaseAttack, L"0", right_field, rows[3] - 3, 160);
+	state.phase_strength_controls = {
+		add_page_label(state, 1, L"Strength (0-1)", left_label, rows[2], 145),
+		add_page_edit(state, 1, PhaseStrength, L"1", left_field, rows[2] - 3, 160)};
+	state.phase_pool_controls = {
+		add_page_label(state, 1, L"Variant pool (1-64)", left_label, rows[3], 145),
+		add_page_edit(state, 1, PhasePool, L"64", left_field, rows[3] - 3, 160)};
+	state.phase_continuous_controls = {
+		add_page_check(state, 1, PhaseContinuous, L"Use a unique angle for every note",
+			left_label, rows[4] - 4, 310)};
+	state.phase_seed_controls = {
+		add_page_label(state, 1, L"Seed", right_label, rows[1], 180),
+		add_page_edit(state, 1, PhaseSeed, L"0", right_field, rows[1] - 3, 160)};
+	state.phase_correlation_controls = {
+		add_page_label(state, 1, L"Correlation (Hz)", right_label, rows[2], 180),
+		add_page_edit(state, 1, PhaseCorrelation, L"250", right_field, rows[2] - 3, 160)};
+	state.phase_attack_controls = {
+		add_page_label(state, 1, L"Preserve attack (ms)", right_label, rows[3], 180),
+		add_page_edit(state, 1, PhaseAttack, L"0", right_field, rows[3] - 3, 160)};
 
 	add_page_label(state, 2,
 		L"Mastering follows the raw mix. Leave gain at 0 dB and limiter off for the reference output.",
@@ -908,6 +1004,7 @@ void create_ui(AppState& state)
 	add_page_label(state, 2, L"Release (ms)", right_label, rows[3], 180);
 	add_page_edit(state, 2, LimiterRelease, L"100", right_field, rows[3] - 3, 160);
 	show_page(state, 0);
+	update_phase_controls(state);
 
 	state.status_title = create_control(state, L"STATIC", L"Ready to render",
 		SS_LEFT, 0, StatusTitle, 32, 546, 560, 28, state.font_bold);
@@ -1042,7 +1139,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
 			if (state)
 			{
 				SetBkMode(reinterpret_cast<HDC>(wparam), TRANSPARENT);
-				SetTextColor(reinterpret_cast<HDC>(wparam), RGB(31, 41, 55));
+				const bool enabled = IsWindowEnabled(reinterpret_cast<HWND>(lparam)) != FALSE;
+				SetTextColor(reinterpret_cast<HDC>(wparam), enabled
+					? RGB(31, 41, 55) : RGB(148, 163, 184));
 				return reinterpret_cast<LRESULT>(state->background);
 			}
 			break;
@@ -1091,6 +1190,14 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
 					if (!path.empty()) set_text(state->output_path, path);
 					return 0;
 				}
+				case PhaseMode:
+					if (HIWORD(wparam) == CBN_SELCHANGE)
+						update_phase_controls(*state);
+					return 0;
+				case PhaseContinuous:
+					if (HIWORD(wparam) == BN_CLICKED)
+						update_phase_controls(*state);
+					return 0;
 				case RenderButton:
 				{
 					RenderRequest request;
