@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace
@@ -388,6 +392,88 @@ void test_seed_changes_only_phase_assignment()
 	check(first_audio != second_audio,
 		"changing phase seed changes deterministic phase assignment");
 }
+void test_preparation_preserves_audio_and_warms_all_variants()
+{
+	auto bank = make_bank(make_signal(127, 2), 12700, 2, true, 19, 113);
+	bank.regions.push_back(bank.regions.front()); // Same sample identity, two layers.
+	std::vector<safsyn::PhaseSettings> cases;
+	for (const auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::RandomPolarity,
+		safsyn::PhaseMode::Analytic, safsyn::PhaseMode::SmoothField, safsyn::PhaseMode::IndependentBins})
+		cases.push_back(settings(mode, 4, 0xabc));
+	auto continuous = settings(safsyn::PhaseMode::Analytic, 4, 0xabc);
+	continuous.continuous = true; cases.push_back(continuous);
+	for (auto phase : cases)
+	{
+		phase.preserve_attack_ms = 1;
+		safsyn::SynthEngine lazy(12700, 1), prepared(12700, 1);
+		for (auto* engine : {&lazy, &prepared})
+		{
+			engine->set_soundfont(&bank); engine->set_phase_settings(phase);
+			engine->set_voice_model(safsyn::VoiceModel::Cohorts, 512); engine->set_render_threads(4);
+		}
+		safsyn::PhasePreparationProgress last;
+		safsyn::PhasePreparationOptions preparation;
+		preparation.progress = [&](const auto& progress) { last = progress; };
+		check(prepared.prepare_playback(128, preparation), "preparation succeeds");
+		const auto warm = prepared.phase_cache_stats();
+		const bool transformed = phase.mode != safsyn::PhaseMode::Coherent && phase.mode != safsyn::PhaseMode::RandomPolarity;
+		check(warm.cached_samples == (transformed ? 1 : 0), "preparation deduplicates shared sample layers");
+		check(last.completed == last.total && last.cache_bytes == last.total_cache_bytes,
+			"preparation completes the entire planned PCM cache");
+		check(prepared.stats().started_voices == 0 && prepared.stats().rendered_frames == 0 && warm.assignments == 0,
+			"preparation does not play dummy notes or advance the timeline");
+		for (unsigned i = 0; i < 128; ++i)
+			for (auto* engine : {&lazy, &prepared})
+				engine->note_on_batch(static_cast<uint8_t>(i % 16), static_cast<uint8_t>(60 + i % 3),
+					static_cast<uint8_t>(40 + i % 70), 3);
+		check(render(lazy, 64) == render(prepared, 64), "prepared onset/parallel mix is bit-identical to lazy rendering");
+		check(prepared.stats().parallel_render_calls > 0, "prepared phase fixture exercises worker mixing");
+		for (unsigned ch = 0; ch < 16; ++ch)
+			for (uint8_t note : {60, 61, 62})
+				for (auto* engine : {&lazy, &prepared}) engine->note_off(static_cast<uint8_t>(ch), note);
+		check(render(lazy, 64) == render(prepared, 64), "prepared note-off reconstruction preserves audio");
+		prepared.reset(); prepared.note_on(0, 60, 127); render(prepared, 64);
+		check(prepared.phase_cache_stats().cache_bytes == warm.cache_bytes &&
+			prepared.phase_cache_stats().preprocessing_ms == warm.preprocessing_ms && prepared.phase_cache_stats().failures == 0,
+			"notes, note-offs, and panic/reset perform no further phase preprocessing");
+		check(prepared.prepare_playback(128, preparation) && prepared.phase_cache_stats().preprocessing_ms == warm.preprocessing_ms,
+			"repeated preparation reuses the warm cache");
+	}
+}
+
+void test_preparation_budget_and_cancellation()
+{
+	auto bank = make_bank(make_signal(127), 12700);
+	safsyn::PhaseProcessor processor;
+	processor.configure(settings(safsyn::PhaseMode::IndependentBins, 4));
+	safsyn::PhasePreparationOptions options; options.maximum_cache_bytes = 1;
+	bool rejected = false;
+	try { processor.prepare(bank.regions, options); } catch (const std::length_error&) { rejected = true; }
+	check(rejected && processor.stats().cache_bytes == 0 && processor.stats().cached_samples == 0,
+		"oversized phase pools fail before any cache entry or PCM allocation");
+	std::stop_source stop;
+	options = {}; options.stop = stop.get_token();
+	options.progress = [&](const auto& p) { if (p.completed == 1) stop.request_stop(); };
+	check(!processor.prepare(bank.regions, options), "preparation stops between variants");
+	check(processor.stats().cached_variants == 1 && processor.stats().failures == 0,
+		"cancelled preparation keeps completed variants without coherent fallback");
+	check(processor.prepare(bank.regions) && processor.stats().cached_variants == 4,
+		"partially prepared cache can resume safely");
+	processor.clear(); processor.configure(settings(safsyn::PhaseMode::Analytic));
+	auto large = make_bank(make_signal(1048576), 48000);
+	std::atomic<bool> begun{false}; std::stop_source interrupt;
+	options = {}; options.stop = interrupt.get_token();
+	options.progress = [&](const auto&) { begun.store(true); };
+	std::jthread canceller([&] {
+		while (!begun.load()) std::this_thread::yield();
+		std::this_thread::sleep_for(std::chrono::milliseconds(10)); interrupt.request_stop();
+	});
+	const auto started = std::chrono::steady_clock::now();
+	check(!processor.prepare(large.regions, options), "long FFT preparation is cancellable inside the first sample");
+	check(std::chrono::steady_clock::now() - started < std::chrono::seconds(5), "FFT cancellation is prompt");
+	check(processor.stats().analytic_samples == 0 && processor.stats().cache_bytes == 0 && processor.stats().failures == 0,
+		"cancelled FFT does not publish partial PCM or report a playback fallback");
+}
 } // namespace
 
 int main()
@@ -404,6 +490,8 @@ int main()
 	test_voice_stealing_does_not_reassign_survivor_phases();
 	test_modes_preserve_timing_and_voice_counts();
 	test_seed_changes_only_phase_assignment();
+	test_preparation_preserves_audio_and_warms_all_variants();
+	test_preparation_budget_and_cancellation();
 	if (failures != 0)
 	{
 		std::cerr << failures << " phase test(s) failed\n";

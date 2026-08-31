@@ -50,6 +50,11 @@ int wmain(int argc, wchar_t** argv)
 					throw std::runtime_error("invalid integer option");
 				return static_cast<uint32_t>(result);
 			};
+			auto decimal = [&]() -> double {
+				const auto text = value(); size_t end = 0; const auto result = std::stod(text, &end);
+				if (end != text.size() || !std::isfinite(result)) throw std::runtime_error("invalid decimal option");
+				return result;
+			};
 			if (argument == L"--help")
 			{
 				std::cout << "SAFSYN live synthesizer (Windows WASAPI)\n"
@@ -57,6 +62,11 @@ int wmain(int argc, wchar_t** argv)
 					"--midi song.mid (omit for live input) --midi-in N --output N\n"
 					"--threads 0..64 --cohorts N --buffer-frames N --block-frames N\n"
 					"--sample-rate N --gain-db N --no-limiter --seconds N --test-note --mute\n"
+					"--phase coherent|polarity|analytic|smooth|independent (default coherent)\n"
+					"--phase-strength 0..1 --phase-pool 1..64 --phase-continuous --phase-seed N\n"
+					"--phase-correlation-hz N --phase-preserve-attack-ms N --phase-cache-mib N\n"
+					"All phase samples/variants are prepared before audio starts (Ctrl+C cancels).\n"
+					"Cache limit defaults to 2048 MiB; temporary FFT memory is extra.\n"
 					"Live mode runs until Ctrl+C; file mode stops after the release tail.\n";
 				return 0;
 			}
@@ -86,6 +96,29 @@ int wmain(int argc, wchar_t** argv)
 			else if (argument == L"--buffer-frames") options.playback.buffer_frames = number();
 			else if (argument == L"--block-frames") options.playback.block_frames = number();
 			else if (argument == L"--sample-rate") options.playback.sample_rate = number();
+			else if (argument == L"--phase")
+			{
+				const auto mode = value();
+				if (mode == L"coherent") options.playback.phase.mode = safsyn::PhaseMode::Coherent;
+				else if (mode == L"polarity") options.playback.phase.mode = safsyn::PhaseMode::RandomPolarity;
+				else if (mode == L"analytic") options.playback.phase.mode = safsyn::PhaseMode::Analytic;
+				else if (mode == L"smooth") options.playback.phase.mode = safsyn::PhaseMode::SmoothField;
+				else if (mode == L"independent") options.playback.phase.mode = safsyn::PhaseMode::IndependentBins;
+				else throw std::runtime_error("unknown phase mode");
+			}
+			else if (argument == L"--phase-strength") options.playback.phase.strength = static_cast<float>(decimal());
+			else if (argument == L"--phase-pool") options.playback.phase.pool_size = number();
+			else if (argument == L"--phase-continuous") options.playback.phase.continuous = true;
+			else if (argument == L"--phase-correlation-hz") options.playback.phase.correlation_hz = static_cast<float>(decimal());
+			else if (argument == L"--phase-preserve-attack-ms") options.playback.phase.preserve_attack_ms = static_cast<float>(decimal());
+			else if (argument == L"--phase-cache-mib") options.playback.maximum_phase_cache_bytes = uint64_t{number()} * 1048576;
+			else if (argument == L"--phase-seed")
+			{
+				const auto text = value(); size_t end = 0;
+				if (text.empty() || text.find(L'-') != std::wstring::npos) throw std::runtime_error("invalid phase seed");
+				options.playback.phase.seed = std::stoull(text, &end);
+				if (end != text.size()) throw std::runtime_error("invalid phase seed");
+			}
 			else if (argument == L"--gain-db" || argument == L"--seconds")
 			{
 				const auto text = value(); size_t end = 0; const auto result = std::stod(text, &end);
@@ -112,6 +145,9 @@ int wmain(int argc, wchar_t** argv)
 				std::cerr << utf8(state.status) << " played_seconds="
 					<< double(state.playback.consumed_frames) / options.playback.sample_rate
 					<< " events=" << state.playback.scheduled_events
+					<< " prepared=" << state.playback.preparation.completed << '/' << state.playback.preparation.total
+					<< " cache_mib=" << double(state.playback.phase.cache_bytes) / 1048576
+					<< '/' << double(state.playback.preparation.total_cache_bytes) / 1048576
 					<< " underruns=" << state.playback.underruns << '\n';
 				next_report = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 			}
@@ -124,6 +160,9 @@ int wmain(int argc, wchar_t** argv)
 			<< " steals=" << stats.engine.cohort_capacity_steals << " parallel_calls=" << stats.engine.parallel_render_calls
 			<< " underruns=" << stats.underruns << " missing_frames=" << stats.underrun_frames
 			<< " midi_rejected=" << stats.rejected_midi_events << " device_empty=" << state.empty_device_buffers << '\n';
+		std::cout << "prepared=" << stats.preparation.completed << '/' << stats.preparation.total
+			<< " preparation_ms=" << stats.preparation_ms << " phase_cache_bytes=" << stats.phase.cache_bytes
+			<< " phase_preprocessing_ms=" << stats.phase.preprocessing_ms << " phase_failures=" << stats.phase.failures << '\n';
 		if (!state.error.empty()) { std::cerr << state.error << '\n'; return 1; }
 		return 0;
 	}

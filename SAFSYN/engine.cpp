@@ -105,6 +105,18 @@ void SynthEngine::set_phase_settings(const PhaseSettings& settings) noexcept
 	phase_processor_.configure(settings);
 }
 
+bool SynthEngine::prepare_playback(uint32_t maximum_block_frames, const PhasePreparationOptions& options)
+{
+	if (options.stop.stop_requested()) return false;
+	if (!soundfont_) return true;
+	const auto& regions = all_regions_mode_ && !soundfont_->stress_regions.empty() ?
+		soundfont_->stress_regions : soundfont_->regions;
+	if (!phase_processor_.prepare(regions, options)) return false;
+	if (voice_model_ == VoiceModel::Cohorts && cohort_engine_)
+		cohort_engine_->reserve_playback(maximum_block_frames, regions.size());
+	return !options.stop.stop_requested();
+}
+
 void SynthEngine::set_voice_model(VoiceModel model, size_t maximum_cohorts) noexcept
 {
 	silence_all();

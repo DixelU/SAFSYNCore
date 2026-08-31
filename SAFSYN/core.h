@@ -170,6 +170,9 @@ public:
 	void consume_short_messages(const uint32_t* packed_messages, size_t count) noexcept;
 	void render_audio(float* interleaved_stereo, uint32_t frames) noexcept;
 	void set_phase_settings(const PhaseSettings& settings) noexcept;
+	// Precompute phase PCM and reserve finite cohort/worker storage before playback.
+	// Does not play dummy notes or alter the MIDI timeline. False means cancelled.
+	bool prepare_playback(uint32_t maximum_block_frames, const PhasePreparationOptions& options = {});
 	// A zero cohort ceiling means dynamic offline growth without stealing.
 	void set_voice_model(VoiceModel model, size_t maximum_cohorts = 0) noexcept;
 	VoiceModel voice_model() const noexcept { return voice_model_; }

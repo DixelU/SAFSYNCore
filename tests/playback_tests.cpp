@@ -180,6 +180,40 @@ void live_recovery_test()
 	synth.stop(); check(synth.finished(), "stop did not join producer");
 	check(!synth.enqueue_short_message(0x00643c90), "stopped synth accepts events");
 }
+void phase_preparation_test()
+{
+	for (auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::RandomPolarity,
+		safsyn::PhaseMode::Analytic, safsyn::PhaseMode::SmoothField, safsyn::PhaseMode::IndependentBins})
+	{
+		auto config = options(); config.phase.mode = mode; config.phase.pool_size = 4;
+		auto source = bank();
+		safsyn::BufferedSynth synth(source, config, file(32)); synth.start();
+		const auto audio = collect(synth); const auto stats = synth.stats();
+		check(stats.preparation.completed == stats.preparation.total && !stats.preparing,
+			"playback started without completing phase preparation");
+		check(stats.phase.cache_bytes == stats.preparation.total_cache_bytes && stats.phase.failures == 0,
+			"playback phase cache was not fully prepared");
+		safsyn::SynthEngine reference(48000, 1); reference.set_soundfont(source.get());
+		reference.set_voice_model(safsyn::VoiceModel::Cohorts, config.maximum_cohorts); reference.set_phase_settings(config.phase);
+		std::vector<float> expected(audio.size());
+		reference.note_on_batch(0, 60, 100, 32); reference.render_audio(expected.data(), 48);
+		reference.note_off_batch(0, 60, 32); reference.render_audio(expected.data() + 96, static_cast<uint32_t>(expected.size() / 2 - 48));
+		check(audio == expected, "startup preparation changed the first notes or MIDI timing");
+	}
+	auto config = options(); config.phase.mode = safsyn::PhaseMode::Analytic; config.maximum_phase_cache_bytes = 1;
+	safsyn::BufferedSynth failed(bank(), config, file(32)); failed.start(); await([&] { return failed.finished(); });
+	check(!failed.stats().error.empty() && failed.stats().scheduled_events == 0 && failed.stats().phase.cache_bytes == 0,
+		"phase budget failure must stop before dispatching MIDI or allocating phase PCM");
+	check(failed.ready() && failed.drained(), "preparation failure did not terminate cleanly");
+	safsyn::BufferedSynth cancelled(bank(), options(), file(32)); cancelled.request_stop(); cancelled.start();
+	await([&] { return cancelled.finished(); });
+	check(cancelled.stats().error.empty() && cancelled.stats().scheduled_events == 0 && cancelled.drained(),
+		"cancelled startup processed MIDI or reported an error");
+	config = options(); config.phase.mode = safsyn::PhaseMode::RandomPolarity;
+	config.phase.strength = NAN; config.phase.pool_size = 0; config.phase.correlation_hz = NAN;
+	safsyn::BufferedSynth inactive(bank(), config, file(32)); inactive.start(); collect(inactive);
+	check(inactive.stats().phase.cache_bytes == 0, "inactive phase settings were validated or used");
+}
 void lifecycle_and_limiter_test()
 {
 	for (size_t i = 0; i < 8; ++i)
@@ -210,6 +244,7 @@ int main()
 	try
 	{
 		queue_test(); ring_test(); file_timing_test(); parallel_test(); live_recovery_test(); lifecycle_and_limiter_test();
+		phase_preparation_test();
 		std::cout << "Playback: concurrent queues, sample timing, dense bursts, workers, overflow, underruns, limiter, lifecycle passed\n";
 		return 0;
 	}

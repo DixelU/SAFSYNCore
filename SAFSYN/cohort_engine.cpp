@@ -1442,6 +1442,26 @@ void CohortEngine::set_render_threads(size_t threads) noexcept
 		state_->set_render_threads(threads);
 }
 
+void CohortEngine::reserve_playback(uint32_t maximum_block_frames, size_t region_count)
+{
+	if (!state_) return;
+	auto& state = *state_;
+	// Reserve, do not resize: unused slots must not affect iteration/stealing order.
+	const size_t capacity = state.maximum_cohorts;
+	state.cohorts.reserve(capacity);
+	state.free_cohorts.reserve(capacity);
+	state.logical_batches.reserve(capacity);
+	state.free_logical_batches.reserve(capacity);
+	state.onset_candidates.reserve(capacity);
+	state.matching_regions_scratch.reserve(region_count);
+	if (state.parallel_render)
+		for (auto& scratch : state.parallel_render->scratch)
+		{
+			scratch.audio.resize(static_cast<size_t>(maximum_block_frames) * 2);
+			scratch.retired.reserve((capacity + state.render_threads() - 1) / state.render_threads());
+		}
+}
+
 size_t CohortEngine::render_threads() const noexcept
 {
 	return state_ ? state_->render_threads() : 1;

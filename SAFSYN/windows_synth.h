@@ -20,7 +20,7 @@ struct WindowsSynthOptions
 	std::wstring midi_path; // Empty selects live MIDI mode.
 	std::wstring output_device; // Empty selects the default multimedia endpoint.
 	int midi_input = -1;
-	PlaybackOptions playback; // Standalone host overrides phase to Coherent.
+	PlaybackOptions playback; // Coherent by default; phase caches are prepared before audio starts.
 	double maximum_seconds = 0.0; // Optional bounded device smoke test.
 	bool mute = false; // Device validation without audible output.
 	bool test_note = false;

@@ -23,12 +23,17 @@ struct PlaybackOptions
 	uint8_t initial_program = 0;
 	uint32_t maximum_tail_seconds = 10;
 	PhaseSettings phase;
+	uint64_t maximum_phase_cache_bytes = uint64_t{2048} * 1024 * 1024;
 	MasteringSettings mastering{-12.0, true, -1.0, 5.0, 100.0};
 };
 
 struct PlaybackStats
 {
 	RenderStats engine;
+	PhaseCacheStats phase;
+	PhasePreparationProgress preparation;
+	bool preparing = false;
+	double preparation_ms = 0.0;
 	uint64_t scheduled_events = 0;
 	uint64_t consumed_frames = 0;
 	uint64_t underrun_frames = 0;

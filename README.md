@@ -74,8 +74,12 @@ or an existing virtual MIDI cable. For black MIDI files, choose the `.mid` and
 click **Play MIDI file**; this uses the exact scheduler directly, without
 routing millions of events through WinMM. Drag-and-drop accepts banks and MIDI.
 The **Black MIDI preset** selects 512 cohorts, four render threads, and ten
-seconds of buffering for dense files. Phase rotation is disabled in the synth;
-the offline renderer retains its experimental modes.
+seconds of buffering for dense files. The **Phase mode** selector defaults to
+coherent (off), with polarity, analytic, and FFT modes available. Stop to change
+mode. Phase samples and finite variant pools are precomputed before playback,
+with progress, cancellation, and an adjustable cache limit; large banks can take
+time and memory to prepare. Cohort storage and worker buffers are reserved at
+startup, while cohort membership follows MIDI events.
 
 Live playback uses a finite cohort ceiling (default 4096), an automatic persistent
 render pool (up to 16 threads, reserving two logical CPUs), and a separate WASAPI

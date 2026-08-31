@@ -2,7 +2,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <span>
+#include <stop_token>
 
 namespace safsyn
 {
@@ -38,6 +41,21 @@ struct PhaseCacheStats
 	uint64_t assignments = 0;
 	uint64_t failures = 0;
 	double preprocessing_ms = 0.0;
+};
+
+struct PhasePreparationProgress
+{
+	uint64_t completed = 0; // Unique sample transforms; one per FFT pool entry.
+	uint64_t total = 0;
+	uint64_t cache_bytes = 0;
+	uint64_t total_cache_bytes = 0; // PCM cache only; temporary FFT memory is extra.
+};
+
+struct PhasePreparationOptions
+{
+	uint64_t maximum_cache_bytes = uint64_t{2048} * 1024 * 1024;
+	std::stop_token stop;
+	std::function<void(const PhasePreparationProgress&)> progress;
 };
 
 struct PhaseVoiceState
@@ -107,6 +125,11 @@ public:
 	void configure(const PhaseSettings& settings) noexcept;
 	const PhaseSettings& settings() const noexcept;
 	void clear() noexcept;
+	// Prepare every unique sample (and every finite FFT variant) without assigning
+	// notes or advancing serials. Region indices must match subsequent assign().
+	// Returns false on cancellation; throws on a budget/allocation failure. Call
+	// on the engine owner thread before rendering, not from the audio callback.
+	bool prepare(std::span<const SampleRegion> regions, const PhasePreparationOptions& options = {});
 	PhaseVoiceState assign(const SampleRegion& region, uint64_t region_id,
 		uint64_t event_serial, uint8_t channel, uint8_t note) noexcept;
 	// Rebuild an already-assigned logical event contribution without counting a

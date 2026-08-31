@@ -29,16 +29,65 @@ session. Loading happens outside the UI thread. Closing while loading requests
 cancellation and waits for the current bank/file load to finish safely; those
 loaders are not interruptible. Output device loss is reported and stops playback;
 choose another endpoint or refresh the device list and start again.
-Phase rotation is disabled in the Windows host, including its console mode.
-The offline renderer still exposes the experimental modes.
+Phase mode is selectable in the synth and console; coherent (off) remains the
+default. Stop before changing the mode, then start again to prepare its cache.
 
 The console supports `--help`, `--list-devices`, `--bank`, `--midi`, `--midi-in`,
 `--output`, `--threads`, `--cohorts`, `--buffer-frames`, `--block-frames`,
 `--sample-rate`, `--gain-db`, `--no-limiter`, `--seconds`, `--test-note`, and
 `--mute`. `--output` uses the displayed output index; `--midi-in` uses the MIDI
 device ID. Ctrl+C/Break requests a joined shutdown. `--seconds` bounds time after
-the device starts, excluding file loading and initial buffering. `--mute`
+the device starts, excluding file loading, phase preparation, and initial buffering. `--mute`
 still renders and delivers audio through WASAPI, but marks device packets silent.
+
+## Phase selection and startup preparation
+
+The **Phase mode** selector offers coherent, random polarity, analytic rotation,
+smooth phase field, and independent FFT bins. Settings that do not apply to the
+selected mode are disabled and ignored; their text is retained when switching
+modes. Analytic continuous assignment disables the finite pool field. The GUI
+starts with a pool of eight; the console retains the core default of 64, so use
+`--phase-pool` explicitly for FFT modes with large banks. The Black MIDI preset
+only changes threads, cohort ceiling, and buffering; it preserves phase settings.
+
+Before dispatching any notes, the producer prepares every unique sample across
+the bank's presets. Analytic mode prepares one quadrature buffer per sample,
+shared by all its angles; smooth/independent modes prepare every variant in the
+finite pool. Coherent and random polarity require no transformed PCM. Shared
+sample layers reuse the same cache entry. No dummy notes are played, event serials
+are unchanged, and MIDI still starts at sample zero. This avoids FFT work on the
+first note of a new key, velocity layer, or program. Preparation is currently
+serial; the persistent cohort workers handle playback mixing afterward.
+
+The status panel shows completed/total transforms, current/planned cache MiB,
+and preparation time. **Panic / stop**, closing the window, and console Ctrl+C
+cancel preparation, including inside a long FFT. The test keyboard and WinMM
+input start accepting notes only after preparation and initial buffering.
+
+**Cache MiB** limits persistent transformed PCM (2048 MiB by default). An
+oversized pool is rejected before generating any transformed samples, with the
+required size and suggestions. Temporary FFT arrays, the original bank, cohort
+state, and MIDI data are additional memory; this setting is not a process memory
+limit. Large banks can still take substantial time to prepare. Reduce the pool
+or use analytic, polarity, or coherent mode if the cost is too high. Caches are
+session-local and rebuilt on a fresh start; they are not saved to disk.
+
+The synth also reserves finite cohort slots, initial logical bookkeeping,
+region-match scratch, and per-worker mix/retirement buffers before playback.
+Actual cohort membership is constructed from arriving MIDI events: note timing,
+sustain, releases, and controllers cannot be known ahead of live input. Further
+logical-note and phase-aggregate bookkeeping can still allocate during playback.
+
+```text
+safsyn-play --bank piano.sf2 --phase analytic --phase-pool 8 --midi song.mid
+safsyn-play --phase smooth --phase-pool 4 --phase-correlation-hz 250 --test-note --seconds 2
+```
+
+Additional console settings are `--phase-strength 0..1`, `--phase-seed N`,
+`--phase-continuous`, `--phase-preserve-attack-ms N`, and `--phase-cache-mib N`.
+Mode names for `--phase` are `coherent`, `polarity`, `analytic`, `smooth`, and
+`independent`. Finite caches remove startup transforms, not the ongoing mixing
+cost of phase decorrelation; the usual cohort ceiling and underrun metrics apply.
 
 ## Thread ownership and timing
 
@@ -162,8 +211,30 @@ recovery, underrun silence/counts, panic, full-buffer shutdown, and limiting.
 Existing engine/SMF/mastering/phase tests and the coherent WAV hash remain in
 CTest. Device and full-song results are recorded separately below.
 
+Phase preparation tests compare lazy and prepared output bit-for-bit across
+all five modes and continuous analytic, including layered stereo, loop transforms,
+four-lane mixing, note-off reconstruction, and reset/cache reuse. They verify
+that note processing performs no additional preprocessing, oversized caches fail
+before allocation/dispatch, and cancellation interrupts the first long FFT.
+Playback tests also verify that preparation preserves the first MIDI onset and
+note-off sample positions and that irrelevant phase fields do not block startup.
+
 ### Local validation, 2026-08-31
 
+- The phase-selection/preparation update passed all eight Release CTest suites.
+  A muted real-piano analytic test prepared all 87 unique sample transforms in
+  85.03 seconds, using 1,143,619,584 bytes (1090.64 MiB) of phase PCM, before
+  dispatching the first MIDI note. Subsequent two-second WASAPI playback had
+  zero underruns, missing frames, empty device buffers, or phase failures. A
+  one-MiB limit rejected the same bank before any transform or note dispatch.
+- A hidden native GUI probe checked all five mode capability combinations,
+  continuous analytic with invalid stale pool/correlation fields, 64-bit seed
+  input, prepared test-chord playback/release, and stop/close during real-bank
+  preparation. Stopping preparation took 109 ms in this run. This verifies
+  control behavior and lifecycle, not visual appearance or listening quality.
+- The full-song black MIDI results below were obtained with coherent phase in
+  the preceding synth build; they do not establish full-song performance of
+  the newly exposed phase modes.
 - Windows x64 Release build and all eight CTest suites passed. The prepared
   region-index tests include bank/program switching, key and velocity layers,
   reversed stress-region order, and soundbank replacement.

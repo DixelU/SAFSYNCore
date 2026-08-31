@@ -283,7 +283,6 @@ struct WindowsSynth::Impl
 	{
 		try
 		{
-			options.playback.phase = {}; // The live product intentionally disables phase rotation.
 			set_status(L"Loading sound bank...");
 			auto bank = load_bank(options.bank_path);
 			if (cancelled.load()) { set_status(L"Stopped"); running.store(false); return; }
@@ -318,14 +317,15 @@ struct WindowsSynth::Impl
 			if (options.test_note && !midi) playback->enqueue_short_message(0x00644590);
 			playback->start();
 			std::unique_ptr<MidiInput> input;
-			if (!midi && options.midi_input >= 0)
-				input = std::make_unique<MidiInput>(static_cast<UINT>(options.midi_input), *playback);
 			set_status(L"Buffering...");
 			while (!playback->ready() && !cancelled.load()) WaitForSingleObject(stop_event.value, 5);
 			if (!cancelled.load())
 			{
 				const auto initial = playback->stats();
 				if (!initial.error.empty()) throw std::runtime_error(initial.error);
+				// Do not accept live input during potentially lengthy phase preparation.
+				if (!midi && options.midi_input >= 0)
+					input = std::make_unique<MidiInput>(static_cast<UINT>(options.midi_input), *playback);
 				Mmcss priority;
 				BYTE* bytes = nullptr;
 				require(render->GetBuffer(capacity, &bytes), "WASAPI prime buffer");
@@ -411,6 +411,7 @@ WindowsSynthStats WindowsSynth::stats() const
 	{ std::lock_guard lock(impl_->mutex); playback = impl_->synth; result.status = impl_->status; result.error = impl_->error; }
 	if (playback) result.playback = playback->stats();
 	result.running = impl_->running.load(std::memory_order_acquire);
+	if (result.running && result.playback.preparing && result.error.empty()) result.status = L"Preparing phase cache...";
 	result.device_buffer_frames = impl_->device_frames.load();
 	result.empty_device_buffers = impl_->empty_buffers.load();
 	return result;

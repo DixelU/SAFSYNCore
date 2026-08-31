@@ -18,8 +18,9 @@ enum Control
 {
 	Bank = 100, BrowseBank, Midi, BrowseMidi, Output, Input, Refresh,
 	Threads, Cohorts, Buffer, Block, Rate, InitialBank, Program, Gain,
+	Phase, Strength, Seed, Pool, Continuous, Correlation, Attack,
 	Limiter = 122,
-	Live, Play, Stop, Test, Metrics, BlackMidiPreset
+	Live, Play, Stop, Test, Metrics, BlackMidiPreset, CacheLimit
 };
 struct App
 {
@@ -74,11 +75,29 @@ uint32_t integer(HWND window, int id, uint32_t low, uint32_t high, const char* n
 	if (std::floor(value) != value) throw std::runtime_error(std::string("Expected integer ") + name);
 	return static_cast<uint32_t>(value);
 }
+struct PhaseControls { bool strength, seed, pool, continuous, correlation, attack, cache; };
+PhaseControls phase_controls(HWND window)
+{
+	const auto mode = static_cast<safsyn::PhaseMode>(selected(window, Phase));
+	const bool active = mode != safsyn::PhaseMode::Coherent;
+	const bool transform = active && mode != safsyn::PhaseMode::RandomPolarity;
+	const bool analytic = mode == safsyn::PhaseMode::Analytic;
+	return {transform, active, transform && !(analytic && checked(window, Continuous)),
+		analytic, mode == safsyn::PhaseMode::SmoothField, active, transform};
+}
+void enable_phase_controls(App& app, bool running)
+{
+	const auto c = phase_controls(app.window);
+	for (const auto [id, enabled] : {std::pair{Strength, c.strength}, {Seed, c.seed}, {Pool, c.pool},
+		{Continuous, c.continuous}, {Correlation, c.correlation}, {Attack, c.attack}, {CacheLimit, c.cache}})
+		EnableWindow(GetDlgItem(app.window, id), !running && enabled);
+}
 void enable_controls(App& app, bool running)
 {
 	for (auto field : app.configuration) EnableWindow(field, !running);
+	enable_phase_controls(app, running);
 	EnableWindow(GetDlgItem(app.window, Stop), running);
-	EnableWindow(GetDlgItem(app.window, Test), running && !app.file_mode);
+	EnableWindow(GetDlgItem(app.window, Test), FALSE); // Enabled after preparation/buffering.
 }
 void refresh_devices(App& app)
 {
@@ -124,7 +143,24 @@ void start(App& app, bool file)
 	options.initial_program = static_cast<uint8_t>(integer(app.window, Program, 0, 127, "program number"));
 	options.mastering.output_gain_db = number(app.window, Gain, -120, 24, "gain dB");
 	options.mastering.limiter_enabled = checked(app.window, Limiter);
-	options.phase = {}; // Live host stays coherent; phase experiments remain offline.
+	const int mode = selected(app.window, Phase);
+	if (mode < 0 || mode > 4) throw std::runtime_error("Choose a phase mode.");
+	options.phase.mode = static_cast<safsyn::PhaseMode>(mode);
+	const auto c = phase_controls(app.window);
+	// Inactive fields keep their text, but are never parsed or validated.
+	if (c.strength) options.phase.strength = static_cast<float>(number(app.window, Strength, 0, 1, "phase strength"));
+	if (c.pool) options.phase.pool_size = integer(app.window, Pool, 1, 64, "phase pool size");
+	if (c.continuous) options.phase.continuous = checked(app.window, Continuous);
+	if (c.correlation) options.phase.correlation_hz = static_cast<float>(number(app.window, Correlation, 0.001, 1000000, "correlation Hz"));
+	if (c.attack) options.phase.preserve_attack_ms = static_cast<float>(number(app.window, Attack, 0, 10000, "preserved attack ms"));
+	if (c.cache) options.maximum_phase_cache_bytes = uint64_t{integer(app.window, CacheLimit, 1, 1048576, "phase cache MiB")} * 1048576;
+	if (c.seed)
+	{
+		const auto value = text(app.window, Seed); size_t end = 0;
+		if (value.empty() || value.find(L'-') != std::wstring::npos) throw std::runtime_error("Invalid phase seed");
+		options.phase.seed = std::stoull(value, &end);
+		if (end != value.size()) throw std::runtime_error("Invalid phase seed");
+	}
 	app.sample_rate = options.sample_rate;
 	app.file_mode = file;
 	KillTimer(app.window, 2); app.test_chord_active = false;
@@ -150,18 +186,27 @@ void create_controls(App& app)
 	label(app, L"Bank number", 20, 318); edit(app, InitialBank, L"0", 160, 318, 80);
 	label(app, L"Program", 290, 318); edit(app, Program, L"0", 410, 318, 80);
 	label(app, L"Output gain (dB)", 530, 318); edit(app, Gain, L"-12", 660, 318, 120);
-	label(app, L"Phase rotation: off (coherent)", 20, 366, 400);
-	control(app, L"BUTTON", L"Limiter (-1 dB ceiling)", Limiter, 470, 366, 290, 28, WS_TABSTOP | BS_AUTOCHECKBOX);
+	label(app, L"Phase mode", 20, 356);
+	const auto phase = combo(app, Phase, 160, 356, 290);
+	for (const auto name : {L"Coherent (off)", L"Random polarity", L"Analytic rotation", L"Smooth phase field", L"Independent FFT bins"}) add_item(phase, name);
+	SendMessageW(phase, CB_SETCURSEL, 0, 0);
+	control(app, L"BUTTON", L"Limiter (-1 dB ceiling)", Limiter, 470, 356, 290, 28, WS_TABSTOP | BS_AUTOCHECKBOX);
 	SendDlgItemMessageW(app.window, Limiter, BM_SETCHECK, BST_CHECKED, 0);
-	button(app, BlackMidiPreset, L"Black MIDI preset", 20, 409, 190);
-	label(app, L"For files: 512 cohorts, 4 render threads, 10 seconds of buffering.", 230, 409, 550);
-	label(app, L"Large buffers absorb bursts but add latency. Lower the cohort ceiling if rendering cannot keep up.", 20, 455, 770);
-	label(app, L"File playback keeps exact MIDI timing; external players need a MIDI input port or a virtual MIDI cable.", 20, 480, 770);
-	button(app, Live, L"Start live synth", 20, 521, 170);
-	button(app, Play, L"Play MIDI file", 205, 521, 170);
-	button(app, Test, L"Test chord", 390, 521, 170, false);
-	button(app, Stop, L"Panic / stop", 575, 521, 205, false);
-	control(app, L"EDIT", L"Stopped", Metrics, 20, 572, 760, 140,
+	label(app, L"Strength", 20, 394, 75); edit(app, Strength, L"1", 100, 394, 60);
+	label(app, L"Pool", 195, 394, 55); edit(app, Pool, L"8", 250, 394, 65);
+	control(app, L"BUTTON", L"Continuous analytic", Continuous, 340, 394, 200, 28, WS_TABSTOP | BS_AUTOCHECKBOX);
+	label(app, L"Cache MiB", 550, 394, 105); edit(app, CacheLimit, L"2048", 660, 394, 120);
+	label(app, L"Seed", 20, 432, 75); edit(app, Seed, L"0", 100, 432, 150);
+	label(app, L"Correlation Hz", 270, 432, 120); edit(app, Correlation, L"250", 390, 432, 100);
+	label(app, L"Keep attack ms", 530, 432, 125); edit(app, Attack, L"0", 660, 432, 120);
+	button(app, BlackMidiPreset, L"Black MIDI preset", 20, 474, 190);
+	label(app, L"512 cohorts, 4 threads, 10 s buffer. Large buffers add latency.", 230, 474, 550);
+	label(app, L"Stop to change phase. All bank samples are prepared before playback; FFT working memory is extra.", 20, 512, 770);
+	button(app, Live, L"Start live synth", 20, 548, 170);
+	button(app, Play, L"Play MIDI file", 205, 548, 170);
+	button(app, Test, L"Test chord", 390, 548, 170, false);
+	button(app, Stop, L"Panic / stop", 575, 548, 205, false);
+	control(app, L"EDIT", L"Stopped", Metrics, 20, 590, 760, 155,
 		ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, false);
 	refresh_devices(app); enable_controls(app, false);
 }
@@ -180,9 +225,13 @@ void update(App& app)
 		<< s.rejected_midi_events << L"    Recoveries: " << s.midi_recoveries << L"\r\n"
 		<< L"Raw peak: " << s.raw_peak << L"    Device buffer: " << state.device_buffer_frames
 		<< L" frames    Empty device buffers: " << state.empty_device_buffers;
+	output << L"\r\nPhase preparation: " << s.preparation.completed << L"/" << s.preparation.total
+		<< L"    Cache: " << double(s.phase.cache_bytes) / 1048576 << L" / "
+		<< double(s.preparation.total_cache_bytes) / 1048576 << L" MiB    Prep: " << s.preparation_ms / 1000 << L" s";
 	if (!state.error.empty()) output << L"\r\n" << std::wstring(state.error.begin(), state.error.end());
 	SetDlgItemTextW(app.window, Metrics, output.str().c_str());
 	if (app.was_running && !state.running) { app.was_running = false; enable_controls(app, false); }
+	EnableWindow(GetDlgItem(app.window, Test), state.running && s.ready && !s.preparing && !app.file_mode);
 	if (app.closing && !state.running) DestroyWindow(app.window);
 }
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
@@ -208,6 +257,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
 				if (!path.empty()) SetDlgItemTextW(window, bank ? Bank : Midi, path.c_str()); return 0;
 			}
 			case Refresh: refresh_devices(*app); return 0;
+			case Phase: case Continuous: enable_phase_controls(*app, app->was_running); return 0;
 			case BlackMidiPreset:
 				SetDlgItemTextW(window, Cohorts, L"512"); SetDlgItemTextW(window, Threads, L"4");
 				SetDlgItemTextW(window, Buffer, L"10000"); return 0;
@@ -274,7 +324,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
 		type.lpszClassName = L"SAFSYN.LiveSynth"; type.hCursor = LoadCursorW(nullptr, IDC_ARROW);
 		type.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
 		RegisterClassW(&type);
-		RECT bounds{0, 0, 802, 735};
+		RECT bounds{0, 0, 802, 768};
 		const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 		AdjustWindowRect(&bounds, style, FALSE);
 		const HWND window = CreateWindowW(type.lpszClassName, L"SAFSYN Synth", style,

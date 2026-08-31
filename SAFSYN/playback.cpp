@@ -27,13 +27,19 @@ PlaybackOptions validated(PlaybackOptions options)
 		static_cast<unsigned>(options.phase.mode) > static_cast<unsigned>(PhaseMode::IndependentBins) ||
 		!mastering_settings_valid(options.mastering))
 		throw std::invalid_argument("invalid live playback options");
-	if (options.phase.mode != PhaseMode::Coherent &&
-		(!std::isfinite(options.phase.strength) || options.phase.strength < 0 || options.phase.strength > 1 ||
-		 !std::isfinite(options.phase.preserve_attack_ms) || options.phase.preserve_attack_ms < 0 ||
-		 options.phase.preserve_attack_ms > 10000 || options.phase.pool_size < 1 || options.phase.pool_size > 64 ||
-		 !std::isfinite(options.phase.correlation_hz) || options.phase.correlation_hz < 0.001f ||
-		 options.phase.correlation_hz > 1000000))
+	const bool active = options.phase.mode != PhaseMode::Coherent;
+	const bool transform = active && options.phase.mode != PhaseMode::RandomPolarity;
+	const bool pool = transform && !(options.phase.mode == PhaseMode::Analytic && options.phase.continuous);
+	if ((transform && (!std::isfinite(options.phase.strength) || options.phase.strength < 0 || options.phase.strength > 1)) ||
+		(active && (!std::isfinite(options.phase.preserve_attack_ms) || options.phase.preserve_attack_ms < 0 || options.phase.preserve_attack_ms > 10000)) ||
+		(pool && (options.phase.pool_size < 1 || options.phase.pool_size > 64)) ||
+		(options.phase.mode == PhaseMode::SmoothField && (!std::isfinite(options.phase.correlation_hz) ||
+			options.phase.correlation_hz < 0.001f || options.phase.correlation_hz > 1000000)))
 		throw std::invalid_argument("invalid playback phase settings");
+	if (!active) options.phase = {};
+	if (!transform) options.phase.strength = 1;
+	if (!pool) options.phase.pool_size = 1;
+	if (options.phase.mode != PhaseMode::SmoothField) options.phase.correlation_hz = 250;
 	if (options.render_threads == 0)
 	{
 		const auto cpus = std::thread::hardware_concurrency();
@@ -53,6 +59,7 @@ struct BufferedSynth::Impl
 	detail::MidiQueue<MidiEvent> events;
 	std::thread producer;
 	std::atomic<bool> stopping{false}, ready{false}, finished{false};
+	std::stop_source preparation_stop;
 	std::atomic<uint64_t> generation{0}, rejected{0}, consumed{0}, underruns{0}, missing{0};
 	mutable std::mutex stats_mutex;
 	PlaybackStats snapshot;
@@ -104,6 +111,9 @@ struct BufferedSynth::Impl
 		PlaybackStats current;
 		try
 		{
+			current.preparing = true;
+			publish(current);
+			const auto preparation_started = std::chrono::steady_clock::now();
 			SynthEngine engine(options.sample_rate, 1);
 			engine.set_voice_model(VoiceModel::Cohorts, options.maximum_cohorts);
 			engine.set_render_threads(options.render_threads);
@@ -111,6 +121,22 @@ struct BufferedSynth::Impl
 			engine.set_phase_settings(options.phase);
 			defaults(engine);
 			current.render_threads = engine.render_threads();
+			PhasePreparationOptions prepare;
+			prepare.maximum_cache_bytes = options.maximum_phase_cache_bytes;
+			prepare.stop = preparation_stop.get_token();
+			prepare.progress = [&](const PhasePreparationProgress& progress) {
+				current.preparation = progress;
+				current.phase = engine.phase_cache_stats();
+				current.preparation_ms = std::chrono::duration<double, std::milli>(
+					std::chrono::steady_clock::now() - preparation_started).count();
+				publish(current);
+			};
+			if (!engine.prepare_playback(options.block_frames, prepare)) stopping.store(true);
+			current.preparation_ms = std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - preparation_started).count();
+			current.preparing = false;
+			current.phase = engine.phase_cache_stats();
+			publish(current);
 			StereoMasteringProcessor mastering(options.sample_rate, options.mastering);
 			std::vector<float> block(options.block_frames * 2), output;
 			output.reserve(options.block_frames * 2 + static_cast<size_t>(options.sample_rate / 10) * 2);
@@ -222,6 +248,7 @@ struct BufferedSynth::Impl
 				mastering.process(block.data(), frames, output);
 				sanitize();
 				current.engine = engine.stats();
+				current.phase = engine.phase_cache_stats();
 				current.active_voices = engine.active_voice_count();
 				current.active_cohorts = engine.active_cohort_count();
 				if (frames) current.render_load = std::chrono::duration<double>(
@@ -238,6 +265,7 @@ struct BufferedSynth::Impl
 		}
 		catch (const std::exception& e) { current.error = e.what(); }
 		catch (...) { current.error = "unknown playback failure"; }
+		current.preparing = false;
 		publish(current);
 		finished.store(true, std::memory_order_release);
 		ready.store(true, std::memory_order_release);
@@ -261,7 +289,10 @@ void BufferedSynth::start()
 	impl_->started = true;
 	impl_->producer = std::thread([this] { impl_->run(); });
 }
-void BufferedSynth::request_stop() noexcept { impl_->stopping.store(true); impl_->wake.notify_all(); }
+void BufferedSynth::request_stop() noexcept
+{
+	impl_->stopping.store(true); impl_->preparation_stop.request_stop(); impl_->wake.notify_all();
+}
 void BufferedSynth::stop() noexcept { request_stop(); if (impl_->producer.joinable()) impl_->producer.join(); }
 bool BufferedSynth::enqueue_short_message(uint32_t message) noexcept { return impl_->enqueue(message, false); }
 bool BufferedSynth::enqueue_master_volume(uint16_t value) noexcept { return impl_->enqueue(value & 16383, true); }

@@ -9,7 +9,10 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -19,6 +22,12 @@ namespace
 {
 using Complex = std::complex<double>;
 constexpr double pi = 3.1415926535897932384626433832795;
+
+struct PreparationCancelled {};
+void check_cancel(const std::stop_token& stop, size_t iteration = 0)
+{
+	if ((iteration & 16383) == 0 && stop.stop_requested()) throw PreparationCancelled{};
+}
 
 uint64_t splitmix64(uint64_t value) noexcept
 {
@@ -69,11 +78,13 @@ bool is_power_of_two(size_t value) noexcept
 	return value != 0 && (value & (value - 1)) == 0;
 }
 
-void radix2_fft(std::vector<Complex>& values, bool inverse)
+void radix2_fft(std::vector<Complex>& values, bool inverse, std::stop_token stop)
 {
+	check_cancel(stop);
 	const size_t n = values.size();
 	for (size_t i = 1, j = 0; i < n; ++i)
 	{
+		check_cancel(stop, i);
 		size_t bit = n >> 1;
 		for (; j & bit; bit >>= 1)
 			j ^= bit;
@@ -90,6 +101,7 @@ void radix2_fft(std::vector<Complex>& values, bool inverse)
 			Complex factor(1.0, 0.0);
 			for (size_t offset = 0; offset < length / 2; ++offset)
 			{
+				check_cancel(stop, start + offset);
 				const Complex even = values[start + offset];
 				const Complex odd = values[start + offset + length / 2] * factor;
 				values[start + offset] = even + odd;
@@ -105,15 +117,16 @@ void radix2_fft(std::vector<Complex>& values, bool inverse)
 			value /= static_cast<double>(n);
 }
 
-std::vector<Complex> forward_fft_any(const std::vector<Complex>& input)
+std::vector<Complex> forward_fft_any(const std::vector<Complex>& input, std::stop_token stop)
 {
+	check_cancel(stop);
 	const size_t n = input.size();
 	if (n == 0)
 		return {};
 	if (is_power_of_two(n))
 	{
 		auto result = input;
-		radix2_fft(result, false);
+		radix2_fft(result, false, stop);
 		return result;
 	}
 
@@ -121,6 +134,7 @@ std::vector<Complex> forward_fft_any(const std::vector<Complex>& input)
 	std::vector<Complex> a(convolution_size), b(convolution_size);
 	for (size_t index = 0; index < n; ++index)
 	{
+		check_cancel(stop, index);
 		const double i = static_cast<double>(index);
 		const double angle = pi * std::fmod(i * i, 2.0 * static_cast<double>(n)) /
 			static_cast<double>(n);
@@ -131,11 +145,11 @@ std::vector<Complex> forward_fft_any(const std::vector<Complex>& input)
 		if (index != 0)
 			b[convolution_size - index] = positive;
 	}
-	radix2_fft(a, false);
-	radix2_fft(b, false);
+	radix2_fft(a, false, stop);
+	radix2_fft(b, false, stop);
 	for (size_t index = 0; index < convolution_size; ++index)
 		a[index] *= b[index];
-	radix2_fft(a, true);
+	radix2_fft(a, true, stop);
 	a.resize(n);
 	for (size_t index = 0; index < n; ++index)
 	{
@@ -147,24 +161,25 @@ std::vector<Complex> forward_fft_any(const std::vector<Complex>& input)
 	return a;
 }
 
-std::vector<Complex> inverse_fft_any(const std::vector<Complex>& input)
+std::vector<Complex> inverse_fft_any(const std::vector<Complex>& input, std::stop_token stop)
 {
+	check_cancel(stop);
 	std::vector<Complex> conjugated(input.size());
 	for (size_t index = 0; index < input.size(); ++index)
 		conjugated[index] = std::conj(input[index]);
-	auto result = forward_fft_any(conjugated);
+	auto result = forward_fft_any(conjugated, stop);
 	const double scale = input.empty() ? 1.0 : static_cast<double>(input.size());
 	for (Complex& value : result)
 		value = std::conj(value) / scale;
 	return result;
 }
 
-std::vector<float> periodic_quadrature(const std::vector<double>& input)
+std::vector<float> periodic_quadrature(const std::vector<double>& input, std::stop_token stop)
 {
 	std::vector<Complex> complex_input(input.size());
 	for (size_t index = 0; index < input.size(); ++index)
 		complex_input[index] = Complex(input[index], 0.0);
-	auto spectrum = forward_fft_any(complex_input);
+	auto spectrum = forward_fft_any(complex_input, stop);
 	const size_t n = spectrum.size();
 	for (size_t bin = 1; bin < (n + 1) / 2; ++bin)
 		spectrum[bin] *= 2.0;
@@ -173,27 +188,28 @@ std::vector<float> periodic_quadrature(const std::vector<double>& input)
 	if (n % 2 != 0)
 		for (size_t bin = (n + 1) / 2; bin < n; ++bin)
 			spectrum[bin] = Complex{};
-	auto analytic = inverse_fft_any(spectrum);
+	auto analytic = inverse_fft_any(spectrum, stop);
 	std::vector<float> result(n);
 	for (size_t index = 0; index < n; ++index)
 		result[index] = static_cast<float>(analytic[index].imag());
 	return result;
 }
 
-std::vector<float> padded_quadrature(const std::vector<double>& input)
+std::vector<float> padded_quadrature(const std::vector<double>& input, std::stop_token stop)
 {
+	check_cancel(stop);
 	if (input.empty())
 		return {};
 	const size_t padded_size = next_power_of_two(input.size() * 2);
 	std::vector<Complex> analytic(padded_size);
 	for (size_t index = 0; index < input.size(); ++index)
 		analytic[index] = Complex(input[index], 0.0);
-	radix2_fft(analytic, false);
+	radix2_fft(analytic, false, stop);
 	for (size_t bin = 1; bin < padded_size / 2; ++bin)
 		analytic[bin] *= 2.0;
 	for (size_t bin = padded_size / 2 + 1; bin < padded_size; ++bin)
 		analytic[bin] = Complex{};
-	radix2_fft(analytic, true);
+	radix2_fft(analytic, true, stop);
 	std::vector<float> result(input.size());
 	for (size_t index = 0; index < input.size(); ++index)
 		result[index] = static_cast<float>(analytic[index].imag());
@@ -276,20 +292,22 @@ std::vector<double> make_phase_delta(size_t n, uint32_t sample_rate, PhaseMode m
 }
 
 std::vector<float> apply_phase_field(const std::vector<double>& input,
-	const std::vector<double>& delta)
+	const std::vector<double>& delta, std::stop_token stop)
 {
+	check_cancel(stop);
 	std::vector<Complex> complex_input(input.size());
 	for (size_t index = 0; index < input.size(); ++index)
 		complex_input[index] = Complex(input[index], 0.0);
-	auto spectrum = forward_fft_any(complex_input);
+	auto spectrum = forward_fft_any(complex_input, stop);
 	const size_t n = spectrum.size();
 	for (size_t bin = 1; bin < (n + 1) / 2; ++bin)
 	{
+		check_cancel(stop, bin);
 		const Complex rotation(std::cos(delta[bin]), std::sin(delta[bin]));
 		spectrum[bin] *= rotation;
 		spectrum[n - bin] = std::conj(spectrum[bin]);
 	}
-	auto changed = inverse_fft_any(spectrum);
+	auto changed = inverse_fft_any(spectrum, stop);
 	std::vector<float> result(n);
 	for (size_t index = 0; index < n; ++index)
 		result[index] = static_cast<float>(changed[index].real());
@@ -465,18 +483,19 @@ struct PhaseProcessor::Impl
 		}
 	}
 
-	void ensure_analytic(Entry& entry, const SampleRegion& region)
+	void ensure_analytic(Entry& entry, const SampleRegion& region, std::stop_token stop = {})
 	{
+		check_cancel(stop);
 		if (!entry.quadrature_left.empty())
 			return;
 		const auto started = std::chrono::steady_clock::now();
 		const auto left = read_channel(region, false);
-		auto quadrature_left = padded_quadrature(left);
+		auto quadrature_left = padded_quadrature(left, stop);
 		if (has_valid_loop(region))
 		{
 			const std::vector<double> loop(left.begin() + region.loop_start,
 				left.begin() + region.loop_end);
-			install_periodic_body(quadrature_left, periodic_quadrature(loop),
+			install_periodic_body(quadrature_left, periodic_quadrature(loop, stop),
 				region.loop_start, region.sample_rate);
 		}
 		double original_energy_left = 0.0;
@@ -491,12 +510,12 @@ struct PhaseProcessor::Impl
 		if (region.channels == 2)
 		{
 			const auto right = read_channel(region, true);
-			quadrature_right = padded_quadrature(right);
+			quadrature_right = padded_quadrature(right, stop);
 			if (has_valid_loop(region))
 			{
 				const std::vector<double> loop(right.begin() + region.loop_start,
 					right.begin() + region.loop_end);
-				install_periodic_body(quadrature_right, periodic_quadrature(loop),
+				install_periodic_body(quadrature_right, periodic_quadrature(loop, stop),
 					region.loop_start, region.sample_rate);
 			}
 			compute_energy(right, quadrature_right, original_energy_right,
@@ -525,8 +544,10 @@ struct PhaseProcessor::Impl
 		return hash_combine(seed, salt);
 	}
 
-	Variant& ensure_variant(Entry& entry, const SampleRegion& region, uint32_t variant_index)
+	Variant& ensure_variant(Entry& entry, const SampleRegion& region, uint32_t variant_index,
+		std::stop_token stop = {})
 	{
+		check_cancel(stop);
 		if (entry.variants[variant_index])
 			return *entry.variants[variant_index];
 		const auto started = std::chrono::steady_clock::now();
@@ -534,11 +555,11 @@ struct PhaseProcessor::Impl
 		const auto left = read_channel(region, false);
 		const auto delta = make_phase_delta(left.size(), region.sample_rate, settings.mode,
 			settings.strength, settings.correlation_hz, variant_seed(entry, variant_index));
-		variant->left = apply_phase_field(left, delta);
+		variant->left = apply_phase_field(left, delta, stop);
 		if (region.channels == 2)
 		{
 			const auto right = read_channel(region, true);
-			variant->right = apply_phase_field(right, delta);
+			variant->right = apply_phase_field(right, delta, stop);
 		}
 		if (has_valid_loop(region))
 		{
@@ -548,14 +569,14 @@ struct PhaseProcessor::Impl
 				variant_seed(entry, variant_index, 0x4c4f4f50ULL));
 			const std::vector<double> left_loop(left.begin() + region.loop_start,
 				left.begin() + region.loop_end);
-			install_periodic_body(variant->left, apply_phase_field(left_loop, loop_delta),
+			install_periodic_body(variant->left, apply_phase_field(left_loop, loop_delta, stop),
 				region.loop_start, region.sample_rate);
 			if (region.channels == 2)
 			{
 				const auto right = read_channel(region, true);
 				const std::vector<double> right_loop(right.begin() + region.loop_start,
 					right.begin() + region.loop_end);
-				install_periodic_body(variant->right, apply_phase_field(right_loop, loop_delta),
+				install_periodic_body(variant->right, apply_phase_field(right_loop, loop_delta, stop),
 					region.loop_start, region.sample_rate);
 			}
 		}
@@ -684,6 +705,69 @@ void PhaseProcessor::clear() noexcept
 {
 	if (impl_)
 		impl_->reset_cache();
+}
+
+bool PhaseProcessor::prepare(std::span<const SampleRegion> regions, const PhasePreparationOptions& options)
+{
+	try
+	{
+		check_cancel(options.stop);
+		if (!impl_) throw std::logic_error("phase processor has no state");
+		auto& state = *impl_;
+		PhasePreparationProgress progress;
+		progress.cache_bytes = progress.total_cache_bytes = state.statistics.cache_bytes;
+		const bool transformed = state.settings.mode != PhaseMode::Coherent &&
+			state.settings.mode != PhaseMode::RandomPolarity && state.settings.strength > 0;
+		const bool analytic = state.settings.mode == PhaseMode::Analytic;
+		const uint32_t variants = analytic ? 1 : state.settings.pool_size;
+		std::unordered_set<Impl::SampleKey, Impl::SampleKeyHash> seen;
+		std::vector<size_t> unique_regions;
+		if (transformed)
+			for (size_t id = 0; id < regions.size(); ++id)
+			{
+				check_cancel(options.stop);
+				const auto& region = regions[id];
+				if (!region.pcm || region.pcm_len == 0 || region.channels < 1 || region.channels > 2) continue;
+				const auto key = state.make_key(region, id);
+				if (!seen.insert(key).second) continue;
+				unique_regions.push_back(id);
+				progress.total += variants;
+				uint64_t missing = variants;
+				if (const auto found = state.entries.find(key); found != state.entries.end())
+				{
+					if (analytic) missing = found->second->quadrature_left.empty() ? 1 : 0;
+					else for (const auto& variant : found->second->variants) if (variant) --missing;
+				}
+				const uint64_t bytes = uint64_t{region.pcm_len} * region.channels * sizeof(float) * missing;
+				if (bytes > UINT64_MAX - progress.total_cache_bytes) throw std::length_error("phase cache size overflow");
+				progress.total_cache_bytes += bytes;
+			}
+		if (options.progress) options.progress(progress);
+		check_cancel(options.stop);
+		// Refuse oversized FFT pools before allocating any transformed samples.
+		if (progress.total_cache_bytes > options.maximum_cache_bytes)
+			throw std::length_error("Phase cache needs " +
+				std::to_string(progress.total_cache_bytes / 1048576 + (progress.total_cache_bytes % 1048576 != 0)) +
+				" MiB; the limit is " + std::to_string(options.maximum_cache_bytes / 1048576) +
+				" MiB. Reduce the phase pool, choose analytic/coherent mode, or raise the cache limit. FFT working memory is extra.");
+		for (const size_t id : unique_regions)
+		{
+			check_cancel(options.stop);
+			auto& entry = state.entry_for(regions[id], id);
+			for (uint32_t variant = 0; variant < variants; ++variant)
+			{
+				if (analytic) state.ensure_analytic(entry, regions[id], options.stop);
+				else state.ensure_variant(entry, regions[id], variant, options.stop);
+				check_cancel(options.stop);
+				++progress.completed;
+				progress.cache_bytes = state.statistics.cache_bytes;
+				if (options.progress) options.progress(progress);
+			}
+		}
+		check_cancel(options.stop);
+		return true;
+	}
+	catch (const PreparationCancelled&) { return false; }
 }
 
 PhaseVoiceState PhaseProcessor::assign(const SampleRegion& region, uint64_t region_id,
