@@ -11,6 +11,7 @@ add_library(safsyn STATIC
 	SAFSYN/engine.cpp
 	SAFSYN/mastering.cpp
 	SAFSYN/phase.cpp
+	SAFSYN/playback.cpp
 	SAFSYN/smf.cpp
 	SAFSYN/smf_renderer.cpp
 	SAFSYN/wav_writer.cpp
@@ -52,6 +53,27 @@ if(MSVC)
 endif()
 
 if(WIN32)
+	add_library(safsyn-windows STATIC SAFSYN/windows_synth.cpp)
+	target_link_libraries(safsyn-windows PUBLIC SAFSYN::safsyn PRIVATE ole32 uuid winmm avrt)
+	target_compile_features(safsyn-windows PUBLIC cxx_std_20)
+	target_compile_definitions(safsyn-windows PRIVATE UNICODE _UNICODE)
+	add_executable(safsyn-synth WIN32 tools/safsyn_synth.cpp)
+	target_link_libraries(safsyn-synth PRIVATE safsyn-windows comctl32 comdlg32 shell32)
+	target_compile_definitions(safsyn-synth PRIVATE UNICODE _UNICODE NOMINMAX)
+	add_executable(safsyn-play tools/safsyn_play.cpp)
+	target_link_libraries(safsyn-play PRIVATE safsyn-windows)
+	install(TARGETS safsyn-synth safsyn-play RUNTIME DESTINATION . COMPONENT Synth)
+	install(FILES README.md LICENSE.txt DESTINATION . COMPONENT Synth)
+	install(DIRECTORY docs/ DESTINATION docs COMPONENT Synth FILES_MATCHING PATTERN "*.md")
+	if(MSVC)
+		foreach(target safsyn-windows safsyn-synth safsyn-play)
+			target_compile_options(${target} PRIVATE /EHsc /W4 /permissive-)
+		endforeach()
+		set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION .)
+		set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT Synth)
+		include(InstallRequiredSystemLibraries)
+	endif()
+
 	add_executable(safsyn-render-gui WIN32 tools/safsyn_render_gui.cpp)
 	target_link_libraries(safsyn-render-gui PRIVATE SAFSYN::safsyn
 		comctl32 comdlg32 shell32)
@@ -70,6 +92,13 @@ endif()
 
 if(SAFSYN_BUILD_TESTS)
 	include(CTest)
+	add_executable(safsyn-playback-tests tests/playback_tests.cpp)
+	target_link_libraries(safsyn-playback-tests PRIVATE SAFSYN::safsyn Threads::Threads)
+	if(MSVC)
+		target_compile_options(safsyn-playback-tests PRIVATE /EHsc /W4)
+	endif()
+	add_test(NAME safsyn-playback COMMAND safsyn-playback-tests)
+	set_tests_properties(safsyn-playback PROPERTIES TIMEOUT 60)
 	add_executable(safsyn-tests tests/core_tests.cpp)
 	target_link_libraries(safsyn-tests PRIVATE SAFSYN::safsyn)
 	target_compile_features(safsyn-tests PRIVATE cxx_std_20)

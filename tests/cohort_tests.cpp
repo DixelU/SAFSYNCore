@@ -449,6 +449,56 @@ void test_safety_limit_stealing()
 		"explicit cohort ceiling steals deterministically and accounts logical multiplicity");
 }
 
+void test_prepared_region_index()
+{
+	auto bank = make_bank(4000);
+	const auto prototype = bank.regions.front();
+	bank.regions.clear();
+	for (uint16_t i = 0; i < 36; ++i)
+	{
+		auto region = prototype;
+		region.preset_bank = static_cast<uint16_t>((i / 12) * 128);
+		region.preset_program = static_cast<uint16_t>((i / 4) % 3);
+		region.lo_key = static_cast<uint8_t>(40 + i % 4);
+		region.hi_key = static_cast<uint8_t>(70 - i % 4);
+		region.lo_vel = static_cast<uint8_t>(i % 4 * 20);
+		region.hi_vel = static_cast<uint8_t>(127 - i % 4 * 10);
+		region.attenuation = 0.1f + i * 0.01f;
+		bank.regions.push_back(region);
+	}
+	bank.stress_regions = bank.regions;
+	std::reverse(bank.stress_regions.begin(), bank.stress_regions.end());
+	for (auto& region : bank.stress_regions) region.attenuation *= 0.3f;
+	safsyn::SynthEngine reference(4000, 256), indexed(4000, 256);
+	indexed.set_voice_model(safsyn::VoiceModel::Cohorts, 256);
+	for (auto* engine : {&reference, &indexed}) engine->set_soundfont(&bank);
+	for (bool all : {false, true})
+		for (uint16_t selected_bank : {0, 128, 256, 999})
+			for (uint8_t program : {0, 1, 2, 127})
+				for (uint8_t velocity : {10, 70, 127})
+				{
+					for (auto* engine : {&reference, &indexed})
+					{
+						engine->reset(); engine->set_all_regions_mode(all);
+						engine->control_change(0, 0, static_cast<uint8_t>(selected_bank >> 7));
+						engine->control_change(0, 32, static_cast<uint8_t>(selected_bank & 127));
+						engine->program_change(0, program);
+						for (uint8_t note : {20, 41, 60, 70, 100}) engine->note_on(0, note, velocity);
+					}
+					check(reference.stats().started_voices == indexed.stats().started_voices &&
+						close_audio(render(reference, 32), render(indexed, 32)),
+						"prepared preset/key lookup preserves velocity layers and stress-region order");
+				}
+	auto replacement = make_bank(4000, true);
+	for (auto* engine : {&reference, &indexed})
+	{
+		engine->reset(); engine->set_all_regions_mode(false); engine->set_soundfont(&replacement);
+		engine->note_on(0, 60, 100);
+	}
+	check(close_audio(render(reference, 32), render(indexed, 32)),
+		"soundbank replacement rebuilds prepared region pointers");
+}
+
 void test_parallel_cohort_render()
 {
 	constexpr uint32_t cohort_count = 1024;
@@ -499,6 +549,7 @@ int main()
 	test_block_and_seed_determinism();
 	test_safety_limit_stealing();
 	test_parallel_cohort_render();
+	test_prepared_region_index();
 	if (failures != 0)
 	{
 		std::cerr << failures << " cohort test(s) failed\n";

@@ -5,9 +5,33 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <unordered_map>
 
 namespace safsyn
 {
+struct RegionIndex
+{
+	using Keys = std::array<std::vector<size_t>, 128>;
+	std::unordered_map<uint32_t, Keys> presets;
+	Keys all_regions;
+	std::vector<size_t> empty;
+
+	explicit RegionIndex(const Soundfont& bank)
+	{
+		for (size_t id = 0; id < bank.regions.size(); ++id)
+		{
+			const auto& region = bank.regions[id];
+			auto& keys = presets[(uint32_t{region.preset_bank} << 16) | region.preset_program];
+			for (unsigned note = region.lo_key; note <= region.hi_key && note < 128; ++note)
+				keys[note].push_back(id);
+		}
+		const auto& flattened = bank.stress_regions.empty() ? bank.regions : bank.stress_regions;
+		for (size_t id = 0; id < flattened.size(); ++id)
+			for (unsigned note = flattened[id].lo_key; note <= flattened[id].hi_key && note < 128; ++note)
+				all_regions[note].push_back(id);
+	}
+};
+
 namespace
 {
 constexpr double pi = 3.1415926535897932384626433832795;
@@ -60,6 +84,19 @@ void SynthEngine::set_soundfont(const Soundfont* soundfont) noexcept
 	silence_all();
 	phase_processor_.clear();
 	soundfont_ = soundfont;
+	region_index_.reset();
+	if (soundfont)
+		try { region_index_ = std::make_unique<RegionIndex>(*soundfont); }
+		catch (...) { /* Preserve playback via the reference scan if preparation fails. */ }
+}
+
+const std::vector<size_t>* SynthEngine::region_candidates(uint16_t bank, uint8_t program,
+	uint8_t note) const noexcept
+{
+	if (!region_index_ || note >= 128) return nullptr;
+	if (all_regions_mode_) return &region_index_->all_regions[note];
+	const auto found = region_index_->presets.find((uint32_t{bank} << 16) | program);
+	return found == region_index_->presets.end() ? &region_index_->empty : &found->second[note];
 }
 
 void SynthEngine::set_phase_settings(const PhaseSettings& settings) noexcept

@@ -362,6 +362,7 @@ struct CohortEngineState
 	std::array<uint32_t, 16 * 128> note_heads{};
 	size_t maximum_cohorts = 0;
 	std::unique_ptr<ParallelRenderState> parallel_render;
+	std::vector<std::pair<size_t, const SampleRegion*>> matching_regions_scratch;
 
 	CohortEngineState() noexcept
 	{
@@ -981,10 +982,11 @@ struct CohortEngineState
 		const auto& render_regions = owner.all_regions_mode_ &&
 			!owner.soundfont_->stress_regions.empty()
 			? owner.soundfont_->stress_regions : owner.soundfont_->regions;
-		std::vector<std::pair<size_t, const SampleRegion*>> matches;
+		auto& matches = matching_regions_scratch;
+		matches.clear();
 		bool has_exclusive = false;
 		bool has_one_shot = false;
-		for (size_t region_id = 0; region_id < render_regions.size(); ++region_id)
+		auto consider = [&](size_t region_id)
 		{
 			const auto& region = render_regions[region_id];
 			if (!region.pcm || region.pcm_len == 0 || region.channels < 1 || region.channels > 2 ||
@@ -992,11 +994,15 @@ struct CohortEngineState
 					region.preset_program != channel_state.program)) ||
 				note < region.lo_key || note > region.hi_key ||
 				velocity < region.lo_vel || velocity > region.hi_vel)
-				continue;
+				return;
 			matches.push_back({region_id, &region});
 			has_exclusive = has_exclusive || region.exclusive_class != 0;
 			has_one_shot = has_one_shot || region.loop_mode == LoopMode::OneShot;
-		}
+		};
+		if (const auto* candidates = owner.region_candidates(selected_bank, channel_state.program, note))
+			for (const auto id : *candidates) consider(id);
+		else
+			for (size_t id = 0; id < render_regions.size(); ++id) consider(id);
 		if (matches.empty())
 		{
 			owner.next_serial_ += count;

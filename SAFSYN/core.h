@@ -120,6 +120,7 @@ enum class VoiceModel : uint8_t
 
 class CohortEngine;
 struct CohortEngineState;
+struct RegionIndex;
 
 class SynthEngine
 {
@@ -248,10 +249,15 @@ private:
 	void all_notes_off(uint8_t channel) noexcept;
 	void all_sound_off(uint8_t channel) noexcept;
 	void silence_all() noexcept;
+	// Prepared preset/key candidates in original region order. Null means that
+	// preparation ran out of memory and callers must use the reference scan.
+	const std::vector<size_t>* region_candidates(uint16_t bank, uint8_t program,
+		uint8_t note) const noexcept;
 	friend class CohortEngine;
 	friend struct CohortEngineState;
 
 	const Soundfont* soundfont_ = nullptr;
+	std::unique_ptr<RegionIndex> region_index_;
 	std::vector<Voice> voices_;
 	std::unique_ptr<CohortEngine> cohort_engine_;
 	ChannelState channels_[16] = {};

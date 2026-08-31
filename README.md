@@ -1,9 +1,10 @@
 # SAFSYNCore
 
-SAFSYNCore is a deterministic streaming Standard MIDI File renderer with a
+SAFSYNCore includes a standalone Windows MIDI synthesizer and a deterministic
+streaming Standard MIDI File renderer with a
 bit-exact coherent baseline, opt-in experimental phase-decorrelation modes, and
 an optional post-mix mastering stage. Raw unclipped float output remains the
-default so DSP experiments retain a reproducible baseline.
+offline default so DSP experiments retain a reproducible baseline.
 
 ## What is included
 
@@ -12,10 +13,15 @@ default so DSP experiments retain a reproducible baseline.
 - `safsyn-render`: headless scripted-note renderer producing stereo float32 WAV
 - `safsyn-render-gui`: native Windows SMF renderer with organized settings,
   live render metrics, remaining-time estimates, and cancellation
+- `safsyn-synth`: native Windows synth with WASAPI audio, WinMM MIDI input,
+  direct MIDI-file playback, persistent render workers, and live overload metrics
+- `safsyn-play`: command-line Windows playback and device diagnostics
 - `safsyn-tests`: engine, MIDI-message, SFZ-loader, determinism, and WAV tests
 - `safsyn-phase-tests`: phase policy, determinism, pool, loop, and cache tests
 - `safsyn-mastering-tests`: gain, lookahead, stereo-link, and invariance tests
 - `safsyn-smf-tests`: SMF parsing, timing, merge, streaming, and RF64 tests
+- `safsyn-playback-tests`: concurrent queues, live recovery, dense file bursts,
+  sample timing, threaded playback, limiting, and lifecycle tests
 - `SAFSYN/dllmain.cpp`: preserved Windows driver sketch, excluded by default
 
 The coherent engine supports the preserved fixed individual-voice reference
@@ -58,7 +64,40 @@ Generate a self-contained coherent baseline without a sound bank:
 build/Release/safsyn-render --demo coherent-demo.wav
 ```
 
-Or render the same sample-accurate scripted chord sequence through a bank:
+## Play the synth
+
+On Windows, launch `build/Release/safsyn-synth.exe` (or
+`build/safsyn-synth.exe` with a single-configuration Ninja build). Select an
+SF2/SFZ bank and click **Start live synth**, or leave the bank blank to try the
+built-in sine instrument with **Test chord**. Choose a MIDI input for a keyboard
+or an existing virtual MIDI cable. For black MIDI files, choose the `.mid` and
+click **Play MIDI file**; this uses the exact scheduler directly, without
+routing millions of events through WinMM. Drag-and-drop accepts banks and MIDI.
+The **Black MIDI preset** selects 512 cohorts, four render threads, and ten
+seconds of buffering for dense files. Phase rotation is disabled in the synth;
+the offline renderer retains its experimental modes.
+
+Live playback uses a finite cohort ceiling (default 4096), an automatic persistent
+render pool (up to 16 threads, reserving two logical CPUs), and a separate WASAPI
+delivery thread. Buffering is adjustable; the GUI starts at 100 ms. Live output
+starts at -12 dB with a -1 dB sample-peak limiter and a final safety clamp.
+Offline renderer settings and reference hashes are unchanged.
+
+```text
+build/Release/safsyn-play --list-devices
+build/Release/safsyn-play --bank piano.sf2 --midi song.mid --threads 8
+build/Release/safsyn-play --bank piano.sf2 --midi black.mid --threads 4 --cohorts 512 --buffer-frames 480000
+build/Release/safsyn-play --bank piano.sf2 --midi-in 0 --buffer-frames 2048
+build/Release/safsyn-play --test-note --mute --seconds 2
+```
+
+See `docs/LIVE_SYNTH.md` for buffering, overflow recovery, setup, and validation
+limits. This is a standalone host, not an installed MIDI-output driver or a
+VST plugin; it does not change the registry or create a virtual MIDI port.
+
+## Offline rendering
+
+Render a sample-accurate scripted chord sequence through a bank:
 
 ```text
 build/Release/safsyn-render piano.sf2 piano-baseline.wav --bank 0 --program 0
@@ -124,7 +163,8 @@ stage after the raw float mix; it is not an oversampled true-peak meter.
 ## Project boundary
 
 `SAFSYN_BUILD_WINMM` defaults to `OFF`. Enabling it only compiles the preserved
-DLL shell; it does not claim a functioning WinMM/WASAPI backend. See
+DLL shell; it is separate from the functioning standalone WASAPI/MIDI-input
+host and does not expose a system MIDI-output device. See
 `docs/DSP_CONTRACT.md` for the contract and `docs/PHASE_EXPERIMENT.md` for the
 phase architecture, measurements, and evidence boundaries. See
 `docs/SMF_RENDERER.md` for the file/scheduling contract and the `Hypernova.mid`
