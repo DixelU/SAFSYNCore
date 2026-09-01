@@ -281,7 +281,8 @@ void SynthEngine::begin_release(Voice& voice, float seconds_override) noexcept
 {
 	if (!voice.active() || voice.stage == Voice::Stage::Release)
 		return;
-	const float seconds = seconds_override >= 0.0f ? seconds_override : voice.region->release;
+	const float seconds = seconds_override >= 0.0f
+		? seconds_override : release_seconds(*voice.region, voice.channel);
 	voice.note_off_pending = false;
 	if (seconds <= 0.0f || voice.env <= 0.0f)
 	{
@@ -290,6 +291,22 @@ void SynthEngine::begin_release(Voice& voice, float seconds_override) noexcept
 	}
 	voice.stage = Voice::Stage::Release;
 	voice.env_inc = -voice.env / (seconds * sample_rate_);
+}
+
+float SynthEngine::release_seconds(const SampleRegion& region, uint8_t channel) const noexcept
+{
+	if (channel >= 16)
+		return region.release;
+
+	// SpessaSynth's extended CC72 mapping is a positive linear bipolar
+	// modulation of +/-3600 timecents. MIDI value 64 is therefore neutral,
+	// and the SoundFont region remains the source of the base release time.
+	constexpr float release_range_timecents = 3600.0f;
+	constexpr float timecents_per_octave = 1200.0f;
+	const float bipolar = static_cast<float>(
+		static_cast<int>(channels_[channel].controllers[72]) - 64) / 64.0f;
+	return region.release * std::exp2(
+		bipolar * release_range_timecents / timecents_per_octave);
 }
 
 float SynthEngine::advance_envelope(Voice& voice) noexcept
@@ -611,6 +628,9 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 		}
 		break;
 	}
+	case 72:
+		// Applied when a voice enters release, including deferred sustain releases.
+		break;
 	case 98:
 	case 99:
 		state.parameter_selection = ChannelState::ParameterSelection::Nrpn;

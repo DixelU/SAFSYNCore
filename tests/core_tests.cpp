@@ -293,6 +293,66 @@ void test_release_and_sustain()
 	check(engine.active_voice_count() == 0, "pedal-up completes the release envelope");
 }
 
+uint32_t cc72_release_frames(safsyn::VoiceModel model, uint8_t value,
+	bool defer_with_sustain = false)
+{
+	auto bank = make_constant_bank();
+	bank.regions[0].release = 0.064f;
+	safsyn::SynthEngine engine(1000, 8);
+	engine.set_voice_model(model);
+	engine.set_soundfont(&bank);
+	engine.note_on(0, 60, 127);
+	std::array<float, 2> audio{};
+	engine.render_audio(audio.data(), 1);
+	if (defer_with_sustain)
+	{
+		engine.control_change(0, 64, 127);
+		engine.note_off(0, 60);
+		engine.control_change(0, 72, value);
+		engine.render_audio(audio.data(), 3);
+		check(engine.active_voice_count() == 1,
+			"CC64 continues to defer release after a CC72 change");
+		engine.control_change(0, 64, 0);
+	}
+	else
+	{
+		engine.control_change(0, 72, value);
+		engine.note_off(0, 60);
+	}
+
+	uint32_t frames = 0;
+	while (engine.active_voice_count() != 0 && frames < 2048)
+	{
+		engine.render_audio(audio.data(), 1);
+		++frames;
+	}
+	return frames;
+}
+
+void test_release_time_controller()
+{
+	for (const auto model : {safsyn::VoiceModel::Individual, safsyn::VoiceModel::Cohorts})
+	{
+		safsyn::SynthEngine defaults(1000, 8);
+		check(defaults.controller_value(0, 72) == 64 &&
+			defaults.controller_value(15, 72) == 64,
+			"CC72 defaults to its neutral value on every channel");
+		defaults.control_change(0, 72, 47);
+		defaults.control_change(0, 121, 0);
+		check(defaults.controller_value(0, 72) == 64,
+			"CC121 restores the neutral CC72 release-time value");
+
+		check(cc72_release_frames(model, 0) == 8,
+			"CC72 value 0 shortens the SoundFont release by three octaves");
+		check(cc72_release_frames(model, 64) == 64,
+			"CC72 value 64 preserves the SoundFont release duration");
+		check(cc72_release_frames(model, 127) == 496,
+			"CC72 value 127 lengthens the SoundFont release by the bipolar mapping");
+		check(cc72_release_frames(model, 47, true) == 37,
+			"Hypernova CC72 value 47 applies when CC64 unlatches the note");
+	}
+}
+
 void test_controller_contract()
 {
 	auto bank = make_constant_bank();
@@ -757,6 +817,7 @@ int main(int argc, char** argv)
 	test_velocity_response();
 	test_independent_instances();
 	test_release_and_sustain();
+	test_release_time_controller();
 	test_controller_contract();
 	test_rpn_pitch_bend_sensitivity();
 	test_determinism_and_block_invariance();

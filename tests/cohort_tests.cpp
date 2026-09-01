@@ -243,6 +243,7 @@ std::vector<float> lifecycle_render(safsyn::SynthEngine& engine, bool batched)
 	engine.control_change(0, 7, 103);
 	engine.control_change(0, 11, 89);
 	append(11);
+	engine.control_change(0, 72, 47);
 	engine.control_change(0, 64, 0);
 	append(35);
 	if (batched) engine.note_off_batch(0, 60, 5);
@@ -266,7 +267,7 @@ void test_lifecycle_split_and_controls()
 	const auto actual = lifecycle_render(cohorts, true);
 	const bool equivalent = close_audio(expected, actual, 3e-4, 3e-5);
 	if (!equivalent) print_largest_error(expected, actual);
-	check(equivalent, "attack/decay note-offs, sustain release, pitch, pan, volume, and expression match");
+	check(equivalent, "attack/decay note-offs, sustain and CC72 release, pitch, pan, volume, and expression match");
 	check(cohorts.stats().cohort_splits != 0 && cohorts.stats().cohorts_created > 1,
 		"individual note-offs split release cohorts from sustaining multiplicity");
 }

@@ -221,6 +221,7 @@ private:
 			controllers[7] = 100;
 			controllers[10] = 64;
 			controllers[11] = 127;
+			controllers[72] = 64;
 			controllers[98] = 127;
 			controllers[99] = 127;
 			controllers[100] = 127;
@@ -244,6 +245,7 @@ private:
 	double compute_base_increment(const SampleRegion& region, uint8_t note) const noexcept;
 	void compute_gains(const SampleRegion& region, uint8_t channel, uint8_t velocity,
 		float& left, float& right) const noexcept;
+	float release_seconds(const SampleRegion& region, uint8_t channel) const noexcept;
 	void begin_release(Voice& voice, float seconds_override = -1.0f) noexcept;
 	void begin_envelope(Voice& voice) noexcept;
 	float advance_envelope(Voice& voice) noexcept;

@@ -708,7 +708,8 @@ struct CohortEngineState
 	bool begin_release(SynthEngine& owner, RenderCohort& cohort,
 		float seconds_override = -1.0f) noexcept
 	{
-		const float seconds = seconds_override >= 0.0f ? seconds_override : cohort.region->release;
+		const float seconds = seconds_override >= 0.0f
+			? seconds_override : owner.release_seconds(*cohort.region, cohort.channel);
 		if (seconds <= 0.0f || cohort.env <= 0.0f)
 			return false;
 		cohort.stage = CohortStage::Release;
