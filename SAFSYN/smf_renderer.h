@@ -37,6 +37,32 @@ struct SmfRenderProgress
 using SmfRenderProgressCallback = bool (*)(const SmfRenderProgress& progress,
 	void* user_data) noexcept;
 
+enum class TimedMidiEventKind : uint8_t
+{
+	Ignored,
+	ShortMessage,
+	SystemExclusive,
+	MasterVolume,
+};
+
+struct TimedMidiEvent
+{
+	uint64_t frame = 0;
+	TimedMidiEventKind kind = TimedMidiEventKind::Ignored;
+	uint32_t short_message = 0;
+	uint16_t master_volume = 0;
+};
+
+// Return false at the end of the source. Events must be returned in
+// non-decreasing frame order.
+using TimedMidiNextCallback = bool (*)(TimedMidiEvent& event,
+	void* user_data) noexcept;
+
+// Return false if the output sink cannot accept the block. first_frame is
+// relative to the start of this render, before any container-specific lead-in.
+using StereoPcmWriteCallback = bool (*)(const float* interleaved_stereo,
+	uint32_t frames, uint64_t first_frame, void* user_data) noexcept;
+
 struct SmfRenderOptions
 {
 	uint32_t sample_rate = 48000;
@@ -87,6 +113,24 @@ struct SmfRenderResult
 	MasteringStats mastering;
 	std::vector<SmfDiagnostic> diagnostics;
 };
+
+// Shared synthesizer/rendering core for already scheduled MIDI sources. This
+// keeps voice policy, phase preparation, mastering, tails, cancellation, and
+// metrics identical across WAV, MP4, and prepared-archive callers.
+bool render_timed_midi_pcm(uint64_t duration_frames,
+	const Soundfont& soundfont,
+	TimedMidiNextCallback next_event,
+	void* next_event_user_data,
+	const SmfRenderOptions& options,
+	SmfRenderResult& result,
+	StereoPcmWriteCallback write_pcm,
+	void* write_pcm_user_data) noexcept;
+
+// Standard-MIDI adapter over the shared PCM renderer.
+bool render_smf_pcm(const SmfFile& file, const SmfAnalysis& analysis,
+	const Soundfont& soundfont, const SmfRenderOptions& options,
+	SmfRenderResult& result, StereoPcmWriteCallback write_pcm,
+	void* write_pcm_user_data) noexcept;
 
 bool render_smf_stream(const SmfFile& file, const SmfAnalysis& analysis,
 	const Soundfont& soundfont, const char* output_path, const SmfRenderOptions& options,

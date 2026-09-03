@@ -176,6 +176,57 @@ safsyn::Soundfont make_bank(uint32_t sample_rate)
 	return bank;
 }
 
+struct TimedEventSource
+{
+	std::vector<safsyn::TimedMidiEvent> events;
+	size_t cursor = 0;
+};
+
+bool next_timed_event(safsyn::TimedMidiEvent& event, void* user_data) noexcept
+{
+	auto& source = *static_cast<TimedEventSource*>(user_data);
+	if (source.cursor == source.events.size())
+		return false;
+	event = source.events[source.cursor++];
+	return true;
+}
+
+struct PcmCapture
+{
+	std::vector<float> samples;
+};
+
+bool capture_pcm(const float* audio, uint32_t frames, uint64_t,
+	void* user_data) noexcept
+{
+	auto& capture = *static_cast<PcmCapture*>(user_data);
+	capture.samples.insert(capture.samples.end(), audio,
+		audio + static_cast<size_t>(frames) * 2);
+	return true;
+}
+
+void test_timed_source_declared_duration()
+{
+	constexpr uint32_t sample_rate = 1000;
+	auto bank = make_bank(sample_rate);
+	TimedEventSource source{{{
+		0, safsyn::TimedMidiEventKind::ShortMessage,
+		0x90U | (60U << 8) | (100U << 16), 0}}};
+	safsyn::SmfRenderOptions options;
+	options.sample_rate = sample_rate;
+	options.block_frames = 64;
+	PcmCapture pcm;
+	safsyn::SmfRenderResult result;
+	check(safsyn::render_timed_midi_pcm(500, bank, next_timed_event, &source,
+		options, result, capture_pcm, &pcm) && result.frames_written == 500,
+		"timed MIDI source renders its complete declared duration");
+	float ending_energy = 0.0f;
+	for (size_t index = 400 * 2; index < pcm.samples.size(); ++index)
+		ending_energy += std::abs(pcm.samples[index]);
+	check(ending_energy > 0.0f,
+		"voices remain active until the declared duration when the event stream ends early");
+}
+
 std::vector<uint8_t> render_fixture_midi(bool sustain)
 {
 	std::vector<uint8_t> track = {0x00, 0x90, 0x3c, 0x64};
@@ -667,6 +718,7 @@ int main(int argc, char** argv)
 	test_remainder_preservation();
 	test_skipped_meta_sysex_and_malformed_inputs();
 	test_sysex_payload_and_master_dispatch(directory);
+	test_timed_source_declared_duration();
 	test_streamed_wav_headers(directory);
 	test_streamed_render_determinism(directory);
 	test_cohort_histogram_and_mass_dispatch(directory);
