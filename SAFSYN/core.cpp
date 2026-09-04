@@ -7,10 +7,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace safsyn
@@ -719,6 +721,14 @@ bool load_sfz(const char* path, Soundfont& sf)
 	std::ifstream file(path);
 	if (!file.is_open()) return false;
 	std::string dir = sfz_parent_dir(path);
+	std::string default_path;
+	struct LoadedSample
+	{
+		size_t index;
+		uint32_t rate;
+		uint8_t channels;
+	};
+	std::unordered_map<std::string, LoadedSample> loaded_samples;
 
 	struct Desc
 	{
@@ -780,15 +790,35 @@ bool load_sfz(const char* path, Soundfont& sf)
 	{
 		if (d.sample.empty()) return;
 
-		std::string sample_path = dir + "/" + d.sample;
-		std::replace(sample_path.begin(), sample_path.end(), '\\', '/');
+		std::string sample_name = d.sample;
+		std::replace(sample_name.begin(), sample_name.end(), '\\', '/');
+		std::string sample_base = default_path;
+		std::replace(sample_base.begin(), sample_base.end(), '\\', '/');
+		const std::filesystem::path sample_part(sample_name);
+		const std::filesystem::path sample_path_object = sample_part.is_absolute()
+			? sample_part
+			: std::filesystem::path(dir) / sample_base / sample_part;
+		const std::string sample_path = sample_path_object.lexically_normal().string();
 
-		sf.sfz_pcm.emplace_back();
 		uint32_t rate = 44100; uint8_t nch = 1;
-		if (!load_wav(sample_path.c_str(), sf.sfz_pcm.back(), rate, nch))
+		size_t sample_index = 0;
+		const auto loaded = loaded_samples.find(sample_path);
+		if (loaded == loaded_samples.end())
 		{
-			sf.sfz_pcm.pop_back();
-			return;
+			sample_index = sf.sfz_pcm.size();
+			sf.sfz_pcm.emplace_back();
+			if (!load_wav(sample_path.c_str(), sf.sfz_pcm.back(), rate, nch))
+			{
+				sf.sfz_pcm.pop_back();
+				return;
+			}
+			loaded_samples.emplace(sample_path, LoadedSample{sample_index, rate, nch});
+		}
+		else
+		{
+			sample_index = loaded->second.index;
+			rate = loaded->second.rate;
+			nch = loaded->second.channels;
 		}
 
 		SampleRegion r;
@@ -799,8 +829,8 @@ bool load_sfz(const char* path, Soundfont& sf)
 		r.hi_vel = (uint8_t)std::clamp(d.hi_vel, 0, 127);
 		r.root_key = (uint8_t)std::clamp(d.pitch_keycenter, 0, 127);
 
-		r.pcm = sf.sfz_pcm.back().data();
-		r.pcm_len = (uint32_t)(sf.sfz_pcm.back().size() / nch);
+		r.pcm = sf.sfz_pcm[sample_index].data();
+		r.pcm_len = (uint32_t)(sf.sfz_pcm[sample_index].size() / nch);
 		r.sample_rate = rate;
 		r.channels = nch;
 
@@ -833,7 +863,7 @@ bool load_sfz(const char* path, Soundfont& sf)
 	// Four-level hierarchy: global → master → group → region
 	// When entering a child header, copy current parent state as starting point.
 	Desc global_d, master_d, group_d, region_d;
-	enum class H { None, Global, Master, Group, Region } hdr = H::None;
+	enum class H { None, Control, Global, Master, Group, Region } hdr = H::None;
 
 	std::string line;
 	while (std::getline(file, line))
@@ -844,7 +874,8 @@ bool load_sfz(const char* path, Soundfont& sf)
 			// Entering a new header — commit pending region first
 			if (hdr == H::Region) commit_region(region_d);
 
-			if (hdr_name == "global") { hdr = H::Global; global_d = Desc{}; }
+			if (hdr_name == "control") { hdr = H::Control; }
+			else if (hdr_name == "global") { hdr = H::Global; global_d = Desc{}; }
 			else if (hdr_name == "master") { hdr = H::Master; master_d = global_d; master_d.sample.clear(); }
 			else if (hdr_name == "group") { hdr = H::Group;  group_d = master_d; group_d.sample.clear(); }
 			else if (hdr_name == "region") { hdr = H::Region; region_d = group_d;  region_d.sample.clear(); }
@@ -853,6 +884,9 @@ bool load_sfz(const char* path, Soundfont& sf)
 		{
 			switch (hdr)
 			{
+				case H::Control:
+					if (k == "default_path") default_path = std::move(v);
+					break;
 				case H::Global: parse_opcode(global_d, k, v); break;
 				case H::Master: parse_opcode(master_d, k, v); break;
 				case H::Group:  parse_opcode(group_d, k, v); break;

@@ -791,6 +791,30 @@ void test_sfz_loader(const std::filesystem::path& directory)
 		engine.render_audio(audio.data(), 16);
 		check(any_nonzero(audio), "loaded SFZ region renders audio");
 	}
+
+	const auto preset_directory = directory / "presets";
+	const auto sample_directory = directory / "samples";
+	std::filesystem::create_directories(preset_directory);
+	std::filesystem::create_directories(sample_directory);
+	const auto shared_sample_path = sample_directory / "shared.wav";
+	const auto default_path_sfz = preset_directory / "default-path.sfz";
+	write_pcm16_wav(shared_sample_path,
+		{0, 8192, 16384, 8192, 0, -8192, -16384, -8192}, 8000);
+	{
+		std::ofstream sfz(default_path_sfz);
+		sfz << "<control> default_path=..\\samples\\\n"
+			"<group> ampeg_attack=0\n"
+			"<region> sample=shared.wav key=60\n"
+			"<region> sample=shared.wav key=61\n";
+	}
+	safsyn::Soundfont default_path_bank;
+	check(safsyn::load_sfz(default_path_sfz.string().c_str(), default_path_bank),
+		"SFZ control default_path resolves sample files");
+	check(default_path_bank.regions.size() == 2 && default_path_bank.sfz_pcm.size() == 1,
+		"SFZ regions reuse one decoded copy of a shared sample");
+	if (default_path_bank.regions.size() == 2)
+		check(default_path_bank.regions[0].pcm == default_path_bank.regions[1].pcm,
+			"SFZ shared-sample regions reference the same PCM storage");
 }
 
 void test_float_wav(const std::filesystem::path& directory)
