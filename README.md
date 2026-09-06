@@ -138,7 +138,9 @@ reference path, while `--max-cohorts N` gives cohorts an explicit deterministic
 safety ceiling; zero means dynamic offline growth. `--drain-tail` renders until
 all represented logical voices finish or `--max-tail-seconds` is reached.
 `--render-threads N` enables the fast cohort mixer; the default of one retains
-the scalar accumulation order used by the reference hashes.
+the accumulation order used by the reference hashes. Coherent sustained
+single-voice cohorts use an exact SSE2 frame kernel where available. See
+`docs/MIXER_PERFORMANCE.md` for worker-handoff changes, measurements, and limits.
 
 Run an opt-in phase experiment with the same scripted events:
 

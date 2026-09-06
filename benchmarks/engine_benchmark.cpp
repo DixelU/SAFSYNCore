@@ -1,10 +1,13 @@
 #include "core.h"
 
 #include <chrono>
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <string_view>
 #include <vector>
 
 namespace
@@ -43,10 +46,70 @@ double time_ms(Function&& function)
 	function();
 	return std::chrono::duration<double, std::milli>(Clock::now() - started).count();
 }
+
+// Warmed, repeated measurements of the event-to-event intervals that drive
+// worker handoff costs. Keep this harness usable against the original engine.
+int interval_matrix(int argc, char** argv)
+{
+	const size_t threads = argc > 2 ? std::stoull(argv[2]) : 4;
+	const size_t repetitions = argc > 3 ? std::stoull(argv[3]) : 7;
+	const size_t capacity = argc > 4 ? std::stoull(argv[4]) : 4096;
+	if (!threads || threads > 64 || !repetitions || !capacity) return 1;
+	std::cout << "mode,cohorts,threads,interval,median_ms_per_1024_frames,min_ms,max_ms,checksum\n";
+	for (const auto mode : {"mono", "stereo", "analytic"})
+	{
+		auto bank = make_bank();
+		const bool stereo = std::string_view(mode) == "stereo";
+		auto& pcm = bank.sfz_pcm.back();
+		pcm.resize(1024 * (stereo ? 2 : 1));
+		for (size_t i = 0; i < pcm.size(); ++i)
+			pcm[i] = static_cast<int16_t>(std::sin(i * 0.071) * 16384);
+		bank.regions[0].pcm = pcm.data();
+		bank.regions[0].channels = stereo ? 2 : 1;
+		for (uint32_t interval : {1u, 9u, 64u, 256u, 1024u})
+		{
+			safsyn::SynthEngine engine(48000, capacity);
+			engine.set_voice_model(safsyn::VoiceModel::Cohorts, capacity);
+			engine.set_render_threads(threads);
+			if (std::string_view(mode) == "analytic")
+			{
+				safsyn::PhaseSettings phase;
+				phase.mode = safsyn::PhaseMode::Analytic;
+				engine.set_phase_settings(phase);
+			}
+			engine.set_soundfont(&bank);
+			for (uint64_t ordinal = 0; ordinal < capacity; ++ordinal)
+				start_distinct(engine, ordinal, 7);
+			std::vector<float> audio(2048);
+			auto run = [&] {
+				for (uint32_t cursor = 0; cursor < 1024; cursor += interval)
+					engine.render_audio(audio.data() + cursor * 2,
+						(std::min)(interval, 1024 - cursor));
+			};
+			run();
+			run();
+			std::vector<double> times;
+			double checksum = 0;
+			for (size_t trial = 0; trial < repetitions; ++trial)
+			{
+				times.push_back(time_ms(run));
+				for (float sample : audio) checksum += sample;
+			}
+			std::sort(times.begin(), times.end());
+			std::cout << mode << ',' << capacity << ',' << engine.render_threads()
+				<< ',' << interval << ',' << std::fixed << std::setprecision(6)
+				<< times[times.size() / 2] << ',' << times.front() << ','
+				<< times.back() << ',' << checksum << '\n';
+		}
+	}
+	return 0;
+}
 }
 
 int main(int argc, char** argv)
 {
+	if (argc > 1 && std::string_view(argv[1]) == "--matrix")
+		return interval_matrix(argc, argv);
 	const uint64_t iterations = argc > 1 ? std::stoull(argv[1]) : 50000;
 	const size_t render_threads = argc > 2 ? static_cast<size_t>(std::stoull(argv[2])) : 12;
 	constexpr size_t capacity = 4096;

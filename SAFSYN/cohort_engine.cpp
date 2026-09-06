@@ -4,10 +4,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
-#include <condition_variable>
 #include <limits>
-#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -22,6 +21,27 @@ namespace safsyn
 namespace
 {
 constexpr uint32_t invalid_index = (std::numeric_limits<uint32_t>::max)();
+
+// Briefly wait in userspace for dense event intervals, then park idle workers.
+// Acquire observes the job payload (or the completed audio) published by release.
+uint64_t wait_for_change(std::atomic<uint64_t>& value, uint64_t previous) noexcept
+{
+	for (unsigned spin = 0; spin < 256; ++spin)
+	{
+		const uint64_t current = value.load(std::memory_order_acquire);
+		if (current != previous) return current;
+#if defined(_M_X64) || defined(__SSE2__)
+		_mm_pause();
+#endif
+	}
+	uint64_t current;
+	do
+	{
+		value.wait(previous, std::memory_order_acquire);
+		current = value.load(std::memory_order_acquire);
+	} while (current == previous);
+	return current;
+}
 
 float pcm_to_float(int16_t sample) noexcept
 {
@@ -274,6 +294,64 @@ struct RenderCohort
 	PhaseAggregate phase;
 };
 
+#if defined(_M_X64) || defined(__SSE2__)
+// Four independent output frames, with the original sequential double position
+// updates and float operation order. Stop before any loop/sample boundary so
+// the general renderer retains all wrapping and retirement decisions.
+template<bool Stereo, bool Planar = false>
+uint32_t render_coherent_sustain(RenderCohort& cohort, float* out, uint32_t frames,
+	double increment, bool valid_loop, float amplitude) noexcept
+{
+	const auto& region = *cohort.region;
+	const double end = valid_loop ? region.loop_end : region.pcm_len;
+	const __m128 scale = _mm_set1_ps(1.0f / 32768.0f);
+	const __m128 gain_l = _mm_set1_ps(cohort.gain_l);
+	const __m128 gain_r = _mm_set1_ps(cohort.gain_r);
+	const __m128 amp = _mm_set1_ps(amplitude);
+	uint32_t frame = 0;
+	for (; frames - frame >= 4; frame += 4)
+	{
+		const double p0 = cohort.pos;
+		const double p1 = p0 + increment;
+		const double p2 = p1 + increment;
+		const double p3 = p2 + increment;
+		const double p4 = p3 + increment;
+		if (!(p0 >= 0.0 && p3 < end - 1.0 && p4 < end)) break;
+		const uint32_t i0 = static_cast<uint32_t>(p0);
+		const uint32_t i1 = static_cast<uint32_t>(p1);
+		const uint32_t i2 = static_cast<uint32_t>(p2);
+		const uint32_t i3 = static_cast<uint32_t>(p3);
+		const __m128 fraction = _mm_setr_ps(static_cast<float>(p0 - i0),
+			static_cast<float>(p1 - i1), static_cast<float>(p2 - i2),
+			static_cast<float>(p3 - i3));
+		constexpr size_t stride = Stereo && !Planar ? 2 : 1;
+		auto interpolate = [&](const int16_t* pcm) {
+			const __m128 first = _mm_mul_ps(scale, _mm_cvtepi32_ps(_mm_setr_epi32(
+				pcm[size_t{i0} * stride], pcm[size_t{i1} * stride],
+				pcm[size_t{i2} * stride], pcm[size_t{i3} * stride])));
+			const __m128 second = _mm_mul_ps(scale, _mm_cvtepi32_ps(_mm_setr_epi32(
+				pcm[(size_t{i0} + 1) * stride], pcm[(size_t{i1} + 1) * stride],
+				pcm[(size_t{i2} + 1) * stride], pcm[(size_t{i3} + 1) * stride])));
+			return _mm_add_ps(first, _mm_mul_ps(_mm_sub_ps(second, first), fraction));
+		};
+		const __m128 sample_l = interpolate(region.pcm);
+		__m128 sample_r = sample_l;
+		if constexpr (Stereo)
+			sample_r = interpolate(Planar ? region.pcm_right : region.pcm + 1);
+		const __m128 left = _mm_mul_ps(_mm_mul_ps(sample_l, gain_l), amp);
+		const __m128 right = _mm_mul_ps(_mm_mul_ps(sample_r, gain_r), amp);
+		float* destination = out + static_cast<size_t>(frame) * 2;
+		_mm_storeu_ps(destination, _mm_add_ps(_mm_loadu_ps(destination),
+			_mm_unpacklo_ps(left, right)));
+		_mm_storeu_ps(destination + 4, _mm_add_ps(_mm_loadu_ps(destination + 4),
+			_mm_unpackhi_ps(left, right)));
+		cohort.pos = p4;
+		cohort.env = region.sustain;
+	}
+	return frame;
+}
+#endif
+
 struct CohortSlot
 {
 	RenderCohort cohort;
@@ -324,26 +402,36 @@ struct CohortEngineState
 
 	struct ParallelRenderState
 	{
-		std::mutex mutex;
-		std::condition_variable job_ready;
-		std::condition_variable job_finished;
+		// No shared completion counter: each lane owns its acknowledgement.
+		// Separate cache lines keep unrelated workers from invalidating it.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4324) // Intentional cache-line separation of worker signals.
+#endif
+		struct alignas(64) Signal
+		{
+			std::atomic<uint64_t> requested{0};
+			std::atomic<uint64_t> completed{0};
+		};
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+		static constexpr uint64_t stop_epoch = (std::numeric_limits<uint64_t>::max)();
+		std::array<Signal, 64> signals;
 		std::vector<std::jthread> workers;
 		std::vector<RenderScratch> scratch;
 		SynthEngine* owner = nullptr;
 		uint32_t frames = 0;
 		size_t slot_count = 0;
 		uint64_t epoch = 0;
-		size_t completed = 0;
-		bool stopping = false;
 
 		~ParallelRenderState()
 		{
+			for (size_t lane = 1; lane <= workers.size(); ++lane)
 			{
-				const std::lock_guard lock(mutex);
-				stopping = true;
-				++epoch;
+				signals[lane].requested.store(stop_epoch, std::memory_order_release);
+				signals[lane].requested.notify_one();
 			}
-			job_ready.notify_all();
 			workers.clear();
 		}
 	};
@@ -1190,32 +1278,27 @@ struct CohortEngineState
 			for (size_t lane = 1; lane < thread_count; ++lane)
 				state->workers.emplace_back([this, shared = state.get(), lane] {
 					uint64_t observed_epoch = 0;
+					auto& signal = shared->signals[lane];
 					for (;;)
 					{
-						std::unique_lock lock(shared->mutex);
-						shared->job_ready.wait(lock, [&] {
-							return shared->stopping || shared->epoch != observed_epoch;
-						});
-						if (shared->stopping)
+						observed_epoch = wait_for_change(signal.requested, observed_epoch);
+						if (observed_epoch == ParallelRenderState::stop_epoch)
 							return;
-						observed_epoch = shared->epoch;
 						SynthEngine* owner = shared->owner;
 						const uint32_t frames = shared->frames;
 						const size_t slot_count = shared->slot_count;
 						const size_t lanes = shared->scratch.size();
 						const size_t begin = slot_count * lane / lanes;
 						const size_t end = slot_count * (lane + 1) / lanes;
-						lock.unlock();
 
 						auto& scratch = shared->scratch[lane];
+						std::fill_n(scratch.audio.data(), static_cast<size_t>(frames) * 2, 0.0f);
 						render_range(*owner, scratch.audio.data(), frames,
 							static_cast<uint32_t>(begin), static_cast<uint32_t>(end),
 							&scratch.retired);
 
-						lock.lock();
-						++shared->completed;
-						if (shared->completed == shared->workers.size())
-							shared->job_finished.notify_one();
+						signal.completed.store(observed_epoch, std::memory_order_release);
+						signal.completed.notify_one();
 					}
 				});
 			parallel_render = std::move(state);
@@ -1234,6 +1317,20 @@ struct CohortEngineState
 	void render_range(SynthEngine& owner, float* out, uint32_t frames,
 		uint32_t begin, uint32_t end, std::vector<uint32_t>* retired) noexcept
 	{
+		// Tiny event intervals must not pay for SIMD eligibility or setup.
+		if (frames == 1)
+			render_range_impl<false, true>(owner, out, frames, begin, end, retired);
+		else if (frames >= 4)
+			render_range_impl<true>(owner, out, frames, begin, end, retired);
+		else
+			render_range_impl<false>(owner, out, frames, begin, end, retired);
+	}
+
+	template<bool Vectorize, bool SingleFrame = false>
+	void render_range_impl(SynthEngine& owner, float* out, uint32_t frames,
+		uint32_t begin, uint32_t end, std::vector<uint32_t>* retired) noexcept
+	{
+		if constexpr (SingleFrame) frames = 1;
 		for (uint32_t cohort_index = begin; cohort_index < end; ++cohort_index)
 		{
 			auto& slot = cohorts[cohort_index];
@@ -1256,8 +1353,33 @@ struct CohortEngineState
 				region.loop_end <= region.pcm_len && region.loop_end - region.loop_start >= 2;
 			const bool coherent_phase = cohort.phase.transformed_count == 0;
 			const double coherent_count = static_cast<double>(cohort.phase.coherent_count);
+			// Grouped cohorts retain their double multiplicity arithmetic. Phase,
+			// changing envelopes and ping-pong playback use the general kernel.
+#if defined(_M_X64) || defined(__SSE2__)
+			const bool vector_sustain = Vectorize && coherent_phase && coherent_count == 1.0 &&
+				cohort.loop_dir_fwd && region.loop_mode != LoopMode::PingPong;
+#endif
 			for (uint32_t frame = 0; frame < frames && slot.occupied; ++frame)
 			{
+#if defined(_M_X64) || defined(__SSE2__)
+				if (vector_sustain && cohort.stage == CohortStage::Sustain && frames - frame >= 4)
+				{
+					const float sustain_amplitude = region.sustain * channel.volume *
+						channel.expression * owner.master_volume_;
+					float* destination = out + static_cast<size_t>(frame) * 2;
+					const uint32_t count = frames - frame;
+					if (region.channels != 2)
+						frame += render_coherent_sustain<false>(cohort, destination,
+							count, increment, valid_loop, sustain_amplitude);
+					else if (region.pcm_right)
+						frame += render_coherent_sustain<true, true>(cohort, destination,
+							count, increment, valid_loop, sustain_amplitude);
+					else
+						frame += render_coherent_sustain<true>(cohort, destination,
+							count, increment, valid_loop, sustain_amplitude);
+					if (frame == frames) break;
+				}
+#endif
 				if (cohort.pos < 0.0 || cohort.pos >= region.pcm_len)
 				{
 					retire();
@@ -1351,7 +1473,6 @@ struct CohortEngineState
 			{
 				auto& scratch = state.scratch[lane];
 				scratch.audio.resize(samples);
-				std::fill(scratch.audio.begin(), scratch.audio.end(), 0.0f);
 				scratch.retired.clear();
 				const size_t begin = slot_count * lane / state.scratch.size();
 				const size_t end = slot_count * (lane + 1) / state.scratch.size();
@@ -1363,24 +1484,23 @@ struct CohortEngineState
 			return false;
 		}
 
+		state.owner = &owner;
+		state.frames = frames;
+		state.slot_count = slot_count;
+		const uint64_t previous_epoch = state.epoch;
+		// Reserve the sentinel and retain distinct consecutive generations on wrap.
+		if (++state.epoch == ParallelRenderState::stop_epoch) state.epoch = 1;
+		for (size_t lane = 1; lane < state.scratch.size(); ++lane)
 		{
-			const std::lock_guard lock(state.mutex);
-			state.owner = &owner;
-			state.frames = frames;
-			state.slot_count = slot_count;
-			state.completed = 0;
-			++state.epoch;
+			state.signals[lane].requested.store(state.epoch, std::memory_order_release);
+			state.signals[lane].requested.notify_one();
 		}
-		state.job_ready.notify_all();
 		const size_t main_end = slot_count / state.scratch.size();
+		std::fill_n(state.scratch[0].audio.data(), samples, 0.0f);
 		render_range(owner, state.scratch[0].audio.data(), frames, 0,
 			static_cast<uint32_t>(main_end), &state.scratch[0].retired);
-		{
-			std::unique_lock lock(state.mutex);
-			state.job_finished.wait(lock, [&] {
-				return state.completed == state.workers.size();
-			});
-		}
+		for (size_t lane = 1; lane < state.scratch.size(); ++lane)
+			wait_for_change(state.signals[lane].completed, previous_epoch);
 
 		std::fill(out, out + samples, 0.0f);
 		for (const auto& scratch : state.scratch)

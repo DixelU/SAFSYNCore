@@ -1,9 +1,12 @@
 #include "core.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <thread>
 #include <vector>
 
 namespace
@@ -537,6 +540,107 @@ void test_parallel_cohort_render()
 		repeat.active_voice_count() == 0,
 		"threaded rendering retires and clears cohorts on the serial owner thread");
 }
+
+void test_coherent_vector_boundaries()
+{
+	for (int layout = 0; layout < 3; ++layout)
+	for (auto loop : {safsyn::LoopMode::None, safsyn::LoopMode::Forward,
+		safsyn::LoopMode::Sustain, safsyn::LoopMode::PingPong})
+	for (uint32_t block : {4u, 5u, 9u, 64u})
+	{
+		auto bank = layout == 2 ? make_linked_stereo_bank(4000) : make_bank(4000, layout == 1);
+		auto& region = bank.regions[0];
+		region.loop_mode = loop;
+		region.loop_start = 5;
+		region.loop_end = 43;
+		region.attack = 0.001f;
+		region.hold = 0.001f;
+		region.decay = 0.001f;
+		region.sustain = 0.73f;
+		region.release = 0.006f;
+		region.fine_tune = 19;
+		safsyn::SynthEngine reference(4000, 16), singles(4000, 16), vectorized(4000, 16);
+		for (auto* engine : {&reference, &singles, &vectorized})
+		{
+			if (engine != &reference) engine->set_voice_model(safsyn::VoiceModel::Cohorts, 16);
+			engine->set_soundfont(&bank);
+			engine->set_master_volume(11001);
+			engine->control_change(0, 7, 83);
+			engine->control_change(0, 11, 91);
+			for (uint8_t note : {uint8_t{48}, uint8_t{61}, uint8_t{83}, uint8_t{127}})
+				engine->note_on(0, note, 91);
+		}
+		for (uint32_t segment = 0; segment < 3; ++segment)
+		{
+			if (segment == 1)
+				for (auto* engine : {&reference, &singles, &vectorized})
+					engine->set_pitch_bend(0, 10201);
+			if (segment == 2)
+				for (auto* engine : {&reference, &singles, &vectorized})
+					engine->control_change(0, 123, 0);
+			const auto expected = render(reference, 137, 1);
+			const auto scalar = render(singles, 137, 1);
+			const auto actual = render(vectorized, 137, block);
+			check(expected == scalar && scalar == actual,
+				"coherent SIMD keeps exact samples across layouts, loop/envelope boundaries and tails");
+			check(reference.active_voice_count() == vectorized.active_voice_count(),
+				"coherent SIMD keeps exact sample retirement timing");
+		}
+	}
+}
+
+void test_worker_handoff_lifecycle()
+{
+	constexpr uint32_t count = 1024;
+	auto bank = make_linked_stereo_bank(4000);
+	safsyn::SynthEngine scalar(4000, count), parallel(4000, count), repeat(4000, count);
+	for (auto* engine : {&scalar, &parallel, &repeat})
+	{
+		engine->set_voice_model(safsyn::VoiceModel::Cohorts, count);
+		engine->set_soundfont(&bank);
+	}
+	for (size_t threads : {2u, 5u, 16u})
+	for (auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::Analytic})
+	{
+		parallel.set_render_threads(threads);
+		repeat.set_render_threads(threads);
+		for (auto* engine : {&scalar, &parallel, &repeat})
+		{
+			engine->reset();
+			safsyn::PhaseSettings phase;
+			phase.mode = mode;
+			engine->set_phase_settings(phase);
+			engine->prepare_playback(9);
+			for (uint32_t i = 0; i < count; ++i)
+			{
+				engine->control_change(0, 1, static_cast<uint8_t>(i & 127));
+				engine->note_on(0, static_cast<uint8_t>(40 + i % 48), 87);
+			}
+		}
+		for (uint32_t job = 0; job < 80; ++job)
+		{
+			// Alternate scalar fallback and worker jobs; grow beyond preparation,
+			// exercise odd SIMD tails, then let parked workers wake again.
+			const uint32_t frames = std::array{1u, 9u, 65u, 13u}[job % 4];
+			if (job == 40) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+			if (job == 60)
+				for (auto* engine : {&scalar, &parallel, &repeat})
+					engine->control_change(0, 123, 0);
+			const auto expected = render(scalar, frames);
+			const auto actual = render(parallel, frames);
+			const auto repeated = render(repeat, frames);
+			check(actual == repeated && close_audio(expected, actual),
+				"worker generations publish complete, deterministic audio across reuse and resize");
+			check(scalar.active_voice_count() == parallel.active_voice_count() &&
+				parallel.active_voice_count() == repeat.active_voice_count(),
+				"worker retirement is visible before the next owner event");
+		}
+		check(parallel.stats().parallel_render_calls > 0 && parallel.active_voice_count() == 0,
+			"handoff stress exercises workers and drains all release cohorts");
+	}
+	parallel.set_render_threads(1);
+	repeat.set_render_threads(1);
+}
 }
 
 int main()
@@ -550,6 +654,8 @@ int main()
 	test_block_and_seed_determinism();
 	test_safety_limit_stealing();
 	test_parallel_cohort_render();
+	test_coherent_vector_boundaries();
+	test_worker_handoff_lifecycle();
 	test_prepared_region_index();
 	if (failures != 0)
 	{
