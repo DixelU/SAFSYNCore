@@ -180,6 +180,61 @@ void live_recovery_test()
 	synth.stop(); check(synth.finished(), "stop did not join producer");
 	check(!synth.enqueue_short_message(0x00643c90), "stopped synth accepts events");
 }
+void file_sender_backpressure_test()
+{
+	using Result = safsyn::MidiEnqueueResult;
+	auto config = options(); config.midi_queue_capacity = 4;
+	safsyn::BufferedSynth synth(bank(), config);
+	check(synth.try_enqueue_short_message(0x00643c90) == Result::Queued, "file sender note rejected");
+	synth.start(); await([&] { return synth.ready(); });
+	check(synth.stats().active_voices == 1, "held carrier did not start");
+	// The undrained audio ring keeps the producer blocked. Saturate the MIDI
+	// queue with automation while that carrier is still held.
+	for (uint32_t message : {0x000007b0u, 0x007f07b0u, 0x00400bb0u, 0x007f0ab0u})
+		check(synth.try_enqueue_short_message(message) == Result::Queued, "automation rejected early");
+	constexpr uint32_t bend = 0x007f7fe0;
+	for (size_t i = 0; i < 32; ++i)
+		check(synth.try_enqueue_short_message(bend) == Result::Full, "full queue did not request retry");
+	std::array<float, 128> audio{};
+	await([&] {
+		synth.read_audio(audio.data(), 64);
+		return synth.stats().scheduled_events == 5;
+	});
+	check(synth.try_enqueue_short_message(bend) == Result::Queued, "file event retry failed");
+	await([&] {
+		synth.read_audio(audio.data(), 64);
+		return synth.stats().scheduled_events == 6;
+	});
+	bool heard_panned_carrier = false;
+	for (size_t i = 0; i < 32; ++i)
+	{
+		await([&] { return synth.stats().buffered_frames >= 64; });
+		synth.read_audio(audio.data(), 64);
+		double left = 0, right = 0;
+		for (size_t frame = 0; frame < 64; ++frame)
+		{
+			check(std::isfinite(audio[frame * 2]) && std::isfinite(audio[frame * 2 + 1]),
+				"retried automation produced non-finite audio");
+			left += std::abs(audio[frame * 2]); right += std::abs(audio[frame * 2 + 1]);
+		}
+		// CC10=127 leaves the fine-pan LSB at zero, just short of hard right.
+		heard_panned_carrier |= right > 0.001 && left < right * 0.02;
+	}
+	const auto stats = synth.stats();
+	check(heard_panned_carrier && stats.active_voices == 1,
+		"queue saturation erased the held note or its later automation");
+	check(stats.rejected_midi_events == 0 && stats.midi_recoveries == 0 && stats.scheduled_events == 6,
+		"retrying a full queue lost, duplicated, or invalidated MIDI events");
+	check(synth.try_enqueue_short_message(0x00003c80) == Result::Queued, "final note-off rejected");
+	await([&] { synth.read_audio(audio.data(), 64); return synth.stats().active_voices == 0; });
+	synth.request_stop();
+	check(synth.try_enqueue_short_message(bend) == Result::Unavailable,
+		"stopped sender must terminate retries instead of reporting full");
+	synth.stop();
+	safsyn::BufferedSynth scheduled(bank(), config, file(1));
+	check(scheduled.try_enqueue_short_message(bend) == Result::Unavailable,
+		"direct SMF playback accepted live file-sender input");
+}
 void phase_preparation_test()
 {
 	for (auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::RandomPolarity,
@@ -244,7 +299,7 @@ int main()
 	try
 	{
 		queue_test(); ring_test(); file_timing_test(); parallel_test(); live_recovery_test(); lifecycle_and_limiter_test();
-		phase_preparation_test();
+		file_sender_backpressure_test(); phase_preparation_test();
 		std::cout << "Playback: concurrent queues, sample timing, dense bursts, workers, overflow, underruns, limiter, lifecycle passed\n";
 		return 0;
 	}

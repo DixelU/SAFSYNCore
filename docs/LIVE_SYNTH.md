@@ -182,6 +182,33 @@ file mode for reliable black MIDI scheduling.
   seconds of tail. The limiter is flushed, then the device buffer drains
   before stopping. Tail completion has render-block granularity.
 
+### External file senders
+
+Hosts that schedule file events themselves can use
+`BufferedSynth::try_enqueue_short_message` or
+`WindowsSynth::try_send_short_message`. `Full` leaves the queue, controller
+state, and held voices intact; the host retains and retries that same event
+before advancing to the next one. `Unavailable` ends retries when the session
+has stopped or uses the direct SMF scheduler. Capacity waits belong on the
+host's sender thread, with cancellation checks, never on an audio callback.
+The existing nonblocking live-input methods still report lost input and request
+panic recovery on overflow.
+
+The SAFC integration uses this retry path for both timed playback and seeking.
+A local headless live-queue replay of `Hypernova.mid` through
+`sDetrimental Concert Grand Piano.sf2` reproduced the ending cutoff with the
+former input method: 9,307,480 rejected events and 145 recovery resets erased
+the held carriers. Both passes used coherent phase, 4,096 cohorts, automatic
+render threads, 48 kHz, 100 ms buffering, -12 dB gain, and the -1 dB limiter.
+With retries, all 124,550,232 channel events were dispatched with zero rejected
+events, zero recovery resets, and zero safety clamps. The 125-second audio bin
+had RMS 0.02842, versus 0.0000003501 before the fix; the later decay remained
+audible in the measured output. These are software audio measurements from
+2026-09-06, not WASAPI or listening validation. The automated playback suite
+also saturates a four-entry queue while holding a note, retries automation,
+checks the resulting stereo audio, and verifies note release and stopped-session
+handling.
+
 ## Build and validation
 
 Use the repository's CMake instructions. The standalone host does not depend

@@ -422,6 +422,12 @@ bool WindowsSynth::send_short_message(uint32_t message) noexcept
 	std::lock_guard lock(impl_->mutex);
 	return impl_->synth && impl_->synth->enqueue_short_message(message);
 }
+MidiEnqueueResult WindowsSynth::try_send_short_message(uint32_t message) noexcept
+{
+	std::lock_guard lock(impl_->mutex);
+	return impl_->synth ? impl_->synth->try_enqueue_short_message(message)
+		: MidiEnqueueResult::Unavailable;
+}
 void WindowsSynth::panic() noexcept
 {
 	std::lock_guard lock(impl_->mutex);

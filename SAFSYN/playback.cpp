@@ -270,10 +270,17 @@ struct BufferedSynth::Impl
 		finished.store(true, std::memory_order_release);
 		ready.store(true, std::memory_order_release);
 	}
+	MidiEnqueueResult try_enqueue(uint32_t message, bool master) noexcept
+	{
+		if (midi || stopping.load() || finished.load()) return MidiEnqueueResult::Unavailable;
+		return events.push({generation.load(std::memory_order_acquire), message, master})
+			? MidiEnqueueResult::Queued : MidiEnqueueResult::Full;
+	}
 	bool enqueue(uint32_t message, bool master) noexcept
 	{
-		if (midi || stopping.load() || finished.load()) return false;
-		if (events.push({generation.load(std::memory_order_acquire), message, master})) return true;
+		const auto result = try_enqueue(message, master);
+		if (result == MidiEnqueueResult::Queued) return true;
+		if (result == MidiEnqueueResult::Unavailable) return false;
 		rejected.fetch_add(1, std::memory_order_relaxed);
 		generation.fetch_add(1, std::memory_order_release);
 		return false;
@@ -295,6 +302,8 @@ void BufferedSynth::request_stop() noexcept
 }
 void BufferedSynth::stop() noexcept { request_stop(); if (impl_->producer.joinable()) impl_->producer.join(); }
 bool BufferedSynth::enqueue_short_message(uint32_t message) noexcept { return impl_->enqueue(message, false); }
+MidiEnqueueResult BufferedSynth::try_enqueue_short_message(uint32_t message) noexcept
+{ return impl_->try_enqueue(message, false); }
 bool BufferedSynth::enqueue_master_volume(uint16_t value) noexcept { return impl_->enqueue(value & 16383, true); }
 void BufferedSynth::panic() noexcept { impl_->generation.fetch_add(1, std::memory_order_release); }
 void BufferedSynth::report_input_loss() noexcept { impl_->rejected.fetch_add(1); panic(); }
