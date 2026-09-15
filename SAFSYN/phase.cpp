@@ -749,7 +749,7 @@ bool PhaseProcessor::prepare(std::span<const SampleRegion> regions, const PhaseP
 			throw std::length_error("Phase cache needs " +
 				std::to_string(progress.total_cache_bytes / 1048576 + (progress.total_cache_bytes % 1048576 != 0)) +
 				" MiB; the limit is " + std::to_string(options.maximum_cache_bytes / 1048576) +
-				" MiB. Reduce the phase pool, choose analytic/coherent mode, or raise the cache limit. FFT working memory is extra.");
+				" MiB. Reduce the phase pool, choose Analytic or Direct sampling mode, or raise the cache limit. FFT working memory is extra.");
 		for (const size_t id : unique_regions)
 		{
 			check_cancel(options.stop);

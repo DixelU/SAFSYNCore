@@ -440,7 +440,13 @@ WindowsSynthStats WindowsSynth::stats() const
 	{ std::lock_guard lock(impl_->mutex); playback = impl_->synth; result.status = impl_->status; result.error = impl_->error; }
 	if (playback) result.playback = playback->stats();
 	result.running = impl_->running.load(std::memory_order_acquire);
-	if (result.running && result.playback.preparing && result.error.empty()) result.status = L"Preparing phase cache...";
+	if (result.running && result.playback.preparing && result.error.empty())
+	{
+		const auto& preparation = result.playback.preparation;
+		result.status = preparation.total == 0 ? L"Preparing audio engine..." :
+			L"Prerendering sample variants " + std::to_wstring(preparation.completed) +
+			L"/" + std::to_wstring(preparation.total) + L"...";
+	}
 	result.device_buffer_frames = impl_->device_frames.load();
 	result.empty_device_buffers = impl_->empty_buffers.load();
 	return result;

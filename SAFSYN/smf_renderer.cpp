@@ -160,6 +160,7 @@ bool render_timed_midi_pcm(uint64_t duration_frames,
 		uint64_t next_progress_frame = 0;
 		uint64_t next_progress_event = 16'384;
 		SmfRenderProgressStage progress_stage = SmfRenderProgressStage::Preparing;
+		PhasePreparationProgress phase_preparation;
 
 		auto report_progress = [&](SmfRenderProgressStage stage,
 			uint64_t completed, uint64_t total) -> bool {
@@ -167,7 +168,7 @@ bool render_timed_midi_pcm(uint64_t duration_frames,
 				return true;
 			return options.progress_callback({stage, completed, total,
 				result.scheduled_events, engine.active_voice_count(),
-				engine.active_cohort_count(), result.raw_peak},
+				engine.active_cohort_count(), result.raw_peak, phase_preparation},
 				options.progress_user_data);
 		};
 
@@ -195,7 +196,7 @@ bool render_timed_midi_pcm(uint64_t duration_frames,
 		PhasePreparationOptions preparation;
 		preparation.stop = preparation_stop.get_token();
 		preparation.progress = [&](const PhasePreparationProgress& progress) {
-			(void)progress;
+			phase_preparation = progress;
 			if (!report_progress(SmfRenderProgressStage::Preparing, 0, expected_frames))
 			{
 				preparation_cancelled = true;

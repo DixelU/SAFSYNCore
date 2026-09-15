@@ -30,6 +30,9 @@ struct SmfRenderProgress
 	size_t active_voices = 0;
 	size_t active_cohorts = 0;
 	float raw_peak = 0.0f;
+	// Sample transforms prepared before the audio timeline starts. Frames above
+	// retain their audio-frame units during this stage.
+	PhasePreparationProgress preparation;
 };
 
 // Return false to stop rendering. A cancelled render is finalized as a valid
