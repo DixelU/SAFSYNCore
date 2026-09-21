@@ -54,6 +54,7 @@ struct TimedMidiEvent
 	TimedMidiEventKind kind = TimedMidiEventKind::Ignored;
 	uint32_t short_message = 0;
 	uint16_t master_volume = 0;
+	std::optional<uint64_t> tick; // Phase identity before sample-time quantization.
 };
 
 // Return false at the end of the source. Events must be returned in

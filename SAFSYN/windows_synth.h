@@ -49,7 +49,8 @@ public:
 	void request_stop() noexcept;
 	void stop() noexcept;
 	bool send_short_message(uint32_t message) noexcept;
-	MidiEnqueueResult try_send_short_message(uint32_t message) noexcept;
+	MidiEnqueueResult try_send_short_message(uint32_t message,
+		std::optional<uint64_t> tick = {}) noexcept;
 	void panic() noexcept;
 	WindowsSynthStats stats() const;
 private:

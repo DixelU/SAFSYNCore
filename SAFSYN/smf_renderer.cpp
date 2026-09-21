@@ -63,6 +63,7 @@ bool next_smf_event(TimedMidiEvent& output, void* user_data) noexcept
 
 		output = {};
 		output.frame = scheduled.sample;
+		output.tick = scheduled.event.tick;
 		if (scheduled.event.kind == SmfEventKind::Channel)
 		{
 			output.kind = TimedMidiEventKind::ShortMessage;
@@ -281,10 +282,11 @@ bool render_timed_midi_pcm(uint64_t duration_frames,
 		TimedMidiEvent scheduled;
 		bool has_event = next_event(scheduled, next_event_user_data);
 		std::vector<uint32_t> sample_messages;
+		std::optional<uint64_t> batch_tick;
 		auto dispatch_messages = [&]() {
 			if (sample_messages.empty())
 				return;
-			engine.consume_short_messages(sample_messages.data(), sample_messages.size());
+			engine.consume_short_messages(sample_messages.data(), sample_messages.size(), batch_tick);
 			result.dispatched_channel_events += sample_messages.size();
 			sample_messages.clear();
 		};
@@ -312,6 +314,11 @@ bool render_timed_midi_pcm(uint64_t duration_frames,
 			sample_messages.clear();
 			while (has_event && scheduled.frame == event_frame && scheduled.frame < limit)
 			{
+				if (scheduled.tick != batch_tick)
+				{
+					dispatch_messages();
+					batch_tick = scheduled.tick;
+				}
 				++result.scheduled_events;
 				switch (scheduled.kind)
 				{

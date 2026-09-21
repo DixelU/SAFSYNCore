@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -167,7 +168,10 @@ public:
 	void set_master_volume(uint16_t value14) noexcept;
 	void consume_short_message(uint32_t packed_message) noexcept;
 	// Stable-order dispatch that combines only consecutive compatible note runs.
-	void consume_short_messages(const uint32_t* packed_messages, size_t count) noexcept;
+	// A source tick keeps analytic unisons coherent across queue/render boundaries.
+	// Untimestamped callers use the current audio frame as the onset identity.
+	void consume_short_messages(const uint32_t* packed_messages, size_t count,
+		std::optional<uint64_t> tick = {}) noexcept;
 	void render_audio(float* interleaved_stereo, uint32_t frames) noexcept;
 	void set_phase_settings(const PhaseSettings& settings) noexcept;
 	// Precompute phase PCM and reserve finite cohort/worker storage before playback.
@@ -268,6 +272,7 @@ private:
 	ChannelState channels_[16] = {};
 	uint32_t sample_rate_ = 48000;
 	uint64_t next_serial_ = 1;
+	std::optional<uint64_t> midi_tick_;
 	bool all_regions_mode_ = false;
 	float master_volume_ = 1.0f;
 	VoiceModel voice_model_ = VoiceModel::Individual;

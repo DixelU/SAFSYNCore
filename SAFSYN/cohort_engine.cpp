@@ -377,7 +377,7 @@ struct LogicalBatch
 	uint64_t first_serial = 0;
 	uint64_t held = 0;
 	uint64_t sustained = 0;
-	uint64_t onset_frame = 0;
+	uint64_t onset_identity = 0;
 	bool one_shot_blocking = false;
 	bool one_shot_release_applied = false;
 	bool one_shot_release_pending = false;
@@ -869,14 +869,16 @@ struct CohortEngineState
 
 	PhaseAggregate make_phase_aggregate(SynthEngine& owner, const SampleRegion& region,
 		size_t region_id, uint64_t first_serial, uint64_t count, uint8_t channel,
-		uint8_t note, bool assignment)
+		uint8_t note, uint64_t onset_identity, bool assignment)
 	{
 		PhaseAggregate aggregate;
 		for (uint64_t offset = 0; offset < count; ++offset)
 		{
+			const uint64_t phase_identity = owner.phase_settings().mode == PhaseMode::Analytic
+				? onset_identity : first_serial + offset;
 			const auto state = assignment
-				? owner.phase_processor_.assign(region, region_id, first_serial + offset, channel, note)
-				: owner.phase_processor_.reconstruct(region, region_id, first_serial + offset,
+				? owner.phase_processor_.assign(region, region_id, phase_identity, channel, note)
+				: owner.phase_processor_.reconstruct(region, region_id, phase_identity,
 					channel, note);
 			aggregate.add(state);
 		}
@@ -896,7 +898,7 @@ struct CohortEngineState
 				source.stage == CohortStage::Release)
 				continue;
 			PhaseAggregate contribution = make_phase_aggregate(owner, *source.region,
-				link.region_id, first_serial, count, batch.channel, batch.note, false);
+				link.region_id, first_serial, count, batch.channel, batch.note, batch.onset_identity, false);
 			RenderCohort released = source;
 			released.phase = contribution;
 			released.release_target = {};
@@ -986,7 +988,7 @@ struct CohortEngineState
 		batch.velocity = velocity;
 		batch.first_serial = first_serial;
 		batch.held = count;
-		batch.onset_frame = owner.stats_.rendered_frames;
+		batch.onset_identity = owner.midi_tick_.value_or(owner.stats_.rendered_frames);
 		batch.one_shot_blocking = std::any_of(regions.begin(), regions.end(),
 			[](const auto& item) { return item.second->loop_mode == LoopMode::OneShot; });
 		const bool allow_onset_merge = !batch.one_shot_blocking;
@@ -994,7 +996,7 @@ struct CohortEngineState
 		for (const auto& [region_id, region] : regions)
 		{
 			PhaseAggregate aggregate = make_phase_aggregate(owner, *region, region_id,
-				first_serial, count, channel, note, true);
+				first_serial, count, channel, note, batch.onset_identity, true);
 			const OnsetKey key{region, channel, note, velocity};
 			StableHandle handle;
 			auto candidate = onset_candidates.find(key);

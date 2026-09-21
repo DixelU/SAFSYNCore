@@ -130,6 +130,9 @@ public:
 	// Returns false on cancellation; throws on a budget/allocation failure. Call
 	// on the engine owner thread before rendering, not from the audio callback.
 	bool prepare(std::span<const SampleRegion> regions, const PhasePreparationOptions& options = {});
+	// Analytic event_serial is the source tick (or audio frame when untimestamped);
+	// other modes use the logical event serial. Reconstruct must receive the same
+	// identity used at assignment.
 	PhaseVoiceState assign(const SampleRegion& region, uint64_t region_id,
 		uint64_t event_serial, uint8_t channel, uint8_t note) noexcept;
 	// Rebuild an already-assigned logical event contribution without counting a

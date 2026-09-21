@@ -148,6 +148,79 @@ void file_timing_test()
 	for (size_t i = 0; i < (std::min)(audio.size(), other.size()); ++i)
 		check(audio[i] == other[i], "scalar sample sequence changes with producer block size");
 }
+void analytic_tick_queue_test()
+{
+	using Result = safsyn::MidiEnqueueResult;
+	for (bool continuous : {false, true})
+	{
+		auto config = options();
+		config.block_frames = 128; config.buffer_frames = 512;
+		config.midi_queue_capacity = 65538;
+		config.phase.mode = safsyn::PhaseMode::Analytic;
+		config.phase.continuous = continuous;
+		config.phase.seed = 42;
+		auto source = bank();
+		source->regions[0].root_key = 60;
+		safsyn::BufferedSynth synth(source, config);
+		check(synth.try_enqueue_short_message(0x00643c90, 42) == Result::Queued, "first unison queued");
+		// Exceed the per-block dispatch limit: the second unison is consumed one
+		// complete sample loop later, although both notes came from MIDI tick 42.
+		for (size_t i = 0; i < 65535; ++i)
+			check(synth.try_enqueue_short_message(0xfe, 42) == Result::Queued, "burst filler queued");
+		check(synth.try_enqueue_short_message(0x00643c90, 42) == Result::Queued, "second unison queued");
+		synth.start(); await([&] { return synth.ready(); });
+		std::array<float, 512> audio{};
+		check(synth.read_audio(audio.data(), 256) == 256, "two burst blocks rendered");
+		synth.stop();
+		check(synth.stats().error.empty(), "analytic queue render failed");
+		for (size_t i = 0; i < 256; ++i)
+			check(std::abs(audio[i + 256] - 2.0f * audio[i]) < 1e-6f,
+				"same-tick unisons changed phase across a live queue render boundary");
+
+		safsyn::BufferedSynth distinct(source, config);
+		check(distinct.try_enqueue_short_message(0x00643c90, 42) == Result::Queued &&
+			distinct.try_enqueue_short_message(0x00643c90, 43) == Result::Queued,
+			"different-tick notes queued together");
+		distinct.start(); await([&] { return distinct.ready(); });
+		std::array<float, 256> actual{}, expected{};
+		check(distinct.read_audio(actual.data(), 128) == 128, "different-tick block rendered");
+		distinct.stop();
+		safsyn::SynthEngine reference(48000, 16);
+		reference.set_soundfont(source.get()); reference.set_phase_settings(config.phase);
+		const uint32_t message = 0x00643c90;
+		reference.consume_short_messages(&message, 1, 42);
+		reference.consume_short_messages(&message, 1, 43);
+		reference.render_audio(expected.data(), 128);
+		for (size_t i = 0; i < actual.size(); ++i)
+			check(std::abs(actual[i] - expected[i]) < 1e-6f,
+				"queue merged different MIDI ticks into one analytic identity");
+
+		// The built-in SMF player must retain source ticks too, even when two
+		// different ticks quantize to the same scheduled sample.
+		std::vector<uint8_t> bytes{'M','T','h','d',0,0,0,6,0,0,0,1,0x7d,0,'M','T','r','k'};
+		const std::vector<uint8_t> track{0,0x90,60,100,1,0x90,60,100,
+			0x87,0x7f,0x80,60,0,0,0x80,60,0,0,0xff,0x2f,0};
+		append32(bytes, static_cast<uint32_t>(track.size()));
+		bytes.insert(bytes.end(), track.begin(), track.end());
+		auto midi = std::make_shared<safsyn::SmfFile>();
+		check(midi->load_bytes(std::move(bytes)), "different-tick SMF loads");
+		config.sample_rate = 8000;
+		source->regions[0].sample_rate = 8000;
+		safsyn::BufferedSynth scheduled(source, config, midi);
+		scheduled.start();
+		const auto file_audio = collect(scheduled);
+		safsyn::SynthEngine file_reference(8000, 16);
+		file_reference.set_soundfont(source.get()); file_reference.set_phase_settings(config.phase);
+		file_reference.consume_short_messages(&message, 1, 0);
+		file_reference.consume_short_messages(&message, 1, 1);
+		file_reference.render_audio(expected.data(), 128);
+		check(file_audio.size() >= expected.size(), "different-tick SMF rendered its held notes");
+		for (size_t i = 0; i < expected.size(); ++i)
+			check(std::abs(file_audio[i] - expected[i]) < 1e-6f,
+				"buffered SMF player merged distinct tick identities");
+	}
+}
+
 void parallel_test()
 {
 	auto config = options(); config.render_threads = 4; config.mastering.output_gain_db = -12;
@@ -300,6 +373,7 @@ int main()
 	{
 		queue_test(); ring_test(); file_timing_test(); parallel_test(); live_recovery_test(); lifecycle_and_limiter_test();
 		file_sender_backpressure_test(); phase_preparation_test();
+		analytic_tick_queue_test();
 		std::cout << "Playback: concurrent queues, sample timing, dense bursts, workers, overflow, underruns, limiter, lifecycle passed\n";
 		return 0;
 	}

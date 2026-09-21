@@ -51,7 +51,13 @@ PlaybackOptions validated(PlaybackOptions options)
 
 struct BufferedSynth::Impl
 {
-	struct MidiEvent { uint64_t generation; uint32_t message; bool master; };
+	struct MidiEvent
+	{
+		uint64_t generation;
+		uint32_t message;
+		bool master;
+		std::optional<uint64_t> tick;
+	};
 	std::shared_ptr<const Soundfont> bank;
 	std::shared_ptr<const SmfFile> midi;
 	PlaybackOptions options;
@@ -141,6 +147,11 @@ struct BufferedSynth::Impl
 			std::vector<float> block(options.block_frames * 2), output;
 			output.reserve(options.block_frames * 2 + static_cast<size_t>(options.sample_rate / 10) * 2);
 			std::array<uint32_t, 4096> batch{};
+			std::optional<uint64_t> batch_tick;
+			auto dispatch = [&](size_t& count) {
+				engine.consume_short_messages(batch.data(), count, batch_tick);
+				count = 0;
+			};
 			std::optional<ScheduledSmfStream> stream;
 			ScheduledSmfEvent next;
 			bool has_event = false, tail = false;
@@ -190,17 +201,22 @@ struct BufferedSynth::Impl
 					for (size_t i = 0; i < 65536 && !stopping.load() && events.pop(event); ++i)
 					{
 						if (event.generation != applied_generation) continue;
+						if (event.tick != batch_tick)
+						{
+							dispatch(count);
+							batch_tick = event.tick;
+						}
 						if (event.master)
 						{
-							engine.consume_short_messages(batch.data(), count); count = 0;
+							dispatch(count);
 							engine.set_master_volume(static_cast<uint16_t>(event.message));
 						}
 						else batch[count++] = event.message;
 						if (count == batch.size())
-						{ engine.consume_short_messages(batch.data(), count); count = 0; }
+							dispatch(count);
 						++current.scheduled_events;
 					}
-					engine.consume_short_messages(batch.data(), count);
+					dispatch(count);
 				}
 				uint32_t frames = 0;
 				while (frames < options.block_frames && !stopping.load())
@@ -210,22 +226,27 @@ struct BufferedSynth::Impl
 						size_t count = 0;
 						while (has_event && next.sample <= cursor && !stopping.load())
 						{
+							if (next.event.tick != batch_tick)
+							{
+								dispatch(count);
+								batch_tick = next.event.tick;
+							}
 							++current.scheduled_events;
 							if (next.event.kind == SmfEventKind::Channel)
 								batch[count++] = next.event.status | (uint32_t{next.event.data1} << 8) |
 									(uint32_t{next.event.data2} << 16);
 							else if (next.event.kind == SmfEventKind::SystemExclusive)
 							{
-								engine.consume_short_messages(batch.data(), count); count = 0;
+								dispatch(count);
 								uint16_t volume = 0;
 								if (decode_universal_master_volume(*midi, next.event, volume))
 									engine.set_master_volume(volume);
 							}
 							if (count == batch.size())
-							{ engine.consume_short_messages(batch.data(), count); count = 0; }
+								dispatch(count);
 							has_event = stream->next(next);
 						}
-						engine.consume_short_messages(batch.data(), count);
+						dispatch(count);
 					}
 					if (midi && !has_event && !tail)
 					{
@@ -270,10 +291,11 @@ struct BufferedSynth::Impl
 		finished.store(true, std::memory_order_release);
 		ready.store(true, std::memory_order_release);
 	}
-	MidiEnqueueResult try_enqueue(uint32_t message, bool master) noexcept
+	MidiEnqueueResult try_enqueue(uint32_t message, bool master,
+		std::optional<uint64_t> tick = {}) noexcept
 	{
 		if (midi || stopping.load() || finished.load()) return MidiEnqueueResult::Unavailable;
-		return events.push({generation.load(std::memory_order_acquire), message, master})
+		return events.push({generation.load(std::memory_order_acquire), message, master, tick})
 			? MidiEnqueueResult::Queued : MidiEnqueueResult::Full;
 	}
 	bool enqueue(uint32_t message, bool master) noexcept
@@ -302,8 +324,9 @@ void BufferedSynth::request_stop() noexcept
 }
 void BufferedSynth::stop() noexcept { request_stop(); if (impl_->producer.joinable()) impl_->producer.join(); }
 bool BufferedSynth::enqueue_short_message(uint32_t message) noexcept { return impl_->enqueue(message, false); }
-MidiEnqueueResult BufferedSynth::try_enqueue_short_message(uint32_t message) noexcept
-{ return impl_->try_enqueue(message, false); }
+MidiEnqueueResult BufferedSynth::try_enqueue_short_message(uint32_t message,
+	std::optional<uint64_t> tick) noexcept
+{ return impl_->try_enqueue(message, false, tick); }
 bool BufferedSynth::enqueue_master_volume(uint16_t value) noexcept { return impl_->enqueue(value & 16383, true); }
 void BufferedSynth::panic() noexcept { impl_->generation.fetch_add(1, std::memory_order_release); }
 void BufferedSynth::report_input_loss() noexcept { impl_->rejected.fetch_add(1); panic(); }

@@ -133,6 +133,7 @@ void SynthEngine::reset() noexcept
 		channel = ChannelState{};
 	master_volume_ = 1.0f;
 	next_serial_ = 1;
+	midi_tick_.reset();
 	stats_ = {};
 }
 
@@ -419,7 +420,10 @@ void SynthEngine::note_on(uint8_t channel, uint8_t note, uint8_t velocity) noexc
 		voice->channel = channel;
 		voice->base_inc = compute_base_increment(region, note);
 		voice->serial = serial;
-		voice->phase = phase_processor_.assign(region, region_id, serial, channel, note);
+		// Analytic unisons share an onset identity; serials still govern voice lifetime.
+		const uint64_t phase_identity = phase_settings().mode == PhaseMode::Analytic
+			? midi_tick_.value_or(stats_.rendered_frames) : serial;
+		voice->phase = phase_processor_.assign(region, region_id, phase_identity, channel, note);
 		compute_gains(region, channel, velocity, voice->gain_l, voice->gain_r);
 		begin_envelope(*voice);
 		++stats_.started_voices;
@@ -764,10 +768,12 @@ void SynthEngine::consume_short_message(uint32_t message) noexcept
 	}
 }
 
-void SynthEngine::consume_short_messages(const uint32_t* messages, size_t count) noexcept
+void SynthEngine::consume_short_messages(const uint32_t* messages, size_t count,
+	std::optional<uint64_t> tick) noexcept
 {
 	if (!messages || count == 0)
 		return;
+	midi_tick_ = tick;
 	for (size_t index = 0; index < count;)
 	{
 		const uint32_t message = messages[index];
@@ -808,6 +814,7 @@ void SynthEngine::consume_short_messages(const uint32_t* messages, size_t count)
 			note_off_batch(channel, data1, run);
 		index = end;
 	}
+	midi_tick_.reset();
 }
 
 void SynthEngine::render_audio(float* out, uint32_t frames) noexcept

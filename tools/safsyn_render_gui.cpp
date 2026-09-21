@@ -384,7 +384,7 @@ PhaseCapabilities phase_capabilities(safsyn::PhaseMode mode, bool continuous)
 				capabilities.seed = capabilities.attack = true;
 			capabilities.pool = !continuous;
 			capabilities.description = continuous
-				? L"Experimental: each note gets a unique analytic rotation; the finite pool is bypassed."
+				? L"Experimental: notes sharing a key, channel and tick share a random rotation; the finite pool is bypassed."
 				: L"Experimental: analytic rotations come from a deterministic, reusable variant pool.";
 			break;
 		case safsyn::PhaseMode::SmoothField:

@@ -496,6 +496,43 @@ void test_streamed_wav_headers(const std::filesystem::path& directory)
 		"RF64 ds64 and sentinel sizes are finalized from actual frames");
 }
 
+void test_analytic_ticks_before_frame_quantization()
+{
+	// At this PPQ/sample rate, ticks 0 and 1 both schedule onto frame 0.
+	std::vector<uint8_t> track{0, 0x90, 60, 100, 1, 0x90, 60, 100};
+	append_eot(track, 1023);
+	safsyn::SmfFile file;
+	check(file.load_bytes(make_smf(0, 32000, {track})), "sub-sample tick fixture loads");
+	safsyn::SmfAnalysisOptions analysis_options;
+	analysis_options.sample_rate = 8000;
+	safsyn::SmfAnalysis analysis;
+	check(safsyn::analyze_smf(file, analysis_options, analysis), "sub-sample tick fixture analyzes");
+	auto bank = make_bank(8000);
+	for (bool continuous : {false, true})
+	{
+		safsyn::SmfRenderOptions options;
+		options.sample_rate = 8000;
+		options.phase.mode = safsyn::PhaseMode::Analytic;
+		options.phase.continuous = continuous;
+		options.phase.seed = 42;
+		PcmCapture pcm;
+		safsyn::SmfRenderResult result;
+		check(safsyn::render_smf_pcm(file, analysis, bank, options, result, capture_pcm, &pcm),
+			"sub-sample tick fixture renders");
+		safsyn::SynthEngine reference(8000, 16);
+		reference.set_soundfont(&bank); reference.set_phase_settings(options.phase);
+		const uint32_t message = 0x00643c90;
+		reference.consume_short_messages(&message, 1, 0);
+		reference.consume_short_messages(&message, 1, 1);
+		std::vector<float> expected(256);
+		reference.render_audio(expected.data(), 128);
+		bool matches = pcm.samples.size() == expected.size();
+		for (size_t i = 0; matches && i < expected.size(); ++i)
+			matches = std::abs(pcm.samples[i] - expected[i]) < 1e-6f;
+		check(matches, "SMF preserves different analytic tick identities that round to one audio frame");
+	}
+}
+
 void test_streamed_render_determinism(const std::filesystem::path& directory)
 {
 	std::filesystem::create_directories(directory);
@@ -782,6 +819,7 @@ int main(int argc, char** argv)
 	test_timed_source_declared_duration();
 	test_streamed_wav_headers(directory);
 	test_streamed_render_determinism(directory);
+	test_analytic_ticks_before_frame_quantization();
 	test_cohort_histogram_and_mass_dispatch(directory);
 	test_tail_drain(directory);
 	test_render_progress_and_cancellation(directory);
