@@ -188,7 +188,7 @@ void create_controls(App& app)
 	label(app, L"Output gain (dB)", 530, 318); edit(app, Gain, L"-12", 660, 318, 120);
 	label(app, L"Phase mode", 20, 356);
 	const auto phase = combo(app, Phase, 160, 356, 290);
-	for (const auto name : {L"Coherent (off)", L"Random polarity", L"Analytic rotation", L"Smooth phase field", L"Independent FFT bins"}) add_item(phase, name);
+	for (const auto name : {L"Direct sampling", L"Random polarity", L"Analytic rotation", L"Smooth phase field", L"Independent FFT bins"}) add_item(phase, name);
 	SendMessageW(phase, CB_SETCURSEL, 0, 0);
 	control(app, L"BUTTON", L"Limiter (-1 dB ceiling)", Limiter, 470, 356, 290, 28, WS_TABSTOP | BS_AUTOCHECKBOX);
 	SendDlgItemMessageW(app.window, Limiter, BM_SETCHECK, BST_CHECKED, 0);

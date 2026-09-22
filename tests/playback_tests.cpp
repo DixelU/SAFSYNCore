@@ -148,6 +148,79 @@ void file_timing_test()
 	for (size_t i = 0; i < (std::min)(audio.size(), other.size()); ++i)
 		check(audio[i] == other[i], "scalar sample sequence changes with producer block size");
 }
+void analytic_tick_queue_test()
+{
+	using Result = safsyn::MidiEnqueueResult;
+	for (bool continuous : {false, true})
+	{
+		auto config = options();
+		config.block_frames = 128; config.buffer_frames = 512;
+		config.midi_queue_capacity = 65538;
+		config.phase.mode = safsyn::PhaseMode::Analytic;
+		config.phase.continuous = continuous;
+		config.phase.seed = 42;
+		auto source = bank();
+		source->regions[0].root_key = 60;
+		safsyn::BufferedSynth synth(source, config);
+		check(synth.try_enqueue_short_message(0x00643c90, 42) == Result::Queued, "first unison queued");
+		// Exceed the per-block dispatch limit: the second unison is consumed one
+		// complete sample loop later, although both notes came from MIDI tick 42.
+		for (size_t i = 0; i < 65535; ++i)
+			check(synth.try_enqueue_short_message(0xfe, 42) == Result::Queued, "burst filler queued");
+		check(synth.try_enqueue_short_message(0x00643c90, 42) == Result::Queued, "second unison queued");
+		synth.start(); await([&] { return synth.ready(); });
+		std::array<float, 512> audio{};
+		check(synth.read_audio(audio.data(), 256) == 256, "two burst blocks rendered");
+		synth.stop();
+		check(synth.stats().error.empty(), "analytic queue render failed");
+		for (size_t i = 0; i < 256; ++i)
+			check(std::abs(audio[i + 256] - 2.0f * audio[i]) < 1e-6f,
+				"same-tick unisons changed phase across a live queue render boundary");
+
+		safsyn::BufferedSynth distinct(source, config);
+		check(distinct.try_enqueue_short_message(0x00643c90, 42) == Result::Queued &&
+			distinct.try_enqueue_short_message(0x00643c90, 43) == Result::Queued,
+			"different-tick notes queued together");
+		distinct.start(); await([&] { return distinct.ready(); });
+		std::array<float, 256> actual{}, expected{};
+		check(distinct.read_audio(actual.data(), 128) == 128, "different-tick block rendered");
+		distinct.stop();
+		safsyn::SynthEngine reference(48000, 16);
+		reference.set_soundfont(source.get()); reference.set_phase_settings(config.phase);
+		const uint32_t message = 0x00643c90;
+		reference.consume_short_messages(&message, 1, 42);
+		reference.consume_short_messages(&message, 1, 43);
+		reference.render_audio(expected.data(), 128);
+		for (size_t i = 0; i < actual.size(); ++i)
+			check(std::abs(actual[i] - expected[i]) < 1e-6f,
+				"queue merged different MIDI ticks into one analytic identity");
+
+		// The built-in SMF player must retain source ticks too, even when two
+		// different ticks quantize to the same scheduled sample.
+		std::vector<uint8_t> bytes{'M','T','h','d',0,0,0,6,0,0,0,1,0x7d,0,'M','T','r','k'};
+		const std::vector<uint8_t> track{0,0x90,60,100,1,0x90,60,100,
+			0x87,0x7f,0x80,60,0,0,0x80,60,0,0,0xff,0x2f,0};
+		append32(bytes, static_cast<uint32_t>(track.size()));
+		bytes.insert(bytes.end(), track.begin(), track.end());
+		auto midi = std::make_shared<safsyn::SmfFile>();
+		check(midi->load_bytes(std::move(bytes)), "different-tick SMF loads");
+		config.sample_rate = 8000;
+		source->regions[0].sample_rate = 8000;
+		safsyn::BufferedSynth scheduled(source, config, midi);
+		scheduled.start();
+		const auto file_audio = collect(scheduled);
+		safsyn::SynthEngine file_reference(8000, 16);
+		file_reference.set_soundfont(source.get()); file_reference.set_phase_settings(config.phase);
+		file_reference.consume_short_messages(&message, 1, 0);
+		file_reference.consume_short_messages(&message, 1, 1);
+		file_reference.render_audio(expected.data(), 128);
+		check(file_audio.size() >= expected.size(), "different-tick SMF rendered its held notes");
+		for (size_t i = 0; i < expected.size(); ++i)
+			check(std::abs(file_audio[i] - expected[i]) < 1e-6f,
+				"buffered SMF player merged distinct tick identities");
+	}
+}
+
 void parallel_test()
 {
 	auto config = options(); config.render_threads = 4; config.mastering.output_gain_db = -12;
@@ -179,6 +252,61 @@ void live_recovery_test()
 	await([&] { synth.read_audio(block.data(), 128); return synth.stats().midi_recoveries > 0 && synth.stats().active_voices == 0; });
 	synth.stop(); check(synth.finished(), "stop did not join producer");
 	check(!synth.enqueue_short_message(0x00643c90), "stopped synth accepts events");
+}
+void file_sender_backpressure_test()
+{
+	using Result = safsyn::MidiEnqueueResult;
+	auto config = options(); config.midi_queue_capacity = 4;
+	safsyn::BufferedSynth synth(bank(), config);
+	check(synth.try_enqueue_short_message(0x00643c90) == Result::Queued, "file sender note rejected");
+	synth.start(); await([&] { return synth.ready(); });
+	check(synth.stats().active_voices == 1, "held carrier did not start");
+	// The undrained audio ring keeps the producer blocked. Saturate the MIDI
+	// queue with automation while that carrier is still held.
+	for (uint32_t message : {0x000007b0u, 0x007f07b0u, 0x00400bb0u, 0x007f0ab0u})
+		check(synth.try_enqueue_short_message(message) == Result::Queued, "automation rejected early");
+	constexpr uint32_t bend = 0x007f7fe0;
+	for (size_t i = 0; i < 32; ++i)
+		check(synth.try_enqueue_short_message(bend) == Result::Full, "full queue did not request retry");
+	std::array<float, 128> audio{};
+	await([&] {
+		synth.read_audio(audio.data(), 64);
+		return synth.stats().scheduled_events == 5;
+	});
+	check(synth.try_enqueue_short_message(bend) == Result::Queued, "file event retry failed");
+	await([&] {
+		synth.read_audio(audio.data(), 64);
+		return synth.stats().scheduled_events == 6;
+	});
+	bool heard_panned_carrier = false;
+	for (size_t i = 0; i < 32; ++i)
+	{
+		await([&] { return synth.stats().buffered_frames >= 64; });
+		synth.read_audio(audio.data(), 64);
+		double left = 0, right = 0;
+		for (size_t frame = 0; frame < 64; ++frame)
+		{
+			check(std::isfinite(audio[frame * 2]) && std::isfinite(audio[frame * 2 + 1]),
+				"retried automation produced non-finite audio");
+			left += std::abs(audio[frame * 2]); right += std::abs(audio[frame * 2 + 1]);
+		}
+		// CC10=127 leaves the fine-pan LSB at zero, just short of hard right.
+		heard_panned_carrier |= right > 0.001 && left < right * 0.02;
+	}
+	const auto stats = synth.stats();
+	check(heard_panned_carrier && stats.active_voices == 1,
+		"queue saturation erased the held note or its later automation");
+	check(stats.rejected_midi_events == 0 && stats.midi_recoveries == 0 && stats.scheduled_events == 6,
+		"retrying a full queue lost, duplicated, or invalidated MIDI events");
+	check(synth.try_enqueue_short_message(0x00003c80) == Result::Queued, "final note-off rejected");
+	await([&] { synth.read_audio(audio.data(), 64); return synth.stats().active_voices == 0; });
+	synth.request_stop();
+	check(synth.try_enqueue_short_message(bend) == Result::Unavailable,
+		"stopped sender must terminate retries instead of reporting full");
+	synth.stop();
+	safsyn::BufferedSynth scheduled(bank(), config, file(1));
+	check(scheduled.try_enqueue_short_message(bend) == Result::Unavailable,
+		"direct SMF playback accepted live file-sender input");
 }
 void phase_preparation_test()
 {
@@ -244,7 +372,8 @@ int main()
 	try
 	{
 		queue_test(); ring_test(); file_timing_test(); parallel_test(); live_recovery_test(); lifecycle_and_limiter_test();
-		phase_preparation_test();
+		file_sender_backpressure_test(); phase_preparation_test();
+		analytic_tick_queue_test();
 		std::cout << "Playback: concurrent queues, sample timing, dense bursts, workers, overflow, underruns, limiter, lifecycle passed\n";
 		return 0;
 	}

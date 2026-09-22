@@ -119,6 +119,7 @@ struct CallbackContext
 	std::chrono::steady_clock::time_point started;
 	std::chrono::steady_clock::time_point last_posted{};
 	safsyn::SmfRenderProgressStage last_stage = safsyn::SmfRenderProgressStage::Preparing;
+	uint64_t last_preparation_total = 0;
 	bool posted = false;
 };
 
@@ -383,7 +384,7 @@ PhaseCapabilities phase_capabilities(safsyn::PhaseMode mode, bool continuous)
 				capabilities.seed = capabilities.attack = true;
 			capabilities.pool = !continuous;
 			capabilities.description = continuous
-				? L"Experimental: each note gets a unique analytic rotation; the finite pool is bypassed."
+				? L"Experimental: notes sharing a key, channel and tick share a random rotation; the finite pool is bypassed."
 				: L"Experimental: analytic rotations come from a deterministic, reusable variant pool.";
 			break;
 		case safsyn::PhaseMode::SmoothField:
@@ -668,7 +669,8 @@ bool progress_callback(const safsyn::SmfRenderProgress& progress,
 	{
 		const auto now = std::chrono::steady_clock::now();
 		const bool stage_changed = !context.posted || progress.stage != context.last_stage;
-		if (stage_changed || progress.stage == safsyn::SmfRenderProgressStage::Complete ||
+		const bool preparation_started = progress.preparation.total != context.last_preparation_total;
+		if (stage_changed || preparation_started || progress.stage == safsyn::SmfRenderProgressStage::Complete ||
 			now - context.last_posted >= std::chrono::milliseconds(50))
 		{
 			auto update = std::make_unique<ProgressUpdate>();
@@ -679,6 +681,7 @@ bool progress_callback(const safsyn::SmfRenderProgress& progress,
 				update.release();
 			context.last_posted = now;
 			context.last_stage = progress.stage;
+			context.last_preparation_total = progress.preparation.total;
 			context.posted = true;
 		}
 	}
@@ -969,7 +972,7 @@ void create_ui(AppState& state)
 		54, rows[0], 820, 24);
 	add_page_label(state, 1, L"Phase mode", left_label, rows[1], 145);
 	add_page_combo(state, 1, PhaseMode, left_field, rows[1] - 3, 190,
-		{L"Coherent", L"Random polarity", L"Analytic", L"Smooth field",
+		{L"Direct sampling", L"Random polarity", L"Analytic", L"Smooth field",
 			L"Independent bins"}, 0);
 	state.phase_strength_controls = {
 		add_page_label(state, 1, L"Strength (0-1)", left_label, rows[2], 145),
@@ -1035,6 +1038,21 @@ void update_progress_ui(AppState& state, const ProgressUpdate& update)
 {
 	set_marquee(state.progress, false);
 	const auto& progress = update.progress;
+	if (progress.stage == safsyn::SmfRenderProgressStage::Preparing &&
+		progress.preparation.total != 0)
+	{
+		const auto& preparation = progress.preparation;
+		set_text(state.status_title, L"Prerendering sample variants " +
+			format_count(preparation.completed) + L"/" + format_count(preparation.total) + L"...");
+		const double fraction = static_cast<double>(preparation.completed) / preparation.total;
+		SendMessageW(state.progress, PBM_SETPOS, static_cast<int>(fraction * 1000.0), 0);
+		set_text(state.status_detail, L"Audio starts after sample preparation. Elapsed " +
+			format_duration(update.elapsed_seconds));
+		set_text(state.status_metrics, L"Phase cache: " +
+			format_count(preparation.cache_bytes / 1048576) + L" / " +
+			format_count(preparation.total_cache_bytes / 1048576) + L" MiB");
+		return;
+	}
 	const wchar_t* stage = L"Preparing render...";
 	switch (progress.stage)
 	{

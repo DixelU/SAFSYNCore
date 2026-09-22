@@ -219,7 +219,7 @@ void test_continuous_analytic_is_not_pool_quantized()
 		phase.continuous = true;
 		engine.set_phase_settings(phase);
 		for (size_t dummy = 0; dummy < advance; ++dummy)
-			engine.note_on(0, 59, 100); // advances stable event serial without a region
+			render(engine, 1); // advance onset identity without starting a voice
 		engine.note_on(0, 60, 100);
 		outputs[advance] = render(engine, 96);
 		check(engine.phase_cache_stats().cached_variants == 0,
@@ -227,6 +227,115 @@ void test_continuous_analytic_is_not_pool_quantized()
 	}
 	check(outputs[0] != outputs[1] && outputs[1] != outputs[2] && outputs[0] != outputs[2],
 		"continuous analytic angles vary beyond a pool of one");
+}
+
+void test_analytic_unison_onsets()
+{
+	for (const auto model : {safsyn::VoiceModel::Individual, safsyn::VoiceModel::Cohorts})
+	for (bool continuous : {false, true})
+	{
+		auto bank = make_bank(make_signal(128, 2), 12800, 2);
+		safsyn::SynthEngine single(12800, 16), repeated(12800, 16), batched(12800, 16);
+		auto phase = settings(safsyn::PhaseMode::Analytic, 64, 42);
+		phase.continuous = continuous;
+		for (auto* engine : {&single, &repeated, &batched})
+		{
+			engine->set_soundfont(&bank);
+			engine->set_voice_model(model);
+			engine->set_phase_settings(phase);
+		}
+		single.note_on(0, 60, 100);
+		repeated.note_on(0, 60, 100);
+		repeated.note_on(1, 59, 100); // unrelated serial between same-onset unisons
+		repeated.note_on(0, 60, 100);
+		batched.note_on_batch(0, 60, 100, 2);
+		const auto one = render(single, 32);
+		const auto two = render(repeated, 32);
+		const auto batch = render(batched, 32);
+		bool doubled = true;
+		for (size_t i = 0; i < one.size(); ++i)
+			doubled = doubled && std::abs(two[i] - 2.0f * one[i]) < 1e-6f
+				&& std::abs(batch[i] - two[i]) < 1e-6f;
+		check(doubled, "same-onset analytic unisons share phase in separate and batched dispatch");
+		repeated.note_off(0, 60);
+		batched.note_off(0, 60);
+		const auto survivor = render(single, 32);
+		const auto released = render(repeated, 32);
+		const auto batch_released = render(batched, 32);
+		bool matches = true;
+		for (size_t i = 0; i < survivor.size(); ++i)
+			matches = matches && std::abs(survivor[i] - released[i]) < 1e-6f
+				&& std::abs(survivor[i] - batch_released[i]) < 1e-6f;
+		check(matches, "later partial note-off reconstructs the original analytic onset phase");
+	}
+	for (bool continuous : {false, true})
+	{
+		auto bank = make_bank(make_signal(128), 12800);
+		safsyn::PhaseProcessor processor;
+		auto phase = settings(safsyn::PhaseMode::Analytic, 64, 42);
+		phase.continuous = continuous;
+		processor.configure(phase);
+		const auto reference = processor.assign(bank.regions[0], 0, 0, 0, 60);
+		const auto layer = processor.assign(bank.regions[0], 1, 0, 0, 60);
+		check(reference.cosine == layer.cosine && reference.sine == layer.sine,
+			"analytic sample layers share the same angle");
+		bool other_onset = false, other_key = false, other_channel = false, negative_cosine = false;
+		for (uint64_t i = 1; i < 64; ++i)
+		{
+			const auto onset = processor.assign(bank.regions[0], 0, i, 0, 60);
+			const auto key = processor.assign(bank.regions[0], 0, 0, 0, static_cast<uint8_t>(i));
+			const auto channel = processor.assign(bank.regions[0], 0, 0, static_cast<uint8_t>(i % 16), 60);
+			other_onset |= onset.sine != reference.sine;
+			other_key |= key.sine != reference.sine;
+			other_channel |= channel.sine != reference.sine;
+			negative_cosine |= onset.cosine < 0.0f;
+		}
+		check(other_onset && other_key && other_channel && negative_cosine,
+			"analytic groups retain random full-range angles across onsets, keys and channels");
+	}
+}
+
+void test_analytic_source_ticks()
+{
+	for (const auto model : {safsyn::VoiceModel::Individual, safsyn::VoiceModel::Cohorts})
+	for (bool continuous : {false, true})
+	{
+		auto bank = make_bank(make_signal(128), 12800);
+		auto phase = settings(safsyn::PhaseMode::Analytic, 64, 42);
+		phase.continuous = continuous;
+		constexpr uint32_t message = 0x00643c90;
+		auto capture = [&](uint64_t tick, uint32_t delay) {
+			safsyn::SynthEngine engine(12800, 16);
+			engine.set_soundfont(&bank);
+			engine.set_voice_model(model);
+			engine.set_phase_settings(phase);
+			if (delay) render(engine, delay);
+			engine.consume_short_messages(&message, 1, tick);
+			return render(engine, 128);
+		};
+		check(capture(42, 0) == capture(42, 17),
+			"same source tick retains its angle across different render frames");
+		check(capture(42, 0) != capture(43, 0),
+			"different source ticks retain independent angles within one render frame");
+
+		safsyn::SynthEngine single(12800, 16), mixed(12800, 16);
+		for (auto* engine : {&single, &mixed})
+		{
+			engine->set_soundfont(&bank);
+			engine->set_voice_model(model);
+			engine->set_phase_settings(phase);
+			engine->consume_short_messages(&message, 1, 42);
+		}
+		mixed.consume_short_messages(&message, 1, 43);
+		render(single, 32);
+		render(mixed, 32);
+		mixed.note_off(0, 60);
+		const auto expected = render(single, 32), actual = render(mixed, 32);
+		bool matches = true;
+		for (size_t i = 0; i < expected.size(); ++i)
+			matches = matches && std::abs(expected[i] - actual[i]) < 1e-6f;
+		check(matches, "partial note-off subtracts the correct source-tick phase after cohort merging");
+	}
 }
 
 void test_fft_magnitudes_and_dc_nyquist()
@@ -485,6 +594,8 @@ void test_preparation_budget_and_cancellation()
 
 int main()
 {
+	test_analytic_unison_onsets();
+	test_analytic_source_ticks();
 	test_strength_zero_is_coherent();
 	test_determinism_and_block_invariance();
 	test_pool_one_is_mutually_coherent();

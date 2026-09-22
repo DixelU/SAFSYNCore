@@ -45,18 +45,25 @@ It must not be described or measured as phase-only processing.
 - Voice exhaustion prefers the quietest releasing voice, then the oldest voice.
 - SF2/SFZ sustain loops stop looping on note-off and then play their sample tail.
 - The audio loop allocates nothing and performs no I/O.
-- Phase identity is derived from the configured seed, event serial, MIDI
-  channel, note, and logical sample region. Voice slots are not identities.
+- Analytic phase identity uses the configured seed, source tick, MIDI channel,
+  and key. Other modes use the event serial and logical sample region as well.
+  Voice slots are not identities.
 - Analytic quadrature and FFT phase variants are constructed outside
   `render_audio` and cached by logical sample plus phase settings. FFT variants
   are generated lazily when an event first selects them.
 - Finite phase pools accept 1–64 deterministic choices; the regression and
   measurement fixtures cover 1, 8, 32, and 64. Continuous analytic mode derives
-  an angle directly from the stable event identity.
+  an angle directly from the stable onset identity. Analytic notes with the same
+  key, channel, and source tick share one angle, including sample layers
+  and separate batches. Other onset groups retain deterministic random angles
+  over the full strength-scaled range. Tick identity survives audio-frame
+  quantization and queue/render boundaries; it does not change event scheduling.
+  Untimestamped engine/live calls use their current audio frame. Partial note-off
+  reconstructs the original onset angle.
 - Stereo partners use the same analytic angle or FFT phase sheet.
 - Exact render cohorts retain every logical event serial. Analytic cohorts sum
   per-event left/right cosine and sine terms including angle-dependent RMS
-  scales; a logical batch never receives one shared phase angle.
+  scales; analytic events in a unison onset group share their phase angle.
 - Unfiltered multiplicity-one cohorts use the original per-voice phase operation
   exactly. Filtered cohorts retain histories for the independent phase basis
   signals, so partial note-offs preserve each contribution's history, including

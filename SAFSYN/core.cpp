@@ -7,10 +7,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace safsyn
@@ -39,8 +41,9 @@ static float cb_to_linear(int cb)
 #pragma pack(push, 1)
 
 struct SF2Phdr
-{	       // 38 bytes
-	char     name[20];
+{	
+	// 38 bytes
+	char	 name[20];
 	uint16_t preset;
 	uint16_t bank;
 	uint16_t bag_idx;
@@ -48,7 +51,8 @@ struct SF2Phdr
 };
 struct SF2Bag { uint16_t gen_idx, mod_idx; };  //  4 bytes
 struct SF2Gen
-{				 //  4 bytes
+{	
+	//  4 bytes
 	uint16_t oper;
 	union
 	{
@@ -59,8 +63,9 @@ struct SF2Gen
 };
 struct SF2Inst { char name[20]; uint16_t bag_idx; };  // 22 bytes
 struct SF2Shdr
-{	       // 46 bytes
-	char     name[20];
+{	
+	// 46 bytes
+	char	 name[20];
 	uint32_t start, end, loop_start, loop_end;
 	uint32_t sample_rate;
 	uint8_t  pitch;
@@ -340,7 +345,7 @@ bool load_sf2(const char* path, Soundfont& sf)
 
 		uint16_t pbag_lo = PHDR_(pi)->bag_idx;
 		uint16_t pbag_hi = PHDR_(pi + 1)->bag_idx;
-		bool     first_p = true;
+		bool	 first_p = true;
 		GenSet   preset_global;
 
 		for (uint16_t pbi = pbag_lo; pbi < pbag_hi && (size_t)(pbi + 1) < nPbag; pbi++)
@@ -349,7 +354,7 @@ bool load_sf2(const char* path, Soundfont& sf)
 			uint16_t pgen_hi = PBAG_(pbi + 1)->gen_idx;
 
 			GenSet pzone;
-			int    inst_idx = -1;
+			int	inst_idx = -1;
 			for (uint16_t gi = pgen_lo; gi < pgen_hi && gi < nPgen; gi++)
 			{
 				const SF2Gen* g = PGEN_(gi);
@@ -363,7 +368,7 @@ bool load_sf2(const char* path, Soundfont& sf)
 			if ((size_t)inst_idx + 1 >= nInst) continue;
 			uint16_t ibag_lo = INST_(inst_idx)->bag_idx;
 			uint16_t ibag_hi = INST_(inst_idx + 1)->bag_idx;
-			bool     first_i = true;
+			bool	 first_i = true;
 			GenSet   inst_global;
 
 			for (uint16_t ibi = ibag_lo; ibi < ibag_hi && (size_t)(ibi + 1) < nIbag; ibi++)
@@ -372,7 +377,7 @@ bool load_sf2(const char* path, Soundfont& sf)
 				uint16_t igen_hi = IBAG_(ibi + 1)->gen_idx;
 
 				GenSet izone;
-				int    shdr_idx = -1;
+				int	shdr_idx = -1;
 				for (uint16_t gi = igen_lo; gi < igen_hi && gi < nIgen; gi++)
 				{
 					const SF2Gen* g = IGEN_(gi);
@@ -707,7 +712,7 @@ static void sfz_parse_line(std::string src,
 				if (w < n && src[w] == '=')
 				{
 					val_e = j;   // value ends before this whitespace
-					i = k;       // next iteration starts at next key
+					i = k;	   // next iteration starts at next key
 					break;
 				}
 				j = w;
@@ -732,6 +737,14 @@ bool load_sfz(const char* path, Soundfont& sf)
 	std::ifstream file(path);
 	if (!file.is_open()) return false;
 	std::string dir = sfz_parent_dir(path);
+	std::string default_path;
+	struct LoadedSample
+	{
+		size_t index;
+		uint32_t rate;
+		uint8_t channels;
+	};
+	std::unordered_map<std::string, LoadedSample> loaded_samples;
 
 	struct Desc
 	{
@@ -758,33 +771,35 @@ bool load_sfz(const char* path, Soundfont& sf)
 	{
 		try
 		{
-			if (k == "sample")	  d.sample = v;
-			else if (k == "lokey")	   d.lo_key = sfz_note_to_midi(v);
-			else if (k == "hikey")	   d.hi_key = sfz_note_to_midi(v);
-			else if (k == "lovel")	   d.lo_vel = std::stoi(v);
-			else if (k == "hivel")	   d.hi_vel = std::stoi(v);
-			else if (k == "key")	     d.lo_key = d.hi_key = d.pitch_keycenter = sfz_note_to_midi(v);
-			else if (k == "pitch_keycenter") d.pitch_keycenter = sfz_note_to_midi(v);
+			if (k == "sample")			d.sample = v;
+			else if (k == "lokey")			d.lo_key = sfz_note_to_midi(v);
+			else if (k == "hikey")			d.hi_key = sfz_note_to_midi(v);
+			else if (k == "lovel")			d.lo_vel = std::stoi(v);
+			else if (k == "hivel")			d.hi_vel = std::stoi(v);
+			else if (k == "key")			d.lo_key = d.hi_key = d.pitch_keycenter = sfz_note_to_midi(v);
+			else if (k == "pitch_keycenter")	d.pitch_keycenter = sfz_note_to_midi(v);
 			else if (k == "loop_mode")
 			{
-				if (v == "loop_continuous") d.loop_mode = 1;
+				if (v == "loop_continuous")	d.loop_mode = 1;
 				else if (v == "one_shot")	d.loop_mode = 2;
-				else if (v == "loop_sustain")    d.loop_mode = 3;
-				else			     d.loop_mode = 0;
+				else if (v == "loop_sustain")	d.loop_mode = 3;
+				else				d.loop_mode = 0;
 			}
-			else if (k == "loop_start" || k == "loopstart") d.loop_start = std::stoi(v);
-			else if (k == "loop_end" || k == "loopend")   d.loop_end = std::stoi(v);
-			else if (k == "transpose")       d.transpose = std::stoi(v);
-			else if (k == "tune")	    d.tune = std::stof(v);
-			else if (k == "scale_tuning")    d.scale_tuning = std::stoi(v);
-			else if (k == "ampeg_attack")    d.ampeg_attack = std::stof(v);
-			else if (k == "ampeg_hold")      d.ampeg_hold = std::stof(v);
-			else if (k == "ampeg_decay")     d.ampeg_decay = std::stof(v);
-			else if (k == "ampeg_sustain")   d.ampeg_sustain = std::stof(v);
-			else if (k == "ampeg_release")   d.ampeg_release = std::stof(v);
-			else if (k == "volume")	  d.volume = std::stof(v);
-			else if (k == "pan")	     d.pan = std::stof(v);
-			else if (k == "group")	   d.group = std::stoi(v);
+			else if (k == "loop_start" || k == "loopstart")
+				d.loop_start = std::stoi(v);
+			else if (k == "loop_end" || k == "loopend")
+				d.loop_end = std::stoi(v);
+			else if (k == "transpose")		d.transpose = std::stoi(v);
+			else if (k == "tune")			d.tune = std::stof(v);
+			else if (k == "scale_tuning")		d.scale_tuning = std::stoi(v);
+			else if (k == "ampeg_attack")		d.ampeg_attack = std::stof(v);
+			else if (k == "ampeg_hold")		d.ampeg_hold = std::stof(v);
+			else if (k == "ampeg_decay")		d.ampeg_decay = std::stof(v);
+			else if (k == "ampeg_sustain")		d.ampeg_sustain = std::stof(v);
+			else if (k == "ampeg_release")		d.ampeg_release = std::stof(v);
+			else if (k == "volume")			d.volume = std::stof(v);
+			else if (k == "pan")			d.pan = std::stof(v);
+			else if (k == "group")			d.group = std::stoi(v);
 		}
 		catch (...) {}
 	};
@@ -793,15 +808,35 @@ bool load_sfz(const char* path, Soundfont& sf)
 	{
 		if (d.sample.empty()) return;
 
-		std::string sample_path = dir + "/" + d.sample;
-		std::replace(sample_path.begin(), sample_path.end(), '\\', '/');
+		std::string sample_name = d.sample;
+		std::replace(sample_name.begin(), sample_name.end(), '\\', '/');
+		std::string sample_base = default_path;
+		std::replace(sample_base.begin(), sample_base.end(), '\\', '/');
+		const std::filesystem::path sample_part(sample_name);
+		const std::filesystem::path sample_path_object = sample_part.is_absolute()
+			? sample_part
+			: std::filesystem::path(dir) / sample_base / sample_part;
+		const std::string sample_path = sample_path_object.lexically_normal().string();
 
-		sf.sfz_pcm.emplace_back();
 		uint32_t rate = 44100; uint8_t nch = 1;
-		if (!load_wav(sample_path.c_str(), sf.sfz_pcm.back(), rate, nch))
+		size_t sample_index = 0;
+		const auto loaded = loaded_samples.find(sample_path);
+		if (loaded == loaded_samples.end())
 		{
-			sf.sfz_pcm.pop_back();
-			return;
+			sample_index = sf.sfz_pcm.size();
+			sf.sfz_pcm.emplace_back();
+			if (!load_wav(sample_path.c_str(), sf.sfz_pcm.back(), rate, nch))
+			{
+				sf.sfz_pcm.pop_back();
+				return;
+			}
+			loaded_samples.emplace(sample_path, LoadedSample{sample_index, rate, nch});
+		}
+		else
+		{
+			sample_index = loaded->second.index;
+			rate = loaded->second.rate;
+			nch = loaded->second.channels;
 		}
 
 		SampleRegion r;
@@ -812,15 +847,16 @@ bool load_sfz(const char* path, Soundfont& sf)
 		r.hi_vel = (uint8_t)std::clamp(d.hi_vel, 0, 127);
 		r.root_key = (uint8_t)std::clamp(d.pitch_keycenter, 0, 127);
 
-		r.pcm = sf.sfz_pcm.back().data();
-		r.pcm_len = (uint32_t)(sf.sfz_pcm.back().size() / nch);
+		r.pcm = sf.sfz_pcm[sample_index].data();
+		r.pcm_len = (uint32_t)(sf.sfz_pcm[sample_index].size() / nch);
 		r.sample_rate = rate;
 		r.channels = nch;
 
-		if (d.loop_mode == 1) r.loop_mode = LoopMode::Forward;
-		else if (d.loop_mode == 2) r.loop_mode = LoopMode::OneShot;
-		else if (d.loop_mode == 3) r.loop_mode = LoopMode::Sustain;
-		else		       r.loop_mode = LoopMode::None;
+		if (d.loop_mode == 1)		r.loop_mode = LoopMode::Forward;
+		else if (d.loop_mode == 2)	r.loop_mode = LoopMode::OneShot;
+		else if (d.loop_mode == 3)	r.loop_mode = LoopMode::Sustain;
+		else				r.loop_mode = LoopMode::None;
+
 		r.loop_start = (uint32_t)d.loop_start;
 		r.loop_end = (d.loop_end > 0) ? (uint32_t)d.loop_end : r.pcm_len;
 		if (r.loop_end > r.pcm_len) r.loop_end = r.pcm_len;
@@ -846,7 +882,7 @@ bool load_sfz(const char* path, Soundfont& sf)
 	// Four-level hierarchy: global → master → group → region
 	// When entering a child header, copy current parent state as starting point.
 	Desc global_d, master_d, group_d, region_d;
-	enum class H { None, Global, Master, Group, Region } hdr = H::None;
+	enum class H { None, Control, Global, Master, Group, Region } hdr = H::None;
 
 	std::string line;
 	while (std::getline(file, line))
@@ -857,7 +893,8 @@ bool load_sfz(const char* path, Soundfont& sf)
 			// Entering a new header — commit pending region first
 			if (hdr == H::Region) commit_region(region_d);
 
-			if (hdr_name == "global") { hdr = H::Global; global_d = Desc{}; }
+			if (hdr_name == "control") { hdr = H::Control; }
+			else if (hdr_name == "global") { hdr = H::Global; global_d = Desc{}; }
 			else if (hdr_name == "master") { hdr = H::Master; master_d = global_d; master_d.sample.clear(); }
 			else if (hdr_name == "group") { hdr = H::Group;  group_d = master_d; group_d.sample.clear(); }
 			else if (hdr_name == "region") { hdr = H::Region; region_d = group_d;  region_d.sample.clear(); }
@@ -866,6 +903,9 @@ bool load_sfz(const char* path, Soundfont& sf)
 		{
 			switch (hdr)
 			{
+				case H::Control:
+					if (k == "default_path") default_path = std::move(v);
+					break;
 				case H::Global: parse_opcode(global_d, k, v); break;
 				case H::Master: parse_opcode(master_d, k, v); break;
 				case H::Group:  parse_opcode(group_d, k, v); break;

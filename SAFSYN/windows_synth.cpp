@@ -269,6 +269,10 @@ std::vector<MidiInputDevice> midi_input_devices()
 
 struct WindowsSynth::Impl
 {
+	// start(), request_stop(), and stop() are public control-plane operations.
+	// Serializing them prevents a stop that arrives during start from being
+	// cleared by the new session and then joining that uncancelled session.
+	std::mutex lifecycle_mutex;
 	mutable std::mutex mutex;
 	std::shared_ptr<BufferedSynth> synth;
 	std::thread delivery;
@@ -279,6 +283,14 @@ struct WindowsSynth::Impl
 	std::wstring status = L"Stopped";
 	std::string error;
 	void set_status(const wchar_t* text) { std::lock_guard lock(mutex); status = text; }
+	void request_stop_locked() noexcept
+	{
+		cancelled.store(true);
+		SetEvent(stop_event.value);
+		std::lock_guard lock(mutex);
+		if (synth)
+			synth->request_stop();
+	}
 	void run(WindowsSynthOptions options) noexcept
 	{
 		try
@@ -369,7 +381,12 @@ struct WindowsSynth::Impl
 			{ std::lock_guard lock(mutex); playback = synth; error = exception.what(); status = L"Error"; }
 			if (playback) playback->stop();
 		}
-		catch (...) { std::lock_guard lock(mutex); error = "unknown Windows synth failure"; status = L"Error"; }
+		catch (...)
+		{
+			std::shared_ptr<BufferedSynth> playback;
+			{ std::lock_guard lock(mutex); playback = synth; error = "unknown Windows synth failure"; status = L"Error"; }
+			if (playback) playback->stop();
+		}
 		running.store(false, std::memory_order_release);
 	}
 };
@@ -378,6 +395,7 @@ WindowsSynth::WindowsSynth() : impl_(std::make_unique<Impl>()) {}
 WindowsSynth::~WindowsSynth() { stop(); }
 void WindowsSynth::start(const WindowsSynthOptions& options)
 {
+	std::lock_guard lifecycle_lock(impl_->lifecycle_mutex);
 	if (impl_->running.load()) throw std::logic_error("synth is already running");
 	if (impl_->delivery.joinable()) impl_->delivery.join();
 	{ std::lock_guard lock(impl_->mutex); impl_->synth.reset(); impl_->error.clear(); impl_->status = L"Starting..."; }
@@ -389,15 +407,27 @@ void WindowsSynth::start(const WindowsSynthOptions& options)
 }
 void WindowsSynth::request_stop() noexcept
 {
-	impl_->cancelled.store(true); SetEvent(impl_->stop_event.value);
-	std::lock_guard lock(impl_->mutex);
-	if (impl_->synth) impl_->synth->request_stop();
+	std::lock_guard lifecycle_lock(impl_->lifecycle_mutex);
+	impl_->request_stop_locked();
 }
-void WindowsSynth::stop() noexcept { request_stop(); if (impl_->delivery.joinable()) impl_->delivery.join(); }
+void WindowsSynth::stop() noexcept
+{
+	std::lock_guard lifecycle_lock(impl_->lifecycle_mutex);
+	impl_->request_stop_locked();
+	if (impl_->delivery.joinable())
+		impl_->delivery.join();
+}
 bool WindowsSynth::send_short_message(uint32_t message) noexcept
 {
 	std::lock_guard lock(impl_->mutex);
 	return impl_->synth && impl_->synth->enqueue_short_message(message);
+}
+MidiEnqueueResult WindowsSynth::try_send_short_message(uint32_t message,
+	std::optional<uint64_t> tick) noexcept
+{
+	std::lock_guard lock(impl_->mutex);
+	return impl_->synth ? impl_->synth->try_enqueue_short_message(message, tick)
+		: MidiEnqueueResult::Unavailable;
 }
 void WindowsSynth::panic() noexcept
 {
@@ -411,7 +441,13 @@ WindowsSynthStats WindowsSynth::stats() const
 	{ std::lock_guard lock(impl_->mutex); playback = impl_->synth; result.status = impl_->status; result.error = impl_->error; }
 	if (playback) result.playback = playback->stats();
 	result.running = impl_->running.load(std::memory_order_acquire);
-	if (result.running && result.playback.preparing && result.error.empty()) result.status = L"Preparing phase cache...";
+	if (result.running && result.playback.preparing && result.error.empty())
+	{
+		const auto& preparation = result.playback.preparation;
+		result.status = preparation.total == 0 ? L"Preparing audio engine..." :
+			L"Prerendering sample variants " + std::to_wstring(preparation.completed) +
+			L"/" + std::to_wstring(preparation.total) + L"...";
+	}
 	result.device_buffer_frames = impl_->device_frames.load();
 	result.empty_device_buffers = impl_->empty_buffers.load();
 	return result;

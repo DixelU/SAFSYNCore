@@ -11,6 +11,8 @@
 namespace safsyn
 {
 
+enum class MidiEnqueueResult { Queued, Full, Unavailable };
+
 struct PlaybackOptions
 {
 	uint32_t sample_rate = 48000;
@@ -69,6 +71,11 @@ public:
 	void request_stop() noexcept;
 	void stop() noexcept; // Joins the producer; never call from an audio callback.
 	bool enqueue_short_message(uint32_t message) noexcept;
+	// For file senders that can retry: Full leaves voices, controllers, and
+	// queued events intact. The caller retains the message until Queued.
+	// Optional source tick affects phase grouping only, not dispatch scheduling.
+	MidiEnqueueResult try_enqueue_short_message(uint32_t message,
+		std::optional<uint64_t> tick = {}) noexcept;
 	bool enqueue_master_volume(uint16_t value) noexcept;
 	// Invalidates queued live events and resets controllers/voices on producer.
 	void panic() noexcept;

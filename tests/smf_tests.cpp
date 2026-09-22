@@ -22,6 +22,12 @@ struct ProgressCapture
 	uint64_t previous_frame = 0;
 	uint64_t final_frame = 0;
 	uint64_t cancel_after_frame = 0;
+	uint64_t cancel_after_preparation = 0;
+	uint64_t preparation_completed = 0;
+	uint64_t preparation_total = 0;
+	bool preparation_valid = true;
+	bool saw_preparation_start = false;
+	bool saw_preparation_complete = false;
 	bool monotonic = true;
 	bool saw_events = false;
 	bool saw_tail = false;
@@ -37,6 +43,24 @@ bool capture_progress(const safsyn::SmfRenderProgress& progress, void* user_data
 	capture.monotonic = capture.monotonic && progress.frames_rendered >= capture.previous_frame;
 	capture.previous_frame = progress.frames_rendered;
 	capture.final_frame = progress.frames_rendered;
+	if (progress.stage == safsyn::SmfRenderProgressStage::Preparing &&
+		progress.preparation.total != 0)
+	{
+		const auto& preparation = progress.preparation;
+		capture.preparation_valid = capture.preparation_valid &&
+			preparation.completed >= capture.preparation_completed &&
+			preparation.completed <= preparation.total &&
+			(capture.preparation_total == 0 || capture.preparation_total == preparation.total) &&
+			progress.frames_rendered == 0 && progress.scheduled_events == 0;
+		capture.preparation_completed = preparation.completed;
+		capture.preparation_total = preparation.total;
+		capture.saw_preparation_start = capture.saw_preparation_start || preparation.completed == 0;
+		capture.saw_preparation_complete = capture.saw_preparation_complete ||
+			preparation.completed == preparation.total;
+		if (capture.cancel_after_preparation != 0 &&
+			preparation.completed >= capture.cancel_after_preparation)
+			return false;
+	}
 	capture.saw_events = capture.saw_events ||
 		progress.stage == safsyn::SmfRenderProgressStage::RenderingEvents;
 	capture.saw_tail = capture.saw_tail ||
@@ -174,6 +198,57 @@ safsyn::Soundfont make_bank(uint32_t sample_rate)
 	region.release = 0.01f;
 	bank.regions.push_back(region);
 	return bank;
+}
+
+struct TimedEventSource
+{
+	std::vector<safsyn::TimedMidiEvent> events;
+	size_t cursor = 0;
+};
+
+bool next_timed_event(safsyn::TimedMidiEvent& event, void* user_data) noexcept
+{
+	auto& source = *static_cast<TimedEventSource*>(user_data);
+	if (source.cursor == source.events.size())
+		return false;
+	event = source.events[source.cursor++];
+	return true;
+}
+
+struct PcmCapture
+{
+	std::vector<float> samples;
+};
+
+bool capture_pcm(const float* audio, uint32_t frames, uint64_t,
+	void* user_data) noexcept
+{
+	auto& capture = *static_cast<PcmCapture*>(user_data);
+	capture.samples.insert(capture.samples.end(), audio,
+		audio + static_cast<size_t>(frames) * 2);
+	return true;
+}
+
+void test_timed_source_declared_duration()
+{
+	constexpr uint32_t sample_rate = 1000;
+	auto bank = make_bank(sample_rate);
+	TimedEventSource source{{{
+		0, safsyn::TimedMidiEventKind::ShortMessage,
+		0x90U | (60U << 8) | (100U << 16), 0}}};
+	safsyn::SmfRenderOptions options;
+	options.sample_rate = sample_rate;
+	options.block_frames = 64;
+	PcmCapture pcm;
+	safsyn::SmfRenderResult result;
+	check(safsyn::render_timed_midi_pcm(500, bank, next_timed_event, &source,
+		options, result, capture_pcm, &pcm) && result.frames_written == 500,
+		"timed MIDI source renders its complete declared duration");
+	float ending_energy = 0.0f;
+	for (size_t index = 400 * 2; index < pcm.samples.size(); ++index)
+		ending_energy += std::abs(pcm.samples[index]);
+	check(ending_energy > 0.0f,
+		"voices remain active until the declared duration when the event stream ends early");
 }
 
 std::vector<uint8_t> render_fixture_midi(bool sustain)
@@ -421,6 +496,43 @@ void test_streamed_wav_headers(const std::filesystem::path& directory)
 		"RF64 ds64 and sentinel sizes are finalized from actual frames");
 }
 
+void test_analytic_ticks_before_frame_quantization()
+{
+	// At this PPQ/sample rate, ticks 0 and 1 both schedule onto frame 0.
+	std::vector<uint8_t> track{0, 0x90, 60, 100, 1, 0x90, 60, 100};
+	append_eot(track, 1023);
+	safsyn::SmfFile file;
+	check(file.load_bytes(make_smf(0, 32000, {track})), "sub-sample tick fixture loads");
+	safsyn::SmfAnalysisOptions analysis_options;
+	analysis_options.sample_rate = 8000;
+	safsyn::SmfAnalysis analysis;
+	check(safsyn::analyze_smf(file, analysis_options, analysis), "sub-sample tick fixture analyzes");
+	auto bank = make_bank(8000);
+	for (bool continuous : {false, true})
+	{
+		safsyn::SmfRenderOptions options;
+		options.sample_rate = 8000;
+		options.phase.mode = safsyn::PhaseMode::Analytic;
+		options.phase.continuous = continuous;
+		options.phase.seed = 42;
+		PcmCapture pcm;
+		safsyn::SmfRenderResult result;
+		check(safsyn::render_smf_pcm(file, analysis, bank, options, result, capture_pcm, &pcm),
+			"sub-sample tick fixture renders");
+		safsyn::SynthEngine reference(8000, 16);
+		reference.set_soundfont(&bank); reference.set_phase_settings(options.phase);
+		const uint32_t message = 0x00643c90;
+		reference.consume_short_messages(&message, 1, 0);
+		reference.consume_short_messages(&message, 1, 1);
+		std::vector<float> expected(256);
+		reference.render_audio(expected.data(), 128);
+		bool matches = pcm.samples.size() == expected.size();
+		for (size_t i = 0; matches && i < expected.size(); ++i)
+			matches = std::abs(pcm.samples[i] - expected[i]) < 1e-6f;
+		check(matches, "SMF preserves different analytic tick identities that round to one audio frame");
+	}
+}
+
 void test_streamed_render_determinism(const std::filesystem::path& directory)
 {
 	std::filesystem::create_directories(directory);
@@ -656,6 +768,43 @@ void test_render_progress_and_cancellation(const std::filesystem::path& director
 	check(cancelled_bytes.size() == 44 + cancelled.frames_written * 8 &&
 		read_le32(cancelled_bytes, 40) == cancelled.frames_written * 8,
 		"cancelled render is finalized as a valid partial WAV");
+
+	// Preparation uses unique sample transforms, independently of audio frames
+	// and runtime cohorts. Two layers sharing PCM still need just one pool.
+	bank.regions.push_back(bank.regions.front());
+	options.phase.pool_size = 4;
+	for (const auto mode : {safsyn::PhaseMode::Analytic,
+		safsyn::PhaseMode::SmoothField, safsyn::PhaseMode::IndependentBins})
+	{
+		options.phase.mode = mode;
+		ProgressCapture prepared_progress;
+		options.progress_user_data = &prepared_progress;
+		safsyn::SmfRenderResult prepared;
+		check(safsyn::render_smf_stream(file, analysis, bank,
+			completed_path.string().c_str(), options, prepared) &&
+			prepared_progress.preparation_valid && prepared_progress.saw_preparation_start &&
+			prepared_progress.saw_preparation_complete && prepared_progress.saw_events &&
+			prepared_progress.preparation_total == (mode == safsyn::PhaseMode::Analytic ? 1 : 4),
+			"render forwards counted sample preparation before advancing audio or events");
+	}
+	ProgressCapture preparation_cancelled_progress;
+	preparation_cancelled_progress.cancel_after_preparation = 1;
+	options.progress_user_data = &preparation_cancelled_progress;
+	safsyn::SmfRenderResult preparation_cancelled;
+	check(!safsyn::render_smf_stream(file, analysis, bank,
+		cancelled_path.string().c_str(), options, preparation_cancelled) &&
+		preparation_cancelled.cancelled && preparation_cancelled.frames_written == 0 &&
+		preparation_cancelled.scheduled_events == 0 && preparation_cancelled.diagnostics.empty() &&
+		preparation_cancelled.phase.cached_variants == 1 &&
+		preparation_cancelled_progress.preparation_valid &&
+		preparation_cancelled_progress.preparation_total == 4 &&
+		preparation_cancelled_progress.preparation_completed == 1 &&
+		!preparation_cancelled_progress.saw_events,
+		"preparation progress cancellation stops after one variant without starting the timeline");
+	const auto preparation_cancelled_bytes = read_file(cancelled_path);
+	check(preparation_cancelled_bytes.size() == 44 &&
+		read_le32(preparation_cancelled_bytes, 40) == 0,
+		"cancelling sample preparation finalizes an empty valid WAV");
 }
 } // namespace
 
@@ -668,8 +817,10 @@ int main(int argc, char** argv)
 	test_remainder_preservation();
 	test_skipped_meta_sysex_and_malformed_inputs();
 	test_sysex_payload_and_master_dispatch(directory);
+	test_timed_source_declared_duration();
 	test_streamed_wav_headers(directory);
 	test_streamed_render_determinism(directory);
+	test_analytic_ticks_before_frame_quantization();
 	test_cohort_histogram_and_mass_dispatch(directory);
 	test_tail_drain(directory);
 	test_render_progress_and_cancellation(directory);

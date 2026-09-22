@@ -623,7 +623,9 @@ struct PhaseProcessor::Impl
 		if (state.attack_hold_frames < region.pcm_len && settings.preserve_attack_ms > 0.0f)
 			state.attack_fade_frames = (std::min)(region.pcm_len - state.attack_hold_frames,
 				static_cast<uint32_t>(std::llround(region.sample_rate * 0.010)));
-		const uint64_t identity = event_hash(region_id, serial, channel, note);
+		// Analytic identity is onset/channel/key, shared across sample layers too.
+		const uint64_t identity = event_hash(settings.mode == PhaseMode::Analytic ? 0 : region_id,
+			serial, channel, note);
 		if (settings.mode == PhaseMode::RandomPolarity)
 		{
 			state.kind = PhaseVoiceState::Kind::Polarity;
@@ -640,7 +642,7 @@ struct PhaseProcessor::Impl
 			if (!settings.continuous)
 			{
 				variant_index = static_cast<uint32_t>(identity % settings.pool_size);
-				angle_hash = variant_seed(entry, variant_index, 0x414e474c45ULL);
+				angle_hash = hash_combine(hash_combine(settings.seed, variant_index), 0x414e474c45ULL);
 				if (!entry.analytic_variants_seen[variant_index])
 				{
 					entry.analytic_variants_seen[variant_index] = true;
@@ -749,7 +751,7 @@ bool PhaseProcessor::prepare(std::span<const SampleRegion> regions, const PhaseP
 			throw std::length_error("Phase cache needs " +
 				std::to_string(progress.total_cache_bytes / 1048576 + (progress.total_cache_bytes % 1048576 != 0)) +
 				" MiB; the limit is " + std::to_string(options.maximum_cache_bytes / 1048576) +
-				" MiB. Reduce the phase pool, choose analytic/coherent mode, or raise the cache limit. FFT working memory is extra.");
+				" MiB. Reduce the phase pool, choose Analytic or Direct sampling mode, or raise the cache limit. FFT working memory is extra.");
 		for (const size_t id : unique_regions)
 		{
 			check_cancel(options.stop);

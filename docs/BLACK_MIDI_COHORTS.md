@@ -232,7 +232,10 @@ with a 4,096-wide search. The parallel WAV has a different hash because lane
 partial sums change floating addition order; fixed-thread regression tests
 require bit-identical repeats and tolerance-equivalence to scalar output.
 
-The remaining mixer optimization is a hot/cold structure-of-arrays split with
+The subsequent SSE2 frame-kernel and atomic worker-handoff pass is documented
+in `MIXER_PERFORMANCE.md`, including updated microbenchmarks and validation.
+
+A remaining mixer optimization is a hot/cold structure-of-arrays split with
 specialized coherent/analytic and loop/envelope kernels. That layout can apply
 AVX2 across cohorts at one output frame without changing the scalar reference
 path. It should be driven by a new full-pass profile because short-interval
