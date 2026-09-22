@@ -57,9 +57,11 @@ It must not be described or measured as phase-only processing.
 - Exact render cohorts retain every logical event serial. Analytic cohorts sum
   per-event left/right cosine and sine terms including angle-dependent RMS
   scales; a logical batch never receives one shared phase angle.
-- Multiplicity-one cohorts use the original per-voice phase operation exactly.
-  Grouped cohorts may differ from the individual reference only through
-  floating summation order.
+- Unfiltered multiplicity-one cohorts use the original per-voice phase operation
+  exactly. Filtered cohorts retain histories for the independent phase basis
+  signals, so partial note-offs preserve each contribution's history, including
+  protected attacks. Differences from individual voices are limited to floating
+  point operation order.
 - Looping regions use separately transformed periodic loop bodies with a
   bounded entry crossfade rather than wrapping an arbitrary transformed tail.
 - A protected attack is copied exactly, followed by a 10 ms smoothstep blend
@@ -83,8 +85,24 @@ It must not be described or measured as phase-only processing.
 Milestone 2.5 resolves SF2 preset zones through instruments to sample zones,
 combines the currently supported preset and instrument generator subset, and
 intersects their key and velocity ranges. Linked left/right samples become one
-logical stereo region backed by the original planar sample data. This does not
-claim the full SF2 modulator system, filters, LFOs, or every generator.
+logical stereo region backed by the original planar sample data. The supported
+subset now includes initial filter cutoff and resonance; this does not claim
+the full SF2 modulator system, modulation envelopes, LFOs, or every generator.
+
+The 2026-09-22 Kestrel comparison intentionally changes the default gain and
+release response. Velocity, CC7/39, and CC11/43 use squared amplitude curves;
+release is exponential to a -100 dB envelope floor and CC72 uses Kestrel's
+asymmetric time mapping. SF2 initial attenuation uses 0.04 dB per generator unit,
+while sustain centibels and SFZ volume retain their existing units. Stereo sample
+center gain is unity per channel. CC71/74 and SF2 cutoff/resonance drive a
+normalized low-pass filter after the envelope and before channel gain, with
+persistent 32-sample coefficient/bypass ramps. MIDI dispatch remains at exact
+scheduled frames. See `CONTROLLERS_AND_MASTERING.md` for the formulas and limits.
+
+The MSVC coherent demo SHA-256 for these defaults is
+`3F90ECD4F378C9C3F4EB805C1364DFDCAE7C8945C869AD1E5C12696A4CAB3603`.
+It replaces `457810A95A5EE047A6BD24E035221D68B6691A3E923EDB0D3BB9EA4B694456F5`;
+the exact hash regression remains enabled.
 
 Bit identity is currently promised for the same MSVC executable and settings.
 Other supported platforms are expected to be numerically equivalent within a
@@ -120,10 +138,11 @@ or a configured maximum tail is reached. Hypernova analysis shows that exact
 same-onset grouping does not materially compress its active peak; the measured
 boundary is documented in `BLACK_MIDI_COHORTS.md`.
 
-## Piano integration baselines
+## Historical piano integration baselines
 
-The coherent seed-loader reference is intentionally preserved by
-`--all-regions`. With `sDetrimental Concert Grand Piano.sf2`, the scripted
+These measurements predate the gain, release, and filter changes above. The
+seed-loader region traversal remains available with `--all-regions`, but its
+audio uses the current DSP defaults. With `sDetrimental Concert Grand Piano.sf2`, the scripted
 four-second render at 48 kHz and 512-voice capacity reports:
 
 - presets: 1

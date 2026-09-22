@@ -78,6 +78,8 @@ enum : uint16_t
 	GEN_StartloopAddrsOffset = 2,
 	GEN_EndloopAddrsOffset = 3,
 	GEN_StartAddrsCoarse = 4,
+	GEN_InitialFilterFc = 8,
+	GEN_InitialFilterQ = 9,
 	GEN_EndAddrsCoarse = 12,
 	GEN_Pan = 17,
 	GEN_AttackVolEnv = 34,
@@ -220,7 +222,14 @@ static bool build_seed_loader_region(const SF2Shdr& sh, const GenSet& generators
 	r.sustain = cb_to_linear(sustain_cb);
 	r.release = timecents_to_sec(generators.s16(GEN_ReleaseVolEnv, -12000));
 	r.pan = generators.s16(GEN_Pan, 0) / 500.0f;
-	r.attenuation = cb_to_linear(generators.s16(GEN_InitialAttenuation, 0));
+	// Kestrel-compatible generator-48 response; envelope sustain remains
+	// ordinary centibels and SFZ volume remains ordinary decibels.
+	r.attenuation = std::pow(10.0f,
+		-std::clamp<int>(generators.s16(GEN_InitialAttenuation, 0), 0, 1440) / 500.0f);
+	r.filter_cutoff_cents = static_cast<float>(std::clamp<int>(
+		generators.s16(GEN_InitialFilterFc, 13500), 1500, 13500));
+	r.filter_resonance_cb = static_cast<float>(std::clamp<int>(
+		generators.s16(GEN_InitialFilterQ, 0), 0, 960));
 	r.exclusive_class = generators.u16(GEN_ExclusiveClass, 0);
 	return true;
 }
@@ -483,8 +492,12 @@ bool load_sf2(const char* path, Soundfont& sf)
 				const GenSet& pan_generators = r.channels == 2 ? inst_global : izone;
 				r.pan = std::clamp(combined_s16(pzone, pan_generators, GEN_Pan) / 500.0f,
 					-1.0f, 1.0f);
-				r.attenuation = cb_to_linear(static_cast<int16_t>(std::clamp<int>(
-					combined_s16(pzone, izone, GEN_InitialAttenuation), 0, 1440)));
+				r.attenuation = std::pow(10.0f, -std::clamp<int>(
+					combined_s16(pzone, izone, GEN_InitialAttenuation), 0, 1440) / 500.0f);
+				r.filter_cutoff_cents = static_cast<float>(std::clamp<int>(
+					combined_s16(pzone, izone, GEN_InitialFilterFc, 13500), 1500, 13500));
+				r.filter_resonance_cb = static_cast<float>(std::clamp<int>(
+					combined_s16(pzone, izone, GEN_InitialFilterQ), 0, 960));
 				r.exclusive_class = izone.u16(GEN_ExclusiveClass, 0);
 
 				sf.regions.push_back(r);

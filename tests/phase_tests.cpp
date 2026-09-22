@@ -236,6 +236,13 @@ void test_fft_magnitudes_and_dc_nyquist()
 	coherent.set_soundfont(&bank);
 	changed.set_soundfont(&bank);
 	changed.set_phase_settings(settings(safsyn::PhaseMode::IndependentBins, 1, 13));
+	// Measure the phase transform at unity gain so small spectral bins are not
+	// dominated by rounding from unrelated channel-volume and pan curves.
+	for (auto* engine : {&coherent, &changed})
+	{
+		engine->control_change(0, 7, 127);
+		engine->control_change(0, 10, 0);
+	}
 	coherent.note_on(0, 60, 127);
 	changed.note_on(0, 60, 127);
 	const auto original_magnitude = dft_magnitudes(left_channel(render(coherent, 64)));

@@ -121,6 +121,9 @@ void write_sf2_fixture(const std::filesystem::path& path)
 {
 	// Generator IDs used by this deliberately small fixture.
 	constexpr uint16_t pan = 17;
+	constexpr uint16_t filter_cutoff = 8;
+	constexpr uint16_t filter_q = 9;
+	constexpr uint16_t attenuation = 48;
 	constexpr uint16_t instrument = 41;
 	constexpr uint16_t key_range = 43;
 	constexpr uint16_t velocity_range = 44;
@@ -139,10 +142,13 @@ void write_sf2_fixture(const std::filesystem::path& path)
 	append_phdr(phdr, "Other", 1, 0, 1);
 	append_phdr(phdr, "EOP", 0, 0, 2);
 	std::vector<uint8_t> pbag;
-	append_bag(pbag, 0); append_bag(pbag, 3); append_bag(pbag, 4);
+	append_bag(pbag, 0); append_bag(pbag, 6); append_bag(pbag, 7);
 	std::vector<uint8_t> pgen;
 	append_range_gen(pgen, key_range, 50, 70);
 	append_gen(pgen, fine_tune, 10);
+	append_gen(pgen, filter_cutoff, -1200);
+	append_gen(pgen, filter_q, 30);
+	append_gen(pgen, attenuation, 25);
 	append_gen(pgen, instrument, 0);
 	append_gen(pgen, instrument, 1);
 
@@ -151,22 +157,31 @@ void write_sf2_fixture(const std::filesystem::path& path)
 	append_inst(inst, "OtherInst", 3);
 	append_inst(inst, "EOI", 4);
 	std::vector<uint8_t> ibag;
-	append_bag(ibag, 0); append_bag(ibag, 5); append_bag(ibag, 10);
-	append_bag(ibag, 14); append_bag(ibag, 15);
+	append_bag(ibag, 0); append_bag(ibag, 8); append_bag(ibag, 16);
+	append_bag(ibag, 23); append_bag(ibag, 24);
 	std::vector<uint8_t> igen;
 	append_range_gen(igen, key_range, 60, 80);
 	append_range_gen(igen, velocity_range, 0, 63);
 	append_gen(igen, pan, -500);
 	append_gen(igen, fine_tune, 20);
+	append_gen(igen, filter_cutoff, 13200);
+	append_gen(igen, filter_q, 70);
+	append_gen(igen, attenuation, 50);
 	append_gen(igen, sample_id, 0);
 	append_range_gen(igen, key_range, 60, 80);
 	append_range_gen(igen, velocity_range, 0, 63);
 	append_gen(igen, pan, 500);
 	append_gen(igen, fine_tune, 20);
+	append_gen(igen, filter_cutoff, 13200);
+	append_gen(igen, filter_q, 70);
+	append_gen(igen, attenuation, 50);
 	append_gen(igen, sample_id, 1);
 	append_range_gen(igen, key_range, 60, 80);
 	append_range_gen(igen, velocity_range, 64, 127);
 	append_gen(igen, fine_tune, 20);
+	append_gen(igen, filter_cutoff, 13200);
+	append_gen(igen, filter_q, 70);
+	append_gen(igen, attenuation, 50);
 	append_gen(igen, sample_id, 2);
 	append_gen(igen, sample_id, 3);
 
@@ -252,9 +267,9 @@ void test_velocity_response()
 		for (const uint8_t velocity : {uint8_t{64}, uint8_t{1}})
 		{
 			const float actual = render_one(velocity) / full;
-			const float expected = std::pow(static_cast<float>(velocity) / 127.0f, 1.7f);
+			const float expected = std::pow(static_cast<float>(velocity) / 127.0f, 2.0f);
 			check(std::abs(actual - expected) < 1e-6f,
-				"MIDI velocity follows the reference velocity^1.7 amplitude curve");
+				"MIDI velocity follows the Kestrel velocity-squared amplitude curve");
 		}
 	}
 }
@@ -302,7 +317,7 @@ uint32_t cc72_release_frames(safsyn::VoiceModel model, uint8_t value,
 	engine.set_voice_model(model);
 	engine.set_soundfont(&bank);
 	engine.note_on(0, 60, 127);
-	std::array<float, 2> audio{};
+	std::array<float, 6> audio{};
 	engine.render_audio(audio.data(), 1);
 	if (defer_with_sustain)
 	{
@@ -321,7 +336,7 @@ uint32_t cc72_release_frames(safsyn::VoiceModel model, uint8_t value,
 	}
 
 	uint32_t frames = 0;
-	while (engine.active_voice_count() != 0 && frames < 2048)
+	while (engine.active_voice_count() != 0 && frames < 16000)
 	{
 		engine.render_audio(audio.data(), 1);
 		++frames;
@@ -342,13 +357,15 @@ void test_release_time_controller()
 		check(defaults.controller_value(0, 72) == 64,
 			"CC121 restores the neutral CC72 release-time value");
 
-		check(cc72_release_frames(model, 0) == 8,
-			"CC72 value 0 shortens the SoundFont release by three octaves");
-		check(cc72_release_frames(model, 64) == 64,
+		check(cc72_release_frames(model, 0) == 4,
+			"CC72 value 0 respects the four-millisecond release floor");
+		const auto neutral = cc72_release_frames(model, 64);
+		check(neutral >= 64 && neutral <= 65,
 			"CC72 value 64 preserves the SoundFont release duration");
-		check(cc72_release_frames(model, 127) == 496,
-			"CC72 value 127 lengthens the SoundFont release by the bipolar mapping");
-		check(cc72_release_frames(model, 47, true) == 37,
+		const auto longest = cc72_release_frames(model, 127);
+		check(longest >= 15066 && longest <= 15069,
+			"CC72 value 127 adds 15.00282 seconds to the base release");
+		check(cc72_release_frames(model, 47, true) == 15,
 			"Hypernova CC72 value 47 applies when CC64 unlatches the note");
 	}
 }
@@ -381,14 +398,14 @@ void test_controller_contract()
 		engine.control_change(0, 7, 64);
 		engine.control_change(0, 39, 127);
 		engine.render_audio(changed.data(), 1);
-		const double expected_volume_ratio = (8319.0 / 16383.0) / (100.0 / 127.0);
+		const double expected_volume_ratio = std::pow((8319.0 / 16383.0) / (100.0 / 127.0), 2.0);
 		check(std::abs(changed[0] / baseline[0] - expected_volume_ratio) < 1e-5,
 			"CC7/39 form a 14-bit volume pair on an already-active voice");
 		const float volume_only = changed[0];
 		engine.control_change(0, 11, 64);
 		engine.control_change(0, 43, 127);
 		engine.render_audio(changed.data(), 1);
-		check(std::abs(changed[0] / volume_only - 8319.0 / 16383.0) < 1e-5,
+		check(std::abs(changed[0] / volume_only - std::pow(8319.0 / 16383.0, 2.0)) < 1e-5,
 			"CC11/43 form a 14-bit expression pair on an already-active voice");
 		engine.control_change(0, 10, 127);
 		engine.control_change(0, 42, 127);
@@ -454,6 +471,184 @@ void test_controller_contract()
 		engine.render_audio(audio.data(), 4);
 		check(engine.active_voice_count() == 0,
 			"pedal-up releases notes deferred by All Notes Off");
+	}
+}
+
+void test_exponential_release()
+{
+	for (const auto model : {safsyn::VoiceModel::Individual, safsyn::VoiceModel::Cohorts})
+	{
+		auto bank = make_constant_bank();
+		bank.regions[0].release = 0.064f;
+		safsyn::SynthEngine engine(1000, 8);
+		engine.set_soundfont(&bank);
+		engine.set_voice_model(model);
+		engine.note_on(0, 60, 127);
+		std::array<float, 32> audio{};
+		engine.render_audio(audio.data(), 1);
+		const float held = audio[0];
+		engine.note_off(0, 60);
+		engine.render_audio(audio.data(), 16);
+		check(std::abs(audio[30] / held - 0.05623413f) < 1e-6f,
+			"one quarter of a release attenuates by 25 dB");
+		engine.render_audio(audio.data(), 16);
+		check(std::abs(audio[30] / held - 0.00316228f) < 1e-7f,
+			"half of a release attenuates by 50 dB instead of halving amplitude");
+		const float releasing = audio[30];
+		engine.control_change(0, 72, 0);
+		engine.render_audio(audio.data(), 1);
+		check(std::abs(audio[0] / releasing - 0.05623413f) < 1e-6f,
+			"CC72 retimes an already-releasing voice without restarting its envelope");
+		engine.render_audio(audio.data(), 4);
+		check(engine.active_voice_count() == 0,
+			"release retires when its envelope reaches the absolute -100 dB floor");
+
+		engine.set_soundfont(nullptr);
+		bank.regions[0].exclusive_class = 1;
+		engine.set_soundfont(&bank);
+		engine.reset();
+		engine.note_on(0, 60, 127);
+		engine.render_audio(audio.data(), 1);
+		engine.note_on(0, 61, 127);
+		engine.control_change(0, 72, 127);
+		engine.render_audio(audio.data(), 6);
+		check(engine.active_voice_count() == 1,
+			"CC72 does not lengthen the explicit exclusive-class choke fade");
+	}
+}
+
+void test_controller_amplitude_curves()
+{
+	auto bank = make_constant_bank();
+	for (const auto model : {safsyn::VoiceModel::Individual, safsyn::VoiceModel::Cohorts})
+	{
+		safsyn::SynthEngine engine(1000, 8);
+		engine.set_soundfont(&bank);
+		engine.set_voice_model(model);
+		engine.control_change(0, 7, 127);
+		engine.note_on(0, 60, 127);
+		auto sample = [&] {
+			std::array<float, 2> audio{};
+			engine.render_audio(audio.data(), 1);
+			return audio[0];
+		};
+		const float full = sample();
+		for (const uint8_t msb : {uint8_t{7}, uint8_t{11}})
+		{
+			const auto lsb = static_cast<uint8_t>(msb + 32);
+			for (const uint8_t value : {uint8_t{0}, uint8_t{1}, uint8_t{64}, uint8_t{127}})
+			{
+				engine.control_change(0, msb, value);
+				check(std::abs(sample() / full - std::pow(value / 127.0f, 2.0f)) < 1e-6f,
+					"volume and expression use squared 7-bit values with exact endpoints");
+			}
+			engine.control_change(0, msb, 64);
+			engine.control_change(0, lsb, 127);
+			check(std::abs(sample() / full - std::pow(8319.0f / 16383.0f, 2.0f)) < 1e-6f,
+				"fine volume and expression square the complete 14-bit value");
+			engine.control_change(0, msb, 64);
+			check(engine.controller_value(0, lsb) == 0 &&
+				std::abs(sample() / full - 0.2539525f) < 1e-6f,
+				"a new volume or expression MSB clears the preceding fine value");
+			engine.control_change(0, msb, 127);
+		}
+	}
+}
+
+void test_lowpass_controllers()
+{
+	constexpr uint32_t rate = 16000;
+	auto bank = make_constant_bank(rate);
+	auto& pcm = bank.sfz_pcm[0];
+	pcm.resize(2048);
+	for (size_t frame = 0; frame < 1024; ++frame)
+	{
+		pcm[frame * 2] = static_cast<int16_t>(12000.0 * std::sin(2.0 * 3.141592653589793 * frame / 128.0));
+		pcm[frame * 2 + 1] = static_cast<int16_t>(12000.0 * std::sin(2.0 * 3.141592653589793 * frame / 4.0));
+	}
+	auto& region = bank.regions[0];
+	region.pcm = pcm.data();
+	region.pcm_len = region.loop_end = 1024;
+	region.channels = 2;
+	region.filter_cutoff_cents = 8300.0f; // Approximately 988 Hz.
+	for (const auto model : {safsyn::VoiceModel::Individual, safsyn::VoiceModel::Cohorts})
+	{
+		safsyn::SynthEngine filtered(rate, 8), bypass(rate, 8);
+		for (auto* engine : {&filtered, &bypass})
+		{
+			engine->set_soundfont(&bank);
+			engine->set_voice_model(model);
+		}
+		bypass.control_change(0, 74, 127);
+		filtered.note_on(0, 60, 127);
+		bypass.note_on(0, 60, 127);
+		auto energy = [&](safsyn::SynthEngine& engine) {
+			std::array<float, 1024> audio{};
+			engine.render_audio(audio.data(), 512);
+			std::array<double, 2> rms{};
+			for (size_t frame = 256; frame < 512; ++frame)
+				for (size_t channel = 0; channel < 2; ++channel)
+				{
+					const double value = audio[frame * 2 + channel];
+					check(std::isfinite(value), "filter output remains finite");
+					rms[channel] += value * value;
+				}
+			for (auto& value : rms) value = std::sqrt(value / 256.0);
+			return rms;
+		};
+		const auto full = energy(bypass);
+		const auto lowpass = energy(filtered);
+		check(lowpass[0] / full[0] > 0.98 && lowpass[0] / full[0] < 1.01 &&
+			lowpass[1] / full[1] < 0.05,
+			"SF2 low-pass preserves low frequencies and rejects highs independently in stereo");
+		filtered.control_change(0, 71, 127);
+		const auto resonant = energy(filtered);
+		check(resonant[0] < lowpass[0] * 0.5,
+			"CC71 applies the reference resonance gain compensation to active notes");
+		filtered.control_change(0, 74, 127);
+		const auto opened = energy(filtered);
+		check(std::abs(opened[0] / full[0] - 1.0) < 1e-5 &&
+			std::abs(opened[1] / full[1] - 1.0) < 1e-5,
+			"CC74 opens an active note's filter through the bypass transition");
+		filtered.control_change(0, 121, 0);
+		const auto reset = energy(filtered);
+		check(filtered.controller_value(0, 71) == 64 && filtered.controller_value(0, 74) == 64 &&
+			std::abs(reset[0] / lowpass[0] - 1.0) < 1e-5 &&
+			std::abs(reset[1] / lowpass[1] - 1.0) < 1e-5,
+			"CC121 restores neutral filter controllers on a held note");
+	}
+}
+
+void test_stereo_center_gain()
+{
+	auto mono = make_constant_bank();
+	auto stereo = make_constant_bank();
+	stereo.regions[0].channels = 2;
+	stereo.regions[0].pcm_len = stereo.regions[0].loop_end = 64;
+	for (const auto model : {safsyn::VoiceModel::Individual, safsyn::VoiceModel::Cohorts})
+	{
+		auto sample = [&](const safsyn::Soundfont& bank, uint8_t pan) {
+			safsyn::SynthEngine engine(1000, 8);
+			engine.set_soundfont(&bank);
+			engine.set_voice_model(model);
+			engine.control_change(0, 7, 127);
+			engine.control_change(0, 10, pan);
+			engine.note_on(0, 60, 127);
+			std::array<float, 2> audio{};
+			engine.render_audio(audio.data(), 1);
+			return audio;
+		};
+		const auto mono_center = sample(mono, 64);
+		const auto stereo_center = sample(stereo, 64);
+		const auto stereo_left = sample(stereo, 0);
+		check(std::abs(mono_center[0] - 0.35355339f) < 1e-6f &&
+			std::abs(mono_center[1] - 0.35355339f) < 1e-6f,
+			"mono center panning retains the constant-power split");
+		check(std::abs(stereo_center[0] - 0.5f) < 1e-6f &&
+			std::abs(stereo_center[1] - 0.5f) < 1e-6f,
+			"stereo center panning retains unity gain per source channel");
+		check(std::abs(stereo_left[0] - 0.70710678f) < 1e-6f && stereo_left[1] == 0.0f,
+			"stereo pan endpoints preserve the normalized constant-power law");
 	}
 }
 
@@ -725,6 +920,19 @@ void test_sf2_preset_loader(const std::filesystem::path& directory)
 		"preset and instrument key ranges are intersected");
 	check(low->fine_tune == 30,
 		"preset and instrument tuning generators are combined");
+	check(low->filter_cutoff_cents == 12000.0f && low->filter_resonance_cb == 100.0f &&
+		high->filter_cutoff_cents == 12000.0f && high->filter_resonance_cb == 100.0f,
+		"preset and instrument filter generators combine for stereo and mono regions");
+	check(std::abs(low->attenuation - 0.7079458f) < 1e-6f &&
+		std::abs(high->attenuation - 0.7079458f) < 1e-6f,
+		"SF2 attenuation 75 uses the reference -3 dB amplitude");
+	check(bank.stress_regions[0].filter_cutoff_cents == 13200.0f &&
+		bank.stress_regions[0].filter_resonance_cb == 70.0f &&
+		std::abs(bank.stress_regions[0].attenuation - 0.7943282f) < 1e-6f,
+		"the seed-loader view applies instrument filter and attenuation generators");
+	check(bank.regions.back().filter_cutoff_cents == 13500.0f &&
+		bank.regions.back().filter_resonance_cb == 0.0f && bank.regions.back().attenuation == 1.0f,
+		"absent filter and attenuation generators retain their neutral defaults");
 	check(low->channels == 2 && low->pcm_len == 4 && low->pcm_right &&
 		low->pcm[0] == 1000 && low->pcm_right[0] == -1000,
 		"linked left/right samples are reconstructed as one planar stereo region");
@@ -818,6 +1026,10 @@ int main(int argc, char** argv)
 	test_independent_instances();
 	test_release_and_sustain();
 	test_release_time_controller();
+	test_exponential_release();
+	test_controller_amplitude_curves();
+	test_lowpass_controllers();
+	test_stereo_center_gain();
 	test_controller_contract();
 	test_rpn_pitch_bend_sensitivity();
 	test_determinism_and_block_invariance();

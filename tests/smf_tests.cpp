@@ -597,9 +597,10 @@ void test_tail_drain(const std::filesystem::path& directory)
 	options.block_frames = 37;
 	const auto drained_path = directory / "tail-drained.wav";
 	safsyn::SmfRenderResult drained;
+	// The float exponential coefficient crosses the -100 dB floor on frame 11.
 	check(safsyn::render_smf_stream(file, analysis, bank, drained_path.string().c_str(),
 		options, drained) && drained.active_voices_at_end == 0 &&
-		!drained.tail_ceiling_reached && drained.tail_frames_written == 10,
+		!drained.tail_ceiling_reached && drained.tail_frames_written == 11,
 		"tail drain stops exactly when the final logical voice becomes inactive");
 
 	options.maximum_tail_frames = 5;

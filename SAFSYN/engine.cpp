@@ -46,10 +46,20 @@ const std::array<float, 128>& velocity_amplitudes() noexcept
 	static const auto amplitudes = [] {
 		std::array<float, 128> result{};
 		for (size_t velocity = 1; velocity < result.size(); ++velocity)
-			result[velocity] = std::pow(static_cast<float>(velocity) / 127.0f, 1.7f);
+		{
+			const float normalized = static_cast<float>(velocity) / 127.0f;
+			result[velocity] = normalized * normalized;
+		}
 		return result;
 	}();
 	return amplitudes;
+}
+
+float controller_amplitude(uint8_t msb, uint8_t lsb) noexcept
+{
+	const float normalized = lsb == 0 ? msb / 127.0f :
+		static_cast<float>((msb << 7) | lsb) / 16383.0f;
+	return normalized * normalized;
 }
 }
 
@@ -243,7 +253,10 @@ void SynthEngine::compute_gains(const SampleRegion& region, uint8_t channel,
 	const float combined_pan = std::clamp(region.pan + channels_[channel].pan,
 		-1.0f, 1.0f);
 	const double angle = (static_cast<double>(combined_pan) + 1.0) * pi * 0.25;
-	const float base_gain = region.attenuation * velocity_amplitudes()[velocity];
+	// A stereo region already supplies distinct left/right signals. Compensate
+	// the mono pan law's -3 dB center so linked samples retain their native level.
+	const float stereo_gain = region.channels == 2 ? 1.4142135623730951f : 1.0f;
+	const float base_gain = region.attenuation * velocity_amplitudes()[velocity] * stereo_gain;
 	left = base_gain * static_cast<float>(std::cos(angle));
 	right = base_gain * static_cast<float>(std::sin(angle));
 }
@@ -290,7 +303,8 @@ void SynthEngine::begin_release(Voice& voice, float seconds_override) noexcept
 		return;
 	}
 	voice.stage = Voice::Stage::Release;
-	voice.env_inc = -voice.env / (seconds * sample_rate_);
+	voice.release_coefficient = release_coefficient(seconds);
+	voice.release_override = seconds_override >= 0.0f;
 }
 
 float SynthEngine::release_seconds(const SampleRegion& region, uint8_t channel) const noexcept
@@ -298,15 +312,67 @@ float SynthEngine::release_seconds(const SampleRegion& region, uint8_t channel) 
 	if (channel >= 16)
 		return region.release;
 
-	// SpessaSynth's extended CC72 mapping is a positive linear bipolar
-	// modulation of +/-3600 timecents. MIDI value 64 is therefore neutral,
-	// and the SoundFont region remains the source of the base release time.
-	constexpr float release_range_timecents = 3600.0f;
-	constexpr float timecents_per_octave = 1200.0f;
-	const float bipolar = static_cast<float>(
-		static_cast<int>(channels_[channel].controllers[72]) - 64) / 64.0f;
-	return region.release * std::exp2(
-		bipolar * release_range_timecents / timecents_per_octave);
+	// Kestrel-compatible response: halve time every eight steps below neutral,
+	// add time above neutral, and retain the reference's four-millisecond floor.
+	const float offset = static_cast<float>(channels_[channel].controllers[72]) - 64.0f;
+	const float seconds = offset <= 0.0f ? region.release * std::exp2(offset / 8.0f) :
+		region.release + 0.00006f * offset * offset * offset;
+	return (std::max)(seconds, (std::min)(0.004f, region.release));
+}
+
+float SynthEngine::release_coefficient(float seconds) const noexcept
+{
+	const float frames = (std::max)(1.0f, seconds * sample_rate_);
+	return std::pow(10.0f, -5.0f / frames);
+}
+
+detail::FilterCoefficients SynthEngine::filter_coefficients(const SampleRegion& region,
+	uint8_t channel) const noexcept
+{
+	const auto& cc = channels_[channel].controllers;
+	const float cents = region.filter_cutoff_cents + (static_cast<int>(cc[74]) - 64) * 75.0f;
+	const float frequency = 8.176f * std::exp2(cents / 1200.0f);
+	if (cents >= 13500.0f || frequency <= 20.0f || frequency >= sample_rate_ * 0.49f)
+		return {};
+	const float resonance = region.filter_resonance_cb +
+		(std::max)(0, static_cast<int>(cc[71]) - 64) * (240.0f / 63.0f);
+	const float q = std::pow(10.0f, (resonance / 10.0f - 3.01f) / 20.0f);
+	const float gain = std::sqrt(0.7071067811865475f / q);
+	const float angle = static_cast<float>(2.0 * pi) * frequency / sample_rate_;
+	const float cosine = std::cos(angle);
+	const float alpha = std::sin(angle) / (2.0f * q);
+	const float divisor = 1.0f + alpha;
+	const float b0 = gain * (1.0f - cosine) * 0.5f / divisor;
+	return {b0, 2.0f * b0, -2.0f * cosine / divisor,
+		(1.0f - alpha) / divisor, true};
+}
+
+void SynthEngine::update_channel_filters(uint8_t channel) noexcept
+{
+	if (voice_model_ == VoiceModel::Cohorts)
+	{
+		if (cohort_engine_)
+			cohort_engine_->update_channel_filters(*this, channel);
+		return;
+	}
+	for (auto& voice : voices_)
+		if (voice.active() && voice.channel == channel &&
+			voice.filter.set(filter_coefficients(*voice.region, channel)))
+			voice.filter_state = {};
+}
+
+void SynthEngine::update_channel_releases(uint8_t channel) noexcept
+{
+	if (voice_model_ == VoiceModel::Cohorts)
+	{
+		if (cohort_engine_)
+			cohort_engine_->update_channel_releases(*this, channel);
+		return;
+	}
+	for (auto& voice : voices_)
+		if (voice.stage == Voice::Stage::Release && voice.channel == channel &&
+			!voice.release_override)
+			voice.release_coefficient = release_coefficient(release_seconds(*voice.region, channel));
 }
 
 float SynthEngine::advance_envelope(Voice& voice) noexcept
@@ -359,8 +425,8 @@ float SynthEngine::advance_envelope(Voice& voice) noexcept
 		voice.env = voice.region->sustain;
 		break;
 	case Voice::Stage::Release:
-		voice.env += voice.env_inc;
-		if (voice.env <= 0.0f)
+		voice.env *= voice.release_coefficient;
+		if (voice.env <= 1.0e-5f)
 		{
 			voice = Voice{};
 			return 0.0f;
@@ -421,6 +487,7 @@ void SynthEngine::note_on(uint8_t channel, uint8_t note, uint8_t velocity) noexc
 		voice->serial = serial;
 		voice->phase = phase_processor_.assign(region, region_id, serial, channel, note);
 		compute_gains(region, channel, velocity, voice->gain_l, voice->gain_r);
+		voice->filter.set(filter_coefficients(region, channel), true);
 		begin_envelope(*voice);
 		++stats_.started_voices;
 		++stats_.logical_voices_started;
@@ -577,8 +644,8 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 	case 0:
 		break;
 	case 7:
-		state.volume = static_cast<float>((state.controllers[7] << 7) |
-			state.controllers[39]) / 16383.0f;
+		state.controllers[39] = 0;
+		state.volume = controller_amplitude(state.controllers[7], 0);
 		break;
 	case 10:
 	{
@@ -589,14 +656,13 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 		update_channel_voice_gains(channel);
 		break;
 	case 11:
-		state.expression = static_cast<float>((state.controllers[11] << 7) |
-			state.controllers[43]) / 16383.0f;
+		state.controllers[43] = 0;
+		state.expression = controller_amplitude(state.controllers[11], 0);
 		break;
 	case 32:
 		break;
 	case 39:
-		state.volume = static_cast<float>((state.controllers[7] << 7) |
-			state.controllers[39]) / 16383.0f;
+		state.volume = controller_amplitude(state.controllers[7], state.controllers[39]);
 		break;
 	case 42:
 	{
@@ -607,8 +673,7 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 		update_channel_voice_gains(channel);
 		break;
 	case 43:
-		state.expression = static_cast<float>((state.controllers[11] << 7) |
-			state.controllers[43]) / 16383.0f;
+		state.expression = controller_amplitude(state.controllers[11], state.controllers[43]);
 		break;
 	case 64:
 	{
@@ -628,8 +693,12 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 		}
 		break;
 	}
+	case 71:
+	case 74:
+		update_channel_filters(channel);
+		break;
 	case 72:
-		// Applied when a voice enters release, including deferred sustain releases.
+		update_channel_releases(channel);
 		break;
 	case 98:
 	case 99:
@@ -678,6 +747,8 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 						begin_release(voice);
 		}
 		update_channel_voice_gains(channel);
+		update_channel_filters(channel);
+		update_channel_releases(channel);
 		break;
 	}
 	case 123:
@@ -880,10 +951,17 @@ void SynthEngine::render_audio(float* out, uint32_t frames) noexcept
 				sample_r = source_r0 + (source_r1 - source_r0) * fraction;
 			}
 
-			const float amplitude = envelope * channel.volume * channel.expression *
-				master_volume_;
-			out[static_cast<size_t>(frame) * 2] += sample_l * voice.gain_l * amplitude;
-			out[static_cast<size_t>(frame) * 2 + 1] += sample_r * voice.gain_r * amplitude;
+			float filtered_l = sample_l * envelope;
+			float filtered_r = sample_r * envelope;
+			if (voice.filter.active())
+			{
+				filtered_l = voice.filter_state.process(filtered_l, 0, voice.filter);
+				filtered_r = voice.filter_state.process(filtered_r, 1, voice.filter);
+			}
+			voice.filter.advance();
+			const float amplitude = channel.volume * channel.expression * master_volume_;
+			out[static_cast<size_t>(frame) * 2] += filtered_l * voice.gain_l * amplitude;
+			out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * voice.gain_r * amplitude;
 
 			voice.pos += voice.loop_dir_fwd ? increment : -increment;
 			if (valid_loop && (region.loop_mode == LoopMode::Forward ||

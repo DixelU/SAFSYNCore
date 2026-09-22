@@ -1,6 +1,7 @@
 #pragma once
 
 #include "phase.h"
+#include "filter.h"
 
 #include <array>
 #include <cstddef>
@@ -55,6 +56,9 @@ struct SampleRegion
 
 	float pan = 0.0f;
 	float attenuation = 1.0f;
+	// Absolute cents and centibels, after combining SF2 zone generators.
+	float filter_cutoff_cents = 13500.0f;
+	float filter_resonance_cb = 0.0f;
 	uint16_t exclusive_class = 0;
 };
 
@@ -202,12 +206,16 @@ private:
 		Stage stage = Stage::Off;
 		float env = 0.0f;
 		float env_inc = 0.0f;
+		float release_coefficient = 0.0f;
+		bool release_override = false;
 		uint32_t hold_samples_left = 0;
 		float gain_l = 0.0f;
 		float gain_r = 0.0f;
 		bool note_off_pending = false;
 		uint64_t serial = 0;
 		PhaseVoiceState phase;
+		detail::FilterRamp filter;
+		detail::StereoFilterState filter_state;
 
 		bool active() const noexcept { return stage != Stage::Off; }
 	};
@@ -221,7 +229,9 @@ private:
 			controllers[7] = 100;
 			controllers[10] = 64;
 			controllers[11] = 127;
+			controllers[71] = 64;
 			controllers[72] = 64;
+			controllers[74] = 64;
 			controllers[98] = 127;
 			controllers[99] = 127;
 			controllers[100] = 127;
@@ -229,7 +239,7 @@ private:
 		}
 
 		std::array<uint8_t, 128> controllers{};
-		float volume = 100.0f / 127.0f;
+		float volume = (100.0f / 127.0f) * (100.0f / 127.0f);
 		float expression = 1.0f;
 		float pan = 0.0f;
 		float pitch_bend_semitones = 0.0f;
@@ -246,6 +256,11 @@ private:
 	void compute_gains(const SampleRegion& region, uint8_t channel, uint8_t velocity,
 		float& left, float& right) const noexcept;
 	float release_seconds(const SampleRegion& region, uint8_t channel) const noexcept;
+	float release_coefficient(float seconds) const noexcept;
+	detail::FilterCoefficients filter_coefficients(const SampleRegion& region,
+		uint8_t channel) const noexcept;
+	void update_channel_filters(uint8_t channel) noexcept;
+	void update_channel_releases(uint8_t channel) noexcept;
 	void begin_release(Voice& voice, float seconds_override = -1.0f) noexcept;
 	void begin_envelope(Voice& voice) noexcept;
 	float advance_envelope(Voice& voice) noexcept;

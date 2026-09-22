@@ -2,8 +2,8 @@
 
 This milestone fixes the controller semantics exposed by `Hypernova.mid` and
 adds an optional listening/mastering stage after the raw float mix. Neither
-phase processing nor limiting is enabled by default, and the original coherent
-SHA guard remains exact.
+phase processing nor limiting is enabled by default. The coherent SHA guard
+remains exact, with its expected value updated for the default DSP changes below.
 
 ## Controller contract
 
@@ -14,6 +14,9 @@ The engine now implements:
 - CC101/100 RPN and CC99/98 NRPN selection with CC6/38 Data Entry;
 - RPN 0 pitch-bend sensitivity, including immediate retuning of held voices;
 - mid-note volume, pan, expression, pitch bend, and master-volume updates;
+- squared velocity, volume, and expression amplitude curves;
+- exponential release with CC72 updates to held, sustained, and releasing notes;
+- SF2 initial cutoff/resonance and CC74/71 low-pass filtering of active notes;
 - CC120 All Sound Off as immediate channel silence, regardless of data byte;
 - CC121 Reset All Controllers while preserving bank and program;
 - CC123 through CC127 as sustain-aware All Notes Off behavior;
@@ -27,6 +30,70 @@ channel and available to later DSP stages; retaining a CC does not imply that
 its corresponding effect processor exists yet. CC121 resets the addressed
 channel's controller table, parameter selection, bend value, and bend range
 while preserving bank and program.
+
+### Kestrel response alignment (2026-09-22)
+
+Velocity amplitude is `(velocity / 127)^2`. Volume and expression each square
+their normalized value: MSB-only values use `MSB / 127`, while a nonzero fine
+value uses `(128 * MSB + LSB) / 16383`. A new CC7 or CC11 clears its fine value,
+matching Kestrel's handling of interleaved coarse/fine automation. CC7 still
+defaults to 100 and CC11 to 127.
+
+For base release time `r` and CC72 offset `d = value - 64`, release time is
+`r * 2^(d/8)` below neutral and `r + 0.00006 * d^3` above neutral. Its minimum
+is `min(0.004, r)` seconds. Each release sample multiplies the current envelope
+by `10^(-5 / max(1, release_seconds * sample_rate))`; the voice retires at an
+absolute envelope level of `1e-5`. This reaches -50 dB halfway through a release
+started at full level. A quieter initial envelope reaches the floor sooner;
+float rounding can slightly shift the final frame. CC72 changes also retime
+existing releases without restarting their level. Explicit exclusive-class
+choke fades retain their separate duration. CC72 value 64 is neutral.
+
+SF2 `initialFilterFc` and `initialFilterQ` combine across preset and instrument
+zones. CC74 adds 75 cents per step relative to 64. CC71 adds up to 240 centibels
+of resonance above 64; values below 64 add none. The RBJ low-pass uses Kestrel's
+resonance gain compensation and bypass thresholds (13500 cents, 20 Hz, or
+49% of sample rate). Filters run independently for left and right after the
+volume envelope, before channel gain. Mid-note changes interpolate coefficients
+and bypass mix over 32 samples, with state preserved across render calls and
+partial cohort releases. CC71/74 default to 64 and CC121 restores those values.
+
+SF2 initial attenuation uses Kestrel's 0.04 dB per generator unit, so 75 means
+-3 dB. Envelope sustain remains ordinary centibels and SFZ volume remains dB.
+Stereo regions compensate the mono panning law's -3 dB center attenuation;
+each stereo source channel has unity center gain. Mono panning is unchanged.
+
+This aligns the tested gain, release, and static filter responses. It does not
+implement Kestrel's full synthesis model: SYNCore still dispatches MIDI at exact
+sample boundaries, retains its pan-combination and CC121 rules, and does not
+implement modulation-envelope/LFO filter sweeps or all of Kestrel's controllers.
+Older measurements below are historical and do not describe these new defaults.
+
+The first 60 seconds of the supplied `Hypernova.mid` and
+`sDetrimental Concert Grand Piano.sf2` were rendered at 48 kHz with coherent
+phase, linear interpolation, unlimited SYNCore cohorts, and no output gain or
+limiter. Kestrel's sample-pool resampling was disabled. Both renders processed
+52,529 note-ons without steals or drops. Measurements use their common first
+2,879,998 frames; Kestrel's final block extends beyond the excerpt.
+
+| Interval | Previous SYNCore RMS | Updated SYNCore RMS | Kestrel RMS | Updated difference |
+|---|---:|---:|---:|---:|
+| 0-5 seconds | -18.793 dBFS | -16.315 dBFS | -16.329 dBFS | +0.013 dB |
+| 40-60 seconds | +4.551 dBFS | -3.439 dBFS | -3.463 dBFS | +0.024 dB |
+| Whole excerpt | +0.107 dBFS | -5.896 dBFS | -5.912 dBFS | +0.016 dB |
+
+Updated SYNCore peak/RMS amplitudes are 4.487008 / 0.507244; Kestrel's are
+4.465930 / 0.506316. Waveform correlation over the common frames is 0.99098,
+so this is close measured agreement, not sample identity or a subjective
+listening claim. The original, intermediate, and final renders plus JSON
+measurements remain under the ignored local `build/cc-audit/` directory.
+The updated render SHA-256 is
+`BC7DB490388CF15250AD2BBB2EC2EB4801BC6926D7E538CCDA12DA5424DA7667`.
+
+All eight CTest suites pass, including the updated coherent hash guard.
+New coverage checks release shape and live CC72 retiming, coarse/fine amplitude
+curves, filter response and reset, stereo gain, partial releases in all five
+phase modes, render-block independence, and scalar/threaded cohort agreement.
 
 Analysis always emits a per-channel controller histogram. A bounded trace of
 any controller can

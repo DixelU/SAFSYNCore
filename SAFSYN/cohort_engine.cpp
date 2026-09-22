@@ -78,6 +78,7 @@ struct VariantTerm
 	const float* left = nullptr;
 	const float* right = nullptr;
 	uint64_t count = 0;
+	detail::StereoFilterState filter_state;
 };
 
 struct PhaseAggregate
@@ -97,6 +98,92 @@ struct PhaseAggregate
 	std::vector<VariantTerm> variants;
 	PhaseVoiceState singleton;
 	bool singleton_valid = false;
+	// Filter linear basis signals, not the weighted sum. A note-off can then
+	// split any phase contribution without guessing its individual history.
+	detail::StereoFilterState original_filter;
+	detail::StereoFilterState protected_filter;
+	detail::StereoFilterState changed_filter;
+	detail::StereoFilterState quadrature_filter;
+
+	void clear_filter_history() noexcept
+	{
+		original_filter = {};
+		protected_filter = {};
+		changed_filter = {};
+		quadrature_filter = {};
+		for (auto& term : variants)
+			term.filter_state = {};
+	}
+
+	void inherit_filter_history(const PhaseAggregate& source) noexcept
+	{
+		original_filter = source.original_filter;
+		protected_filter = source.protected_filter;
+		changed_filter = source.changed_filter;
+		quadrature_filter = source.quadrature_filter;
+		for (auto& term : variants)
+		{
+			const auto found = std::find_if(source.variants.begin(), source.variants.end(),
+				[&](const VariantTerm& other) {
+					return term.left == other.left && term.right == other.right;
+				});
+			if (found != source.variants.end())
+				term.filter_state = found->filter_state;
+		}
+	}
+
+	std::array<float, 2> filtered_sample(const std::array<float, 2>& original0,
+		const std::array<float, 2>& original1, uint32_t index0, uint32_t index1,
+		float fraction, float envelope, const detail::FilterRamp& filter) noexcept
+	{
+		auto blend_at = [&](uint32_t index) {
+			if (index < attack_hold_frames)
+				return 0.0f;
+			if (attack_fade_frames == 0 || index >= attack_hold_frames + attack_fade_frames)
+				return 1.0f;
+			const float u = static_cast<float>(index - attack_hold_frames) / attack_fade_frames;
+			return u * u * (3.0f - 2.0f * u);
+		};
+		const float blend0 = blend_at(index0);
+		const float blend1 = blend_at(index1);
+		auto interpolate = [&](float a, float b) { return (a + (b - a) * fraction) * envelope; };
+		std::array<float, 2> output{};
+		for (size_t channel = 0; channel < 2; ++channel)
+		{
+			const float a = original0[channel];
+			const float b = original1[channel];
+			const float original = original_filter.process(interpolate(a, b), channel, filter);
+			double result = static_cast<double>(original) * coherent_count;
+			if (transformed_count != 0)
+			{
+				const float protected_sample = protected_filter.process(
+					interpolate(a * (1.0f - blend0), b * (1.0f - blend1)), channel, filter);
+				const float changed = changed_filter.process(
+					interpolate(a * blend0, b * blend1), channel, filter);
+				result += static_cast<double>(protected_sample) * transformed_count;
+				result += static_cast<double>(changed) * polarity_sum;
+				if (quadrature_left)
+				{
+					const auto* quadrature = channel == 0 ? quadrature_left : quadrature_right;
+					const float shifted = quadrature_filter.process(interpolate(
+						quadrature[index0] * blend0, quadrature[index1] * blend1), channel, filter);
+					result += static_cast<double>(changed) * (channel == 0 ? cosine_left : cosine_right) -
+						static_cast<double>(shifted) * (channel == 0 ? sine_left : sine_right);
+				}
+				for (auto& term : variants)
+				{
+					if (term.count == 0)
+						continue;
+					const auto* sample = channel == 0 ? term.left : term.right;
+					const float changed_variant = term.filter_state.process(interpolate(
+						sample[index0] * blend0, sample[index1] * blend1), channel, filter);
+					result += static_cast<double>(changed_variant) * term.count;
+				}
+			}
+			output[channel] = static_cast<float>(result);
+		}
+		return output;
+	}
 
 	void add(const PhaseVoiceState& state, uint64_t count = 1)
 	{
@@ -263,6 +350,8 @@ struct RenderCohort
 	CohortStage stage = CohortStage::Off;
 	float env = 0.0f;
 	float env_inc = 0.0f;
+	float release_coefficient = 0.0f;
+	bool release_override = false;
 	uint32_t hold_samples_left = 0;
 	float gain_l = 0.0f;
 	float gain_r = 0.0f;
@@ -272,6 +361,7 @@ struct RenderCohort
 	StableHandle release_target;
 	uint64_t release_target_frame = 0;
 	PhaseAggregate phase;
+	detail::FilterRamp filter;
 };
 
 struct CohortSlot
@@ -714,7 +804,8 @@ struct CohortEngineState
 			return false;
 		cohort.stage = CohortStage::Release;
 		cohort.release_frame = owner.stats_.rendered_frames;
-		cohort.env_inc = -cohort.env / (seconds * owner.sample_rate_);
+		cohort.release_coefficient = owner.release_coefficient(seconds);
+		cohort.release_override = seconds_override >= 0.0f;
 		return true;
 	}
 
@@ -768,8 +859,8 @@ struct CohortEngineState
 			cohort.env = cohort.region->sustain;
 			break;
 		case CohortStage::Release:
-			cohort.env += cohort.env_inc;
-			if (cohort.env <= 0.0f)
+			cohort.env *= cohort.release_coefficient;
+			if (cohort.env <= 1.0e-5f)
 			{
 				cohort.stage = CohortStage::Off;
 				return 0.0f;
@@ -809,6 +900,7 @@ struct CohortEngineState
 				continue;
 			PhaseAggregate contribution = make_phase_aggregate(owner, *source.region,
 				link.region_id, first_serial, count, batch.channel, batch.note, false);
+			contribution.inherit_filter_history(source.phase);
 			RenderCohort released = source;
 			released.phase = contribution;
 			released.release_target = {};
@@ -945,6 +1037,7 @@ struct CohortEngineState
 			cohort.birth_frame = owner.stats_.rendered_frames;
 			cohort.oldest_serial = first_serial;
 			owner.compute_gains(*region, channel, velocity, cohort.gain_l, cohort.gain_r);
+			cohort.filter.set(owner.filter_coefficients(*region, channel), true);
 			begin_envelope(owner, cohort);
 			cohort.phase = std::move(aggregate);
 			handle = allocate_cohort(owner, std::move(cohort), true);
@@ -1177,6 +1270,29 @@ struct CohortEngineState
 		}
 	}
 
+	void update_channel_filters(SynthEngine& owner, uint8_t channel) noexcept
+	{
+		for (uint32_t index = channel_heads[channel]; index != invalid_index;
+			index = cohorts[index].channel_next)
+		{
+			auto& cohort = cohorts[index].cohort;
+			if (cohort.filter.set(owner.filter_coefficients(*cohort.region, channel)))
+				cohort.phase.clear_filter_history();
+		}
+	}
+
+	void update_channel_releases(SynthEngine& owner, uint8_t channel) noexcept
+	{
+		for (uint32_t index = channel_heads[channel]; index != invalid_index;
+			index = cohorts[index].channel_next)
+		{
+			auto& cohort = cohorts[index].cohort;
+			if (cohort.stage == CohortStage::Release && !cohort.release_override)
+				cohort.release_coefficient = owner.release_coefficient(
+					owner.release_seconds(*cohort.region, channel));
+		}
+	}
+
 	void set_render_threads(size_t requested) noexcept
 	{
 		parallel_render.reset();
@@ -1281,32 +1397,46 @@ struct CohortEngineState
 					static_cast<size_t>(index1) * region.channels;
 				const float original_l0 = pcm_to_float(region.pcm[offset0]);
 				const float original_l1 = pcm_to_float(region.pcm[offset1]);
-				const float source_l0 = coherent_phase
-					? static_cast<float>(static_cast<double>(original_l0) * coherent_count)
-					: cohort.phase.sample(original_l0, index0, false);
-				const float source_l1 = coherent_phase
-					? static_cast<float>(static_cast<double>(original_l1) * coherent_count)
-					: cohort.phase.sample(original_l1, index1, false);
-				const float sample_l = source_l0 + (source_l1 - source_l0) * fraction;
-				float sample_r = sample_l;
-				if (region.channels == 2)
+				const float original_r0 = region.channels == 2 ? pcm_to_float(region.pcm_right ?
+					region.pcm_right[index0] : region.pcm[offset0 + 1]) : original_l0;
+				const float original_r1 = region.channels == 2 ? pcm_to_float(region.pcm_right ?
+					region.pcm_right[index1] : region.pcm[offset1 + 1]) : original_l1;
+				float filtered_l;
+				float filtered_r;
+				if (cohort.filter.active())
 				{
-					const float original_r0 = pcm_to_float(region.pcm_right ?
-						region.pcm_right[index0] : region.pcm[offset0 + 1]);
-					const float original_r1 = pcm_to_float(region.pcm_right ?
-						region.pcm_right[index1] : region.pcm[offset1 + 1]);
-					const float source_r0 = coherent_phase
-						? static_cast<float>(static_cast<double>(original_r0) * coherent_count)
-						: cohort.phase.sample(original_r0, index0, true);
-					const float source_r1 = coherent_phase
-						? static_cast<float>(static_cast<double>(original_r1) * coherent_count)
-						: cohort.phase.sample(original_r1, index1, true);
-					sample_r = source_r0 + (source_r1 - source_r0) * fraction;
+					const auto filtered = cohort.phase.filtered_sample({original_l0, original_r0},
+						{original_l1, original_r1}, index0, index1, fraction, envelope, cohort.filter);
+					filtered_l = filtered[0];
+					filtered_r = filtered[1];
 				}
-				const float amplitude = envelope * channel.volume * channel.expression *
-					owner.master_volume_;
-				out[static_cast<size_t>(frame) * 2] += sample_l * cohort.gain_l * amplitude;
-				out[static_cast<size_t>(frame) * 2 + 1] += sample_r * cohort.gain_r * amplitude;
+				else
+				{
+					const float source_l0 = coherent_phase
+						? static_cast<float>(static_cast<double>(original_l0) * coherent_count)
+						: cohort.phase.sample(original_l0, index0, false);
+					const float source_l1 = coherent_phase
+						? static_cast<float>(static_cast<double>(original_l1) * coherent_count)
+						: cohort.phase.sample(original_l1, index1, false);
+					const float sample_l = source_l0 + (source_l1 - source_l0) * fraction;
+					float sample_r = sample_l;
+					if (region.channels == 2)
+					{
+						const float source_r0 = coherent_phase
+							? static_cast<float>(static_cast<double>(original_r0) * coherent_count)
+							: cohort.phase.sample(original_r0, index0, true);
+						const float source_r1 = coherent_phase
+							? static_cast<float>(static_cast<double>(original_r1) * coherent_count)
+							: cohort.phase.sample(original_r1, index1, true);
+						sample_r = source_r0 + (source_r1 - source_r0) * fraction;
+					}
+					filtered_l = sample_l * envelope;
+					filtered_r = sample_r * envelope;
+				}
+				cohort.filter.advance();
+				const float amplitude = channel.volume * channel.expression * owner.master_volume_;
+				out[static_cast<size_t>(frame) * 2] += filtered_l * cohort.gain_l * amplitude;
+				out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * cohort.gain_r * amplitude;
 
 				cohort.pos += cohort.loop_dir_fwd ? increment : -increment;
 				if (valid_loop && (region.loop_mode == LoopMode::Forward ||
@@ -1521,6 +1651,18 @@ void CohortEngine::update_channel_gains(SynthEngine& owner, uint8_t channel) noe
 {
 	if (state_)
 		state_->update_channel_gains(owner, channel);
+}
+
+void CohortEngine::update_channel_filters(SynthEngine& owner, uint8_t channel) noexcept
+{
+	if (state_)
+		state_->update_channel_filters(owner, channel);
+}
+
+void CohortEngine::update_channel_releases(SynthEngine& owner, uint8_t channel) noexcept
+{
+	if (state_)
+		state_->update_channel_releases(owner, channel);
 }
 
 void CohortEngine::invalidate_onset_merges(uint8_t channel) noexcept

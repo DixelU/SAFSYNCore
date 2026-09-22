@@ -311,6 +311,81 @@ void test_controller_contract_equivalence()
 		"14-bit controllers, master volume, sustained All Notes Off, and CC120 match cohorts");
 }
 
+std::vector<float> filtered_lifecycle(safsyn::SynthEngine& engine, uint32_t copies,
+	uint32_t block)
+{
+	std::vector<float> audio;
+	auto append = [&](uint32_t frames) {
+		const auto part = render(engine, frames, block);
+		audio.insert(audio.end(), part.begin(), part.end());
+	};
+	engine.note_on_batch(0, 60, 110, copies);
+	append(37);
+	// Separate calls at one frame exercise cached release-cohort merging.
+	for (uint32_t index = 0; index < copies / 3; ++index)
+		engine.note_off(0, 60);
+	engine.control_change(0, 74, 60);
+	engine.control_change(0, 71, 69);
+	append(7);
+	engine.control_change(0, 74, 127);
+	append(11);
+	engine.control_change(0, 74, 48); // Reverse an unfinished bypass ramp.
+	append(137);
+	engine.control_change(0, 64, 127);
+	engine.note_off_batch(0, 60, copies - copies / 3);
+	append(41);
+	engine.control_change(0, 72, 55);
+	engine.control_change(0, 64, 0);
+	append(120);
+	engine.control_change(0, 121, 0);
+	append(512);
+	engine.control_change(0, 71, 127);
+	engine.control_change(0, 74, 0);
+	append(1200);
+	check(engine.active_voice_count() == 0,
+		"filtered voices retire after sustained and split releases");
+	engine.control_change(0, 121, 0);
+	engine.note_on(0, 60, 110);
+	append(71);
+	return audio;
+}
+
+void test_filtered_phase_splits()
+{
+	for (const bool stereo : {false, true})
+		for (const auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::RandomPolarity,
+			safsyn::PhaseMode::Analytic, safsyn::PhaseMode::SmoothField,
+			safsyn::PhaseMode::IndependentBins})
+			for (const uint32_t copies : {1u, 31u})
+			{
+				auto bank = make_bank(16000, stereo, 0.005f, 0.08f);
+				bank.regions[0].filter_cutoff_cents = 8300.0f;
+				bank.regions[0].filter_resonance_cb = 40.0f;
+				safsyn::PhaseSettings phase;
+				phase.mode = mode;
+				phase.seed = 44;
+				phase.pool_size = 8;
+				phase.continuous = true;
+				phase.preserve_attack_ms = 2.0f;
+				safsyn::SynthEngine reference(16000, 64), cohorts(16000, 4), split(16000, 4);
+				configure_pair(reference, cohorts, bank, phase);
+				split.set_voice_model(safsyn::VoiceModel::Cohorts);
+				split.set_soundfont(&bank);
+				split.set_phase_settings(phase);
+				const auto expected = filtered_lifecycle(reference, copies, 0);
+				const auto actual = filtered_lifecycle(cohorts, copies, 0);
+				const auto blocked = filtered_lifecycle(split, copies, 7);
+				const bool equivalent = close_audio(expected, actual);
+				if (!equivalent) print_largest_error(expected, actual);
+				check(equivalent,
+					"filter histories survive phase cancellation, protected attacks, and partial note-offs");
+				check(actual == blocked,
+					"filter automation and release output are bit-identical across render block sizes");
+				check(std::all_of(actual.begin(), actual.end(), [](float x) { return std::isfinite(x); }),
+					"rapid filter automation remains finite in every phase mode");
+			}
+}
+
 void test_linked_stereo_and_one_shot()
 {
 	auto linked = make_linked_stereo_bank(3000);
@@ -500,10 +575,12 @@ void test_prepared_region_index()
 		"soundbank replacement rebuilds prepared region pointers");
 }
 
-void test_parallel_cohort_render()
+void test_parallel_cohort_render(bool filtered = false)
 {
 	constexpr uint32_t cohort_count = 1024;
 	auto bank = make_bank(4000, true);
+	if (filtered)
+		bank.regions[0].filter_cutoff_cents = 7200.0f;
 	safsyn::SynthEngine scalar(4000, cohort_count), parallel(4000, cohort_count),
 		repeat(4000, cohort_count);
 	for (auto* engine : {&scalar, &parallel, &repeat})
@@ -522,6 +599,9 @@ void test_parallel_cohort_render()
 				static_cast<uint8_t>(64 + (index & 0x3f)));
 		}
 	}
+	if (filtered)
+		for (auto* engine : {&scalar, &parallel, &repeat})
+			engine->control_change(0, 74, 48);
 	const auto expected = render(scalar, 27, 9);
 	const auto actual = render(parallel, 27, 9);
 	const auto repeated = render(repeat, 27, 9);
@@ -545,11 +625,13 @@ int main()
 	test_singleton_bit_exact_modes();
 	test_lifecycle_split_and_controls();
 	test_controller_contract_equivalence();
+	test_filtered_phase_splits();
 	test_linked_stereo_and_one_shot();
 	test_cross_run_merging_and_dynamic_growth();
 	test_block_and_seed_determinism();
 	test_safety_limit_stealing();
 	test_parallel_cohort_render();
+	test_parallel_cohort_render(true);
 	test_prepared_region_index();
 	if (failures != 0)
 	{

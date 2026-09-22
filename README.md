@@ -37,6 +37,13 @@ the supported generator subset, intersects key/velocity ranges, and reconstructs
 linked left/right samples as one logical stereo region. MIDI bank select and
 program change choose the active SF2 preset per channel.
 
+The default amplitude response uses squared velocity, volume, and expression,
+exponential releases with CC72 release-time control, and unity center gain for
+stereo samples. SF2 cutoff/resonance generators and CC74/71 drive a low-pass
+filter on active notes. These defaults follow the Kestrel comparison described
+in [the controller contract](docs/CONTROLLERS_AND_MASTERING.md); they intentionally
+change older rendered audio and its hashes.
+
 ## Build and test
 
 ```text
