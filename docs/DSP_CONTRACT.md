@@ -19,7 +19,7 @@ addition without moving scheduled note-on or note-off frames.
 Two effects must not be conflated:
 
 1. **Waveform coherence**: identical phase-aligned samples reinforce one
-   another. Polarity or analytic phase rotation can reduce that reinforcement.
+   another. Analytic phase rotation can reduce that reinforcement.
 2. **Periodic envelope modulation**: fixed-rate retriggering or chopping creates
    a periodic amplitude envelope. Even perfectly decorrelated carriers can
    retain energy at the dispatch frequency and its harmonics.
@@ -46,11 +46,12 @@ It must not be described or measured as phase-only processing.
 - SF2/SFZ sustain loops stop looping on note-off and then play their sample tail.
 - The audio loop allocates nothing and performs no I/O.
 - Analytic phase identity uses the configured seed, source tick, MIDI channel,
-  and key. Other modes use the event serial and logical sample region as well.
-  Voice slots are not identities.
-- Analytic quadrature and FFT phase variants are constructed outside
-  `render_audio` and cached by logical sample plus phase settings. FFT variants
-  are generated lazily when an event first selects them.
+  and key. Voice slots are not identities.
+- Analytic quadratures are constructed outside `render_audio` and cached by
+  logical sample plus phase settings. Parallel preparation produces the same
+  cached values as serial preparation.
+- SIMD mixing kernels reproduce the scalar cohort arithmetic exactly, so output
+  stays bit-identical across render block sizes.
 - Finite phase pools accept 1–64 deterministic choices; the regression and
   measurement fixtures cover 1, 8, 32, and 64. Continuous analytic mode derives
   an angle directly from the stable onset identity. Analytic notes with the same
@@ -174,12 +175,13 @@ production loudness policy.
 
 ## Phase experiment status
 
-The experimental renderer now contains random-polarity, analytic-signal,
-smooth FFT phase-field, and independent FFT-bin modes. The current automated
-fixtures cover coherent pool-1 behavior, 8/32/64 pools, continuous analytic
-angles, FFT magnitude/DC/Nyquist preservation, attack blending, linked stereo,
-periodic loops, block-size determinism, stable voice stealing, unchanged event
-counts, and absence of phase-cache construction during rendering.
+The renderer contains one experimental decorrelation mode, analytic-signal
+rotation; the random-polarity and FFT phase-field modes were retired. The
+automated fixtures cover coherent pool-1 behavior, 8/32/64 pools, continuous
+analytic angles, periodic-tone energy and frequency preservation, attack
+blending, linked stereo, periodic loops, block-size determinism, stable voice
+stealing, unchanged event counts, parallel/serial preparation equality, and
+absence of phase-cache construction during rendering.
 
 The measurement harness reports:
 

@@ -310,8 +310,7 @@ void file_sender_backpressure_test()
 }
 void phase_preparation_test()
 {
-	for (auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::RandomPolarity,
-		safsyn::PhaseMode::Analytic, safsyn::PhaseMode::SmoothField, safsyn::PhaseMode::IndependentBins})
+	for (auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::Analytic})
 	{
 		auto config = options(); config.phase.mode = mode; config.phase.pool_size = 4;
 		auto source = bank();
@@ -337,8 +336,8 @@ void phase_preparation_test()
 	await([&] { return cancelled.finished(); });
 	check(cancelled.stats().error.empty() && cancelled.stats().scheduled_events == 0 && cancelled.drained(),
 		"cancelled startup processed MIDI or reported an error");
-	config = options(); config.phase.mode = safsyn::PhaseMode::RandomPolarity;
-	config.phase.strength = NAN; config.phase.pool_size = 0; config.phase.correlation_hz = NAN;
+	config = options(); config.phase.mode = safsyn::PhaseMode::Coherent;
+	config.phase.strength = NAN; config.phase.pool_size = 0; config.phase.preserve_attack_ms = NAN;
 	safsyn::BufferedSynth inactive(bank(), config, file(32)); inactive.start(); collect(inactive);
 	check(inactive.stats().phase.cache_bytes == 0, "inactive phase settings were validated or used");
 }

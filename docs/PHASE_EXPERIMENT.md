@@ -6,32 +6,30 @@ its existing piano WAV stays bit-identical.
 
 ## Modes and controls
 
-- `coherent`: original PCM path, with no phase cache.
-- `polarity`: deterministic event polarity. Strength zero bypasses it; any
-  nonzero strength enables the binary polarity experiment.
+- `coherent` (UI: Direct sampling): original PCM path, with no phase cache.
 - `analytic`: `x cos(theta) - H{x} sin(theta)`, using either a deterministic
   finite pool or a continuous event-derived angle.
-- `smooth-field`: FFT phase displacement with linearly interpolated random
-  anchors. `--phase-correlation-hz` controls the approximate anchor spacing.
-- `independent-bins`: an independent deterministic phase displacement per FFT
-  bin.
 
-For the analytic and FFT methods, `--phase-strength S` bounds displacement to
-`[-pi*S, +pi*S]`. FFT processing leaves DC and Nyquist unchanged, applies the
-same phase sheet to linked stereo channels, and RMS-matches each transformed
-channel before optional attack blending. `--phase-preserve-attack-ms N` keeps
-the first N milliseconds exact and then applies a 10 ms smoothstep transition.
+`--phase-strength S` bounds the analytic angle to `[-pi*S, +pi*S]`, and each
+rotation is RMS-matched to its source sample. `--phase-preserve-attack-ms N`
+keeps the first N milliseconds exact and then applies a 10 ms smoothstep
+transition.
 
 Finite pools use deterministic indices in a 1, 8, 32, or 64-entry space.
 Analytic mode caches one quadrature signal per logical sample and derives its
-angles without storing rendered copies. FFT variants are materialized lazily.
-Both are keyed by logical sample identity and all transform settings.
+angles without storing rendered copies. The cache is keyed by logical sample
+identity and all transform settings.
 
-The event identity is independent of voice slots: configured seed, event
-serial, channel, note, and logical region determine the assignment. Therefore
-voice stealing cannot reassign surviving voices. Quadrature construction, FFT,
-variant allocation, and cache insertion happen during note dispatch, never in
-`render_audio`.
+The event identity is independent of voice slots: configured seed, onset,
+channel, and note determine the assignment. Therefore voice stealing cannot
+reassign surviving voices. Quadrature construction and cache insertion happen
+during preparation or note dispatch, never in `render_audio`. Preparation
+transforms unique samples concurrently (`PhasePreparationOptions::threads`,
+automatic by default); the cached values do not depend on the thread count.
+
+The `polarity`, `smooth-field`, and `independent-bins` modes were retired in
+September 2026 so optimization could concentrate on the analytic path. Their
+rows below remain as historical evidence.
 
 Looping samples have an explicitly periodic transformed loop body, plus a
 bounded entry crossfade. The implementation does not merely wrap the end of an
@@ -113,8 +111,14 @@ counts, and exact coherent/strength-zero bypass. They do not establish
 cross-platform bit identity, multithread execution invariance, real-time audio
 safety of note-dispatch preprocessing, or subjective audio quality.
 
-The measurements support keeping continuous analytic, finite analytic pools,
-and independent-bin FFT as listening candidates. Smooth-field FFT is more
-expensive here and less effective on the controlled repeated fixture. No mode
-should become the default until paired listening decides whether the reduced
-build-up is worth its attack and timbral changes.
+The measurements supported keeping continuous analytic, finite analytic pools,
+and independent-bin FFT as listening candidates; smooth-field FFT was more
+expensive and less effective on the controlled repeated fixture. Analytic was
+kept as the only decorrelation mode: it needs one cached quadrature per sample
+instead of a PCM copy per pool entry, and it is cheap to mix. It should not
+become the default until paired listening decides whether the reduced build-up
+is worth its attack and timbral changes.
+
+Preprocessing and render timings in the tables predate the September 2026
+analytic optimization pass; see `MIXER_PERFORMANCE.md`. That pass keeps every
+cached quadrature and rendered sample bit-identical.

@@ -42,22 +42,23 @@ still renders and delivers audio through WASAPI, but marks device packets silent
 
 ## Phase selection and startup preparation
 
-The **Phase mode** selector offers coherent, random polarity, analytic rotation,
-smooth phase field, and independent FFT bins. Settings that do not apply to the
-selected mode are disabled and ignored; their text is retained when switching
-modes. Analytic continuous assignment disables the finite pool field. The GUI
-starts with a pool of eight; the console retains the core default of 64, so use
-`--phase-pool` explicitly for FFT modes with large banks. The Black MIDI preset
-only changes threads, cohort ceiling, and buffering; it preserves phase settings.
+The **Phase mode** selector offers direct sampling (coherent) and analytic
+rotation. Settings that do not apply to the selected mode are disabled and
+ignored; their text is retained when switching modes. Analytic continuous
+assignment disables the finite pool field. The GUI starts with a pool of eight;
+the console retains the core default of 64. The Black MIDI preset only changes
+threads, cohort ceiling, and buffering; it preserves phase settings.
 
 Before dispatching any notes, the producer prepares every unique sample across
 the bank's presets. Analytic mode prepares one quadrature buffer per sample,
-shared by all its angles; smooth/independent modes prepare every variant in the
-finite pool. Coherent and random polarity require no transformed PCM. Shared
+shared by all its angles; coherent mode requires no transformed PCM. Shared
 sample layers reuse the same cache entry. No dummy notes are played, event serials
 are unchanged, and MIDI still starts at sample zero. This avoids FFT work on the
-first note of a new key, velocity layer, or program. Preparation is currently
-serial; the persistent cohort workers handle playback mixing afterward.
+first note of a new key, velocity layer, or program. Unique samples are
+transformed concurrently (up to eight threads, one fewer than the logical CPU
+count); the cached values are identical for any thread count, and progress is
+reported on the preparing thread. The persistent cohort workers handle playback
+mixing afterward.
 
 The status panel shows completed/total transforms, current/planned cache MiB,
 and preparation time. **Panic / stop**, closing the window, and console Ctrl+C
@@ -65,11 +66,11 @@ cancel preparation, including inside a long FFT. The test keyboard and WinMM
 input start accepting notes only after preparation and initial buffering.
 
 **Cache MiB** limits persistent transformed PCM (2048 MiB by default). An
-oversized pool is rejected before generating any transformed samples, with the
-required size and suggestions. Temporary FFT arrays, the original bank, cohort
-state, and MIDI data are additional memory; this setting is not a process memory
-limit. Large banks can still take substantial time to prepare. Reduce the pool
-or use analytic, polarity, or coherent mode if the cost is too high. Caches are
+oversized cache is rejected before generating any transformed samples, with the
+required size and suggestions. Temporary FFT arrays (per preparation thread),
+the original bank, cohort state, and MIDI data are additional memory; this
+setting is not a process memory limit. Large banks can still take substantial
+time to prepare; use coherent mode if the cost is too high. Caches are
 session-local and rebuilt on a fresh start; they are not saved to disk.
 
 The synth also reserves finite cohort slots, initial logical bookkeeping,
@@ -80,14 +81,14 @@ logical-note and phase-aggregate bookkeeping can still allocate during playback.
 
 ```text
 safsyn-play --bank piano.sf2 --phase analytic --phase-pool 8 --midi song.mid
-safsyn-play --phase smooth --phase-pool 4 --phase-correlation-hz 250 --test-note --seconds 2
+safsyn-play --phase analytic --phase-continuous --test-note --seconds 2
 ```
 
 Additional console settings are `--phase-strength 0..1`, `--phase-seed N`,
 `--phase-continuous`, `--phase-preserve-attack-ms N`, and `--phase-cache-mib N`.
-Mode names for `--phase` are `coherent`, `polarity`, `analytic`, `smooth`, and
-`independent`. Finite caches remove startup transforms, not the ongoing mixing
-cost of phase decorrelation; the usual cohort ceiling and underrun metrics apply.
+Mode names for `--phase` are `coherent` (alias `direct`) and `analytic`.
+Prepared caches remove startup transforms, not the ongoing mixing cost of phase
+decorrelation; the usual cohort ceiling and underrun metrics apply.
 
 ## Thread ownership and timing
 

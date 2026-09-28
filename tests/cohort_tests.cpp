@@ -184,20 +184,14 @@ void test_coherent_and_phase_duplicates()
 	continuous.preserve_attack_ms = 8.0f;
 	test_duplicate_equivalence(continuous, true,
 		"continuous stereo analytic sums and protected attacks match individual voices");
-	safsyn::PhaseSettings polarity;
-	polarity.mode = safsyn::PhaseMode::RandomPolarity;
-	polarity.seed = 91;
-	test_duplicate_equivalence(polarity, false,
-		"random-polarity signed multiplicity matches individual voices");
 }
 
 void test_singleton_bit_exact_modes()
 {
 	auto bank = make_bank(3200, true);
 	std::vector<safsyn::PhaseSettings> phases;
-	for (const auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::RandomPolarity,
-		safsyn::PhaseMode::Analytic, safsyn::PhaseMode::SmoothField,
-		safsyn::PhaseMode::IndependentBins})
+	for (const auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::Analytic,
+		safsyn::PhaseMode::Analytic})
 	{
 		safsyn::PhaseSettings phase;
 		phase.mode = mode;
@@ -356,9 +350,7 @@ std::vector<float> filtered_lifecycle(safsyn::SynthEngine& engine, uint32_t copi
 void test_filtered_phase_splits()
 {
 	for (const bool stereo : {false, true})
-		for (const auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::RandomPolarity,
-			safsyn::PhaseMode::Analytic, safsyn::PhaseMode::SmoothField,
-			safsyn::PhaseMode::IndependentBins})
+		for (const auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::Analytic})
 			for (const uint32_t copies : {1u, 31u})
 			{
 				auto bank = make_bank(16000, stereo, 0.005f, 0.08f);
@@ -669,6 +661,82 @@ void test_coherent_vector_boundaries()
 	}
 }
 
+// Analytic singles/groups and filtered cohorts use SIMD kernels on blocks of
+// four or more frames. One-frame calls always take the scalar kernel, so both
+// must agree bit-for-bit through envelopes, splits, filter ramps and tails.
+void test_phase_vector_boundaries()
+{
+	for (int layout = 0; layout < 3; ++layout)
+	for (auto loop : {safsyn::LoopMode::None, safsyn::LoopMode::Forward,
+		safsyn::LoopMode::Sustain, safsyn::LoopMode::PingPong})
+	for (const bool filtered : {false, true})
+	for (const float attack_ms : {0.0f, 3.0f})
+	for (uint32_t block : {4u, 9u, 64u})
+	{
+		auto bank = layout == 2 ? make_linked_stereo_bank(4000) : make_bank(4000, layout == 1);
+		auto& region = bank.regions[0];
+		region.loop_mode = loop;
+		region.loop_start = 5;
+		region.loop_end = 43;
+		region.attack = 0.001f;
+		region.hold = 0.001f;
+		region.decay = 0.001f;
+		region.sustain = 0.73f;
+		region.release = 0.006f;
+		region.fine_tune = 19;
+		if (filtered)
+		{
+			region.filter_cutoff_cents = 7600.0f;
+			region.filter_resonance_cb = 30.0f;
+		}
+		safsyn::PhaseSettings phase;
+		phase.mode = safsyn::PhaseMode::Analytic;
+		phase.seed = 71;
+		phase.pool_size = 16;
+		phase.preserve_attack_ms = attack_ms;
+		safsyn::SynthEngine reference(4000, 32), singles(4000, 16), vectorized(4000, 16);
+		for (auto* engine : {&reference, &singles, &vectorized})
+		{
+			if (engine != &reference) engine->set_voice_model(safsyn::VoiceModel::Cohorts, 16);
+			engine->set_soundfont(&bank);
+			engine->set_phase_settings(phase);
+			engine->set_master_volume(11001);
+			engine->control_change(0, 7, 83);
+			engine->control_change(0, 11, 91);
+			for (uint8_t note : {uint8_t{48}, uint8_t{61}, uint8_t{83}, uint8_t{127}})
+				engine->note_on(0, note, 91);
+			engine->note_on_batch(0, 70, 91, 5); // One grouped cohort.
+		}
+		std::vector<float> expected, scalar, actual;
+		for (uint32_t segment = 0; segment < 5; ++segment)
+		{
+			for (auto* engine : {&reference, &singles, &vectorized})
+			{
+				if (segment == 1) engine->set_pitch_bend(0, 10201);
+				if (segment == 2) engine->note_off_batch(0, 70, 2); // Split the group.
+				if (segment == 3) engine->control_change(0, 74, filtered ? 40 : 90);
+				if (segment == 4)
+				{
+					engine->control_change(0, 74, 127); // Filtered cohorts ramp to bypass.
+					engine->control_change(0, 123, 0);
+				}
+			}
+			const auto reference_part = render(reference, 137, 1);
+			const auto scalar_part = render(singles, 137, 1);
+			const auto vector_part = render(vectorized, 137, block);
+			expected.insert(expected.end(), reference_part.begin(), reference_part.end());
+			scalar.insert(scalar.end(), scalar_part.begin(), scalar_part.end());
+			actual.insert(actual.end(), vector_part.begin(), vector_part.end());
+			check(singles.active_voice_count() == vectorized.active_voice_count(),
+				"phase SIMD keeps exact cohort retirement timing");
+		}
+		check(scalar == actual,
+			"analytic and filtered SIMD keep exact samples across layouts, groups, filters and tails");
+		check(close_audio(expected, actual, 3e-4, 3e-5),
+			"vectorized analytic cohorts still match individual voices within tolerance");
+	}
+}
+
 void test_worker_handoff_lifecycle()
 {
 	constexpr uint32_t count = 1024;
@@ -737,6 +805,7 @@ int main()
 	test_parallel_cohort_render();
 	test_parallel_cohort_render(true);
 	test_coherent_vector_boundaries();
+	test_phase_vector_boundaries();
 	test_worker_handoff_lifecycle();
 	test_prepared_region_index();
 	if (failures != 0)

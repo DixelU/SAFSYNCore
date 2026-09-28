@@ -12,13 +12,12 @@ namespace safsyn
 
 struct SampleRegion;
 
+// Coherent is direct sample playback. Analytic rotates each onset by
+// x cos(theta) - H{x} sin(theta) using one cached quadrature per sample.
 enum class PhaseMode : uint8_t
 {
 	Coherent,
-	RandomPolarity,
 	Analytic,
-	SmoothField,
-	IndependentBins,
 };
 
 struct PhaseSettings
@@ -28,7 +27,6 @@ struct PhaseSettings
 	uint64_t seed = 0;
 	uint32_t pool_size = 64;
 	bool continuous = false;
-	float correlation_hz = 250.0f;
 	float preserve_attack_ms = 0.0f;
 };
 
@@ -45,7 +43,7 @@ struct PhaseCacheStats
 
 struct PhasePreparationProgress
 {
-	uint64_t completed = 0; // Unique sample transforms; one per FFT pool entry.
+	uint64_t completed = 0; // Unique sample quadratures.
 	uint64_t total = 0;
 	uint64_t cache_bytes = 0;
 	uint64_t total_cache_bytes = 0; // PCM cache only; temporary FFT memory is extra.
@@ -54,56 +52,40 @@ struct PhasePreparationProgress
 struct PhasePreparationOptions
 {
 	uint64_t maximum_cache_bytes = uint64_t{2048} * 1024 * 1024;
+	// Unique samples are transformed concurrently. Zero selects a bounded
+	// automatic count; the cache contents do not depend on it.
+	uint32_t threads = 0;
 	std::stop_token stop;
 	std::function<void(const PhasePreparationProgress&)> progress;
 };
 
 struct PhaseVoiceState
 {
-	enum class Kind : uint8_t { Coherent, Polarity, Analytic, Variant };
+	enum class Kind : uint8_t { Coherent, Analytic };
 
 	Kind kind = Kind::Coherent;
 	const float* quadrature_left = nullptr;
 	const float* quadrature_right = nullptr;
-	const float* variant_left = nullptr;
-	const float* variant_right = nullptr;
 	float cosine = 1.0f;
 	float sine = 0.0f;
 	float scale_left = 1.0f;
 	float scale_right = 1.0f;
-	float polarity = 1.0f;
 	uint32_t attack_hold_frames = 0;
 	uint32_t attack_fade_frames = 0;
+
+	// First sample index at which apply() returns the rotated value directly.
+	uint32_t protected_frames() const noexcept { return attack_hold_frames + attack_fade_frames; }
 
 	float apply(float original, uint32_t index, bool right) const noexcept
 	{
 		if (kind == Kind::Coherent)
 			return original;
-		float changed = original;
-		switch (kind)
-		{
-		case Kind::Coherent:
-			break;
-		case Kind::Polarity:
-			changed = original * polarity;
-			break;
-		case Kind::Analytic:
-		{
-			const float* quadrature = right ? quadrature_right : quadrature_left;
-			const float scale = right ? scale_right : scale_left;
-			changed = (cosine * original - sine * quadrature[index]) * scale;
-			break;
-		}
-		case Kind::Variant:
-		{
-			const float* variant = right ? variant_right : variant_left;
-			changed = variant[index];
-			break;
-		}
-		}
+		const float* quadrature = right ? quadrature_right : quadrature_left;
+		const float scale = right ? scale_right : scale_left;
+		const float changed = (cosine * original - sine * quadrature[index]) * scale;
 		if (index < attack_hold_frames)
 			return original;
-		if (attack_fade_frames == 0 || index >= attack_hold_frames + attack_fade_frames)
+		if (attack_fade_frames == 0 || index >= protected_frames())
 			return changed;
 		const float u = static_cast<float>(index - attack_hold_frames) /
 			static_cast<float>(attack_fade_frames);
@@ -125,14 +107,14 @@ public:
 	void configure(const PhaseSettings& settings) noexcept;
 	const PhaseSettings& settings() const noexcept;
 	void clear() noexcept;
-	// Prepare every unique sample (and every finite FFT variant) without assigning
-	// notes or advancing serials. Region indices must match subsequent assign().
-	// Returns false on cancellation; throws on a budget/allocation failure. Call
-	// on the engine owner thread before rendering, not from the audio callback.
+	// Prepare every unique sample quadrature without assigning notes or advancing
+	// serials. Region indices must match subsequent assign(). Returns false on
+	// cancellation; throws on a budget/allocation failure. Call on the engine
+	// owner thread before rendering, not from the audio callback. Progress is
+	// reported on the calling thread.
 	bool prepare(std::span<const SampleRegion> regions, const PhasePreparationOptions& options = {});
-	// Analytic event_serial is the source tick (or audio frame when untimestamped);
-	// other modes use the logical event serial. Reconstruct must receive the same
-	// identity used at assignment.
+	// Analytic event_serial is the source tick (or audio frame when untimestamped).
+	// Reconstruct must receive the same identity used at assignment.
 	PhaseVoiceState assign(const SampleRegion& region, uint64_t region_id,
 		uint64_t event_serial, uint8_t channel, uint8_t note) noexcept;
 	// Rebuild an already-assigned logical event contribution without counting a

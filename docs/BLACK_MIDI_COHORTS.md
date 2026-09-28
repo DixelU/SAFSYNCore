@@ -53,8 +53,7 @@ roughly 55,000-cohort peak in 4,096 physical slots.
 
 ## Phase aggregation
 
-Coherent cohorts multiply the source by logical multiplicity. Random polarity
-cohorts retain the signed polarity sum. Analytic cohorts retain separate left
+Coherent cohorts multiply the source by logical multiplicity. Analytic cohorts retain separate left
 and right sums of `cos(theta) * RMS_scale` and `sin(theta) * RMS_scale`, so each
 logical serial keeps its own finite-pool or continuous deterministic angle.
 Linked stereo channels retain separate RMS scales while sharing the event
@@ -232,15 +231,16 @@ with a 4,096-wide search. The parallel WAV has a different hash because lane
 partial sums change floating addition order; fixed-thread regression tests
 require bit-identical repeats and tolerance-equivalence to scalar output.
 
-The subsequent SSE2 frame-kernel and atomic worker-handoff pass is documented
-in `MIXER_PERFORMANCE.md`, including updated microbenchmarks and validation.
+The subsequent SSE2 frame-kernel, atomic worker-handoff, and analytic/filtered
+kernel passes are documented in `MIXER_PERFORMANCE.md`, including updated
+microbenchmarks and validation.
 
-A remaining mixer optimization is a hot/cold structure-of-arrays split with
-specialized coherent/analytic and loop/envelope kernels. That layout can apply
-AVX2 across cohorts at one output frame without changing the scalar reference
-path. It should be driven by a new full-pass profile because short-interval
-worker synchronization, phase-cache reads, and sample gathers now compete for
-the remaining time.
+A remaining mixer optimization is a hot/cold structure-of-arrays split. That
+layout can apply AVX2 across cohorts at one output frame without changing the
+scalar reference path, which is where one-frame event intervals still spend
+their time. It should be driven by a new full-pass profile because
+short-interval worker synchronization, phase-cache reads, and sample gathers
+now compete for the remaining time.
 
 ## Tail drain and validation
 
@@ -250,7 +250,7 @@ inactive, and reports whether the ceiling was reached. The fixed
 `--tail-seconds N` behavior remains available.
 
 Tests compare cohorts with a generously sized individual reference across
-thousands of coherent, polarity, finite-analytic, and continuous-analytic
+thousands of coherent, finite-analytic, and continuous-analytic
 duplicates; interleaved onset runs; stereo and linked-planar stereo samples;
 attack/decay note-offs; sustain; pitch bend and controllers; block sizes;
 deterministic seeds; dynamic growth; deterministic safety stealing; and

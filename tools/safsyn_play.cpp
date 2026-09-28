@@ -62,10 +62,10 @@ int wmain(int argc, wchar_t** argv)
 					"--midi song.mid (omit for live input) --midi-in N --output N\n"
 					"--threads 0..64 --cohorts N --buffer-frames N --block-frames N\n"
 					"--sample-rate N --gain-db N --no-limiter --seconds N --test-note --mute\n"
-					"--phase coherent|polarity|analytic|smooth|independent (default coherent)\n"
+					"--phase coherent|direct|analytic (default coherent)\n"
 					"--phase-strength 0..1 --phase-pool 1..64 --phase-continuous --phase-seed N\n"
-					"--phase-correlation-hz N --phase-preserve-attack-ms N --phase-cache-mib N\n"
-					"All phase samples/variants are prepared before audio starts (Ctrl+C cancels).\n"
+					"--phase-preserve-attack-ms N --phase-cache-mib N\n"
+					"Analytic samples are prepared before audio starts (Ctrl+C cancels).\n"
 					"Cache limit defaults to 2048 MiB; temporary FFT memory is extra.\n"
 					"Live mode runs until Ctrl+C; file mode stops after the release tail.\n";
 				return 0;
@@ -99,17 +99,13 @@ int wmain(int argc, wchar_t** argv)
 			else if (argument == L"--phase")
 			{
 				const auto mode = value();
-				if (mode == L"coherent") options.playback.phase.mode = safsyn::PhaseMode::Coherent;
-				else if (mode == L"polarity") options.playback.phase.mode = safsyn::PhaseMode::RandomPolarity;
+				if (mode == L"coherent" || mode == L"direct") options.playback.phase.mode = safsyn::PhaseMode::Coherent;
 				else if (mode == L"analytic") options.playback.phase.mode = safsyn::PhaseMode::Analytic;
-				else if (mode == L"smooth") options.playback.phase.mode = safsyn::PhaseMode::SmoothField;
-				else if (mode == L"independent") options.playback.phase.mode = safsyn::PhaseMode::IndependentBins;
 				else throw std::runtime_error("unknown phase mode");
 			}
 			else if (argument == L"--phase-strength") options.playback.phase.strength = static_cast<float>(decimal());
 			else if (argument == L"--phase-pool") options.playback.phase.pool_size = number();
 			else if (argument == L"--phase-continuous") options.playback.phase.continuous = true;
-			else if (argument == L"--phase-correlation-hz") options.playback.phase.correlation_hz = static_cast<float>(decimal());
 			else if (argument == L"--phase-preserve-attack-ms") options.playback.phase.preserve_attack_ms = static_cast<float>(decimal());
 			else if (argument == L"--phase-cache-mib") options.playback.maximum_phase_cache_bytes = uint64_t{number()} * 1048576;
 			else if (argument == L"--phase-seed")

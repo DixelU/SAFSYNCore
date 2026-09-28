@@ -18,7 +18,7 @@ enum Control
 {
 	Bank = 100, BrowseBank, Midi, BrowseMidi, Output, Input, Refresh,
 	Threads, Cohorts, Buffer, Block, Rate, InitialBank, Program, Gain,
-	Phase, Strength, Seed, Pool, Continuous, Correlation, Attack,
+	Phase, Strength, Seed, Pool, Continuous, Attack,
 	Limiter = 122,
 	Live, Play, Stop, Test, Metrics, BlackMidiPreset, CacheLimit
 };
@@ -75,21 +75,17 @@ uint32_t integer(HWND window, int id, uint32_t low, uint32_t high, const char* n
 	if (std::floor(value) != value) throw std::runtime_error(std::string("Expected integer ") + name);
 	return static_cast<uint32_t>(value);
 }
-struct PhaseControls { bool strength, seed, pool, continuous, correlation, attack, cache; };
+struct PhaseControls { bool strength, seed, pool, continuous, attack, cache; };
 PhaseControls phase_controls(HWND window)
 {
-	const auto mode = static_cast<safsyn::PhaseMode>(selected(window, Phase));
-	const bool active = mode != safsyn::PhaseMode::Coherent;
-	const bool transform = active && mode != safsyn::PhaseMode::RandomPolarity;
-	const bool analytic = mode == safsyn::PhaseMode::Analytic;
-	return {transform, active, transform && !(analytic && checked(window, Continuous)),
-		analytic, mode == safsyn::PhaseMode::SmoothField, active, transform};
+	const bool analytic = static_cast<safsyn::PhaseMode>(selected(window, Phase)) == safsyn::PhaseMode::Analytic;
+	return {analytic, analytic, analytic && !checked(window, Continuous), analytic, analytic, analytic};
 }
 void enable_phase_controls(App& app, bool running)
 {
 	const auto c = phase_controls(app.window);
 	for (const auto [id, enabled] : {std::pair{Strength, c.strength}, {Seed, c.seed}, {Pool, c.pool},
-		{Continuous, c.continuous}, {Correlation, c.correlation}, {Attack, c.attack}, {CacheLimit, c.cache}})
+		{Continuous, c.continuous}, {Attack, c.attack}, {CacheLimit, c.cache}})
 		EnableWindow(GetDlgItem(app.window, id), !running && enabled);
 }
 void enable_controls(App& app, bool running)
@@ -144,14 +140,13 @@ void start(App& app, bool file)
 	options.mastering.output_gain_db = number(app.window, Gain, -120, 24, "gain dB");
 	options.mastering.limiter_enabled = checked(app.window, Limiter);
 	const int mode = selected(app.window, Phase);
-	if (mode < 0 || mode > 4) throw std::runtime_error("Choose a phase mode.");
+	if (mode < 0 || mode > 1) throw std::runtime_error("Choose a phase mode.");
 	options.phase.mode = static_cast<safsyn::PhaseMode>(mode);
 	const auto c = phase_controls(app.window);
 	// Inactive fields keep their text, but are never parsed or validated.
 	if (c.strength) options.phase.strength = static_cast<float>(number(app.window, Strength, 0, 1, "phase strength"));
 	if (c.pool) options.phase.pool_size = integer(app.window, Pool, 1, 64, "phase pool size");
 	if (c.continuous) options.phase.continuous = checked(app.window, Continuous);
-	if (c.correlation) options.phase.correlation_hz = static_cast<float>(number(app.window, Correlation, 0.001, 1000000, "correlation Hz"));
 	if (c.attack) options.phase.preserve_attack_ms = static_cast<float>(number(app.window, Attack, 0, 10000, "preserved attack ms"));
 	if (c.cache) options.maximum_phase_cache_bytes = uint64_t{integer(app.window, CacheLimit, 1, 1048576, "phase cache MiB")} * 1048576;
 	if (c.seed)
@@ -188,7 +183,7 @@ void create_controls(App& app)
 	label(app, L"Output gain (dB)", 530, 318); edit(app, Gain, L"-12", 660, 318, 120);
 	label(app, L"Phase mode", 20, 356);
 	const auto phase = combo(app, Phase, 160, 356, 290);
-	for (const auto name : {L"Direct sampling", L"Random polarity", L"Analytic rotation", L"Smooth phase field", L"Independent FFT bins"}) add_item(phase, name);
+	for (const auto name : {L"Direct sampling", L"Analytic rotation"}) add_item(phase, name);
 	SendMessageW(phase, CB_SETCURSEL, 0, 0);
 	control(app, L"BUTTON", L"Limiter (-1 dB ceiling)", Limiter, 470, 356, 290, 28, WS_TABSTOP | BS_AUTOCHECKBOX);
 	SendDlgItemMessageW(app.window, Limiter, BM_SETCHECK, BST_CHECKED, 0);
@@ -197,7 +192,6 @@ void create_controls(App& app)
 	control(app, L"BUTTON", L"Continuous analytic", Continuous, 340, 394, 200, 28, WS_TABSTOP | BS_AUTOCHECKBOX);
 	label(app, L"Cache MiB", 550, 394, 105); edit(app, CacheLimit, L"2048", 660, 394, 120);
 	label(app, L"Seed", 20, 432, 75); edit(app, Seed, L"0", 100, 432, 150);
-	label(app, L"Correlation Hz", 270, 432, 120); edit(app, Correlation, L"250", 390, 432, 100);
 	label(app, L"Keep attack ms", 530, 432, 125); edit(app, Attack, L"0", 660, 432, 120);
 	button(app, BlackMidiPreset, L"Black MIDI preset", 20, 474, 190);
 	label(app, L"512 cohorts, 4 threads, 10 s buffer. Large buffers add latency.", 230, 474, 550);

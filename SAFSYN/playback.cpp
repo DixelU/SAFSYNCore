@@ -24,22 +24,17 @@ PlaybackOptions validated(PlaybackOptions options)
 		options.render_threads > 64 || options.midi_queue_capacity < 2 ||
 		options.midi_queue_capacity > 4194304 || options.initial_bank > 16383 ||
 		options.initial_program > 127 || options.maximum_tail_seconds > 60 ||
-		static_cast<unsigned>(options.phase.mode) > static_cast<unsigned>(PhaseMode::IndependentBins) ||
+		static_cast<unsigned>(options.phase.mode) > static_cast<unsigned>(PhaseMode::Analytic) ||
 		!mastering_settings_valid(options.mastering))
 		throw std::invalid_argument("invalid live playback options");
-	const bool active = options.phase.mode != PhaseMode::Coherent;
-	const bool transform = active && options.phase.mode != PhaseMode::RandomPolarity;
-	const bool pool = transform && !(options.phase.mode == PhaseMode::Analytic && options.phase.continuous);
-	if ((transform && (!std::isfinite(options.phase.strength) || options.phase.strength < 0 || options.phase.strength > 1)) ||
-		(active && (!std::isfinite(options.phase.preserve_attack_ms) || options.phase.preserve_attack_ms < 0 || options.phase.preserve_attack_ms > 10000)) ||
-		(pool && (options.phase.pool_size < 1 || options.phase.pool_size > 64)) ||
-		(options.phase.mode == PhaseMode::SmoothField && (!std::isfinite(options.phase.correlation_hz) ||
-			options.phase.correlation_hz < 0.001f || options.phase.correlation_hz > 1000000)))
+	const bool analytic = options.phase.mode == PhaseMode::Analytic;
+	const bool pool = analytic && !options.phase.continuous;
+	if ((analytic && (!std::isfinite(options.phase.strength) || options.phase.strength < 0 || options.phase.strength > 1)) ||
+		(analytic && (!std::isfinite(options.phase.preserve_attack_ms) || options.phase.preserve_attack_ms < 0 || options.phase.preserve_attack_ms > 10000)) ||
+		(pool && (options.phase.pool_size < 1 || options.phase.pool_size > 64)))
 		throw std::invalid_argument("invalid playback phase settings");
-	if (!active) options.phase = {};
-	if (!transform) options.phase.strength = 1;
+	if (!analytic) options.phase = {};
 	if (!pool) options.phase.pool_size = 1;
-	if (options.phase.mode != PhaseMode::SmoothField) options.phase.correlation_hz = 250;
 	if (options.render_threads == 0)
 	{
 		const auto cpus = std::thread::hardware_concurrency();

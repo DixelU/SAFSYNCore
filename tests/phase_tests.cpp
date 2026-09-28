@@ -126,7 +126,7 @@ void test_strength_zero_is_coherent()
 	safsyn::SynthEngine coherent(9600, 4), zero(9600, 4);
 	coherent.set_soundfont(&bank);
 	zero.set_soundfont(&bank);
-	auto phase = settings(safsyn::PhaseMode::IndependentBins, 8);
+	auto phase = settings(safsyn::PhaseMode::Analytic, 8);
 	phase.strength = 0.0f;
 	zero.set_phase_settings(phase);
 	coherent.note_on(0, 60, 100);
@@ -141,9 +141,7 @@ void test_determinism_and_block_invariance()
 {
 	auto bank = make_bank(make_signal(127), 12700);
 	std::vector<safsyn::PhaseSettings> cases;
-	for (const auto mode : {safsyn::PhaseMode::RandomPolarity, safsyn::PhaseMode::Analytic,
-		safsyn::PhaseMode::SmoothField, safsyn::PhaseMode::IndependentBins})
-		cases.push_back(settings(mode, 8, 99));
+	cases.push_back(settings(safsyn::PhaseMode::Analytic, 8, 99));
 	auto continuous = settings(safsyn::PhaseMode::Analytic, 1, 99);
 	continuous.continuous = true;
 	cases.push_back(continuous);
@@ -196,15 +194,16 @@ void test_pool_sizes_generate_distinct_variants()
 	{
 		safsyn::SynthEngine engine(3200, 1);
 		engine.set_soundfont(&bank);
-		engine.set_phase_settings(settings(safsyn::PhaseMode::IndependentBins, pool, 77));
+		engine.set_phase_settings(settings(safsyn::PhaseMode::Analytic, pool, 77));
+		constexpr uint32_t message = 0x00643c90;
 		for (uint32_t event = 0; event < 2048; ++event)
-			engine.note_on(0, 60, 100);
+			engine.consume_short_messages(&message, 1, event); // Distinct onset identities.
 		const auto count = engine.phase_cache_stats().cached_variants;
 		check(count > previous && count <= pool,
-			"larger FFT pools deterministically expose more distinct variants");
+			"larger analytic pools deterministically expose more distinct angles");
 		previous = count;
 	}
-	check(previous == 64, "pool size 64 reaches all deterministic variants");
+	check(previous == 64, "pool size 64 reaches all deterministic angles");
 }
 
 void test_continuous_analytic_is_not_pool_quantized()
@@ -338,38 +337,46 @@ void test_analytic_source_ticks()
 	}
 }
 
-void test_fft_magnitudes_and_dc_nyquist()
+void test_analytic_rotation_preserves_periodic_tone()
 {
-	auto bank = make_bank(make_signal(64), 6400);
-	safsyn::SynthEngine coherent(6400, 2), changed(6400, 2);
+	// A looped whole-cycle sine has quadrature -cos, so every rotation is the
+	// same tone shifted in phase and the energy scale stays at unity.
+	constexpr size_t frames = 64;
+	std::vector<int16_t> samples(frames);
+	for (size_t index = 0; index < frames; ++index)
+		samples[index] = static_cast<int16_t>(std::llround(
+			12000.0 * std::sin(2.0 * pi * 4.0 * index / frames)));
+	auto bank = make_bank(samples, 6400, 1, true, 0, frames);
+	safsyn::SynthEngine coherent(6400, 2), rotated(6400, 2);
 	coherent.set_soundfont(&bank);
-	changed.set_soundfont(&bank);
-	changed.set_phase_settings(settings(safsyn::PhaseMode::IndependentBins, 1, 13));
-	// Measure the phase transform at unity gain so small spectral bins are not
-	// dominated by rounding from unrelated channel-volume and pan curves.
-	for (auto* engine : {&coherent, &changed})
-	{
-		engine->control_change(0, 7, 127);
-		engine->control_change(0, 10, 0);
-	}
+	rotated.set_soundfont(&bank);
+	auto phase = settings(safsyn::PhaseMode::Analytic, 1, 3);
+	phase.continuous = true;
+	rotated.set_phase_settings(phase);
 	coherent.note_on(0, 60, 127);
-	changed.note_on(0, 60, 127);
-	const auto original_magnitude = dft_magnitudes(left_channel(render(coherent, 64)));
-	const auto changed_magnitude = dft_magnitudes(left_channel(render(changed, 64)));
-	double worst_relative = 0.0;
-	const double significant = *std::max_element(original_magnitude.begin(),
-		original_magnitude.end()) * 1e-5;
-	for (size_t bin = 0; bin < original_magnitude.size(); ++bin)
-		if (original_magnitude[bin] > significant)
-			worst_relative = (std::max)(worst_relative,
-				std::abs(changed_magnitude[bin] - original_magnitude[bin]) /
-				original_magnitude[bin]);
-	if (worst_relative >= 0.001)
-		std::cerr << "FFT worst relative magnitude error: " << worst_relative << '\n';
-	check(worst_relative < 0.001, "FFT phase variants preserve magnitudes within tolerance");
-	check(std::abs(changed_magnitude.front() - original_magnitude.front()) < 0.00001 &&
-		std::abs(changed_magnitude.back() - original_magnitude.back()) < 0.00001,
-		"FFT variants preserve DC and Nyquist bins");
+	rotated.note_on(0, 60, 127);
+	const auto original = left_channel(render(coherent, 640));
+	const auto changed = left_channel(render(rotated, 640));
+	double original_energy = 0.0, changed_energy = 0.0, difference = 0.0;
+	for (size_t index = frames; index < original.size(); ++index)
+	{
+		original_energy += original[index] * original[index];
+		changed_energy += changed[index] * changed[index];
+		difference += (changed[index] - original[index]) * (changed[index] - original[index]);
+	}
+	const double ratio = std::sqrt(changed_energy / original_energy);
+	if (std::abs(ratio - 1.0) >= 1e-3)
+		std::cerr << "Analytic periodic tone RMS ratio: " << ratio << '\n';
+	check(std::abs(ratio - 1.0) < 1e-3, "analytic rotation preserves the RMS of a periodic tone");
+	check(difference > original_energy * 1e-4, "analytic rotation shifts the periodic tone's phase");
+	const auto original_magnitude = dft_magnitudes(std::vector<double>(original.begin() + frames,
+		original.begin() + frames * 5));
+	const auto changed_magnitude = dft_magnitudes(std::vector<double>(changed.begin() + frames,
+		changed.begin() + frames * 5));
+	const size_t peak = static_cast<size_t>(std::max_element(changed_magnitude.begin(),
+		changed_magnitude.end()) - changed_magnitude.begin());
+	check(peak == 16 && std::abs(changed_magnitude[peak] / original_magnitude[peak] - 1.0) < 1e-3,
+		"analytic rotation keeps the tone's frequency and magnitude");
 }
 
 void test_attack_preservation()
@@ -378,7 +385,7 @@ void test_attack_preservation()
 	safsyn::SynthEngine coherent(1000, 2), protected_phase(1000, 2);
 	coherent.set_soundfont(&bank);
 	protected_phase.set_soundfont(&bank);
-	auto phase = settings(safsyn::PhaseMode::SmoothField, 1, 9);
+	auto phase = settings(safsyn::PhaseMode::Analytic, 1, 9);
 	phase.preserve_attack_ms = 5.0f;
 	protected_phase.set_phase_settings(phase);
 	coherent.note_on(0, 60, 127);
@@ -396,7 +403,7 @@ void test_stereo_uses_one_phase_sheet()
 	auto bank = make_bank(make_signal(64, 2), 6400, 2);
 	safsyn::SynthEngine engine(6400, 2);
 	engine.set_soundfont(&bank);
-	engine.set_phase_settings(settings(safsyn::PhaseMode::SmoothField, 1, 54));
+	engine.set_phase_settings(settings(safsyn::PhaseMode::Analytic, 1, 54));
 	engine.note_on(0, 60, 127);
 	const auto audio = render(engine, 64);
 	bool linked = true;
@@ -410,7 +417,7 @@ void test_stereo_uses_one_phase_sheet()
 		}
 	if (!linked)
 		std::cerr << "Stereo worst shared-sheet ratio error: " << worst_ratio << '\n';
-	check(linked, "stereo partners receive the same FFT phase sheet");
+	check(linked, "stereo partners receive the same analytic rotation");
 }
 
 void test_loop_seams_and_render_cache_stability()
@@ -420,19 +427,20 @@ void test_loop_seams_and_render_cache_stability()
 		samples[index] = static_cast<int16_t>(std::llround(
 			10000.0 * std::sin(2.0 * pi * index / 16.0)));
 	auto bank = make_bank(samples, 64, 1, true, 16, 48);
-	for (const auto mode : {safsyn::PhaseMode::Analytic, safsyn::PhaseMode::SmoothField,
-		safsyn::PhaseMode::IndependentBins})
+	for (const bool continuous : {false, true})
 	{
 		safsyn::SynthEngine engine(64, 2);
 		engine.set_soundfont(&bank);
-		engine.set_phase_settings(settings(mode, 1, 5));
+		auto phase = settings(safsyn::PhaseMode::Analytic, 1, 5);
+		phase.continuous = continuous;
+		engine.set_phase_settings(phase);
 		engine.note_on(0, 60, 127);
 		const auto before = engine.phase_cache_stats();
 		const auto audio = render(engine, 144);
 		const auto after = engine.phase_cache_stats();
 		check(before.cache_bytes == after.cache_bytes &&
 			before.cached_variants == after.cached_variants,
-			"render_audio constructs no phase cache entries or variants");
+			"render_audio constructs no phase cache entries or angles");
 		float largest_seam = 0.0f;
 		for (size_t frame : {48u, 80u, 112u})
 			largest_seam = (std::max)(largest_seam,
@@ -465,9 +473,7 @@ void test_voice_stealing_does_not_reassign_survivor_phases()
 void test_modes_preserve_timing_and_voice_counts()
 {
 	auto bank = make_bank(make_signal(96), 9600);
-	for (const auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::RandomPolarity,
-		safsyn::PhaseMode::Analytic, safsyn::PhaseMode::SmoothField,
-		safsyn::PhaseMode::IndependentBins})
+	for (const auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::Analytic})
 	{
 		safsyn::SynthEngine engine(9600, 8);
 		engine.set_soundfont(&bank);
@@ -513,8 +519,7 @@ void test_preparation_preserves_audio_and_warms_all_variants()
 	auto bank = make_bank(make_signal(127, 2), 12700, 2, true, 19, 113);
 	bank.regions.push_back(bank.regions.front()); // Same sample identity, two layers.
 	std::vector<safsyn::PhaseSettings> cases;
-	for (const auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::RandomPolarity,
-		safsyn::PhaseMode::Analytic, safsyn::PhaseMode::SmoothField, safsyn::PhaseMode::IndependentBins})
+	for (const auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::Analytic})
 		cases.push_back(settings(mode, 4, 0xabc));
 	auto continuous = settings(safsyn::PhaseMode::Analytic, 4, 0xabc);
 	continuous.continuous = true; cases.push_back(continuous);
@@ -532,7 +537,7 @@ void test_preparation_preserves_audio_and_warms_all_variants()
 		preparation.progress = [&](const auto& progress) { last = progress; };
 		check(prepared.prepare_playback(128, preparation), "preparation succeeds");
 		const auto warm = prepared.phase_cache_stats();
-		const bool transformed = phase.mode != safsyn::PhaseMode::Coherent && phase.mode != safsyn::PhaseMode::RandomPolarity;
+		const bool transformed = phase.mode != safsyn::PhaseMode::Coherent;
 		check(warm.cached_samples == (transformed ? 1 : 0), "preparation deduplicates shared sample layers");
 		check(last.completed == last.total && last.cache_bytes == last.total_cache_bytes,
 			"preparation completes the entire planned PCM cache");
@@ -557,23 +562,93 @@ void test_preparation_preserves_audio_and_warms_all_variants()
 	}
 }
 
+void test_parallel_preparation_matches_serial()
+{
+	safsyn::Soundfont bank;
+	bank.sfz_pcm.reserve(8);
+	for (uint32_t index = 0; index < 6; ++index)
+	{
+		const uint8_t channels = index % 3 == 1 ? 2 : 1;
+		const size_t frames = 700 + index * 331;
+		bank.sfz_pcm.push_back(make_signal(frames, channels));
+		safsyn::SampleRegion region;
+		region.logical_sample_id = 0x50524550ULL + index;
+		region.pcm = bank.sfz_pcm.back().data();
+		region.pcm_len = static_cast<uint32_t>(frames);
+		region.sample_rate = 12800;
+		region.channels = channels;
+		region.root_key = static_cast<uint8_t>(60 + index);
+		region.lo_key = region.hi_key = static_cast<uint8_t>(60 + index);
+		region.attack = region.decay = region.hold = 0.0f;
+		region.sustain = 1.0f;
+		if (index % 2 == 0)
+		{
+			region.loop_mode = safsyn::LoopMode::Forward;
+			region.loop_start = 100 + index;
+			region.loop_end = static_cast<uint32_t>(frames) - 3 * index; // Mostly non-power-of-two.
+		}
+		bank.regions.push_back(region);
+	}
+	auto phase = settings(safsyn::PhaseMode::Analytic, 8, 31);
+	phase.continuous = true;
+	safsyn::SynthEngine serial(12800, 16), parallel(12800, 16);
+	for (auto* engine : {&serial, &parallel})
+	{
+		engine->set_voice_model(safsyn::VoiceModel::Cohorts);
+		engine->set_soundfont(&bank);
+		engine->set_phase_settings(phase);
+	}
+	const auto caller = std::this_thread::get_id();
+	bool off_thread = false;
+	safsyn::PhasePreparationProgress serial_last, parallel_last;
+	safsyn::PhasePreparationOptions options;
+	options.threads = 1;
+	options.progress = [&](const auto& progress) {
+		off_thread |= std::this_thread::get_id() != caller;
+		serial_last = progress;
+	};
+	check(serial.prepare_playback(64, options), "serial preparation succeeds");
+	options.threads = 4;
+	options.progress = [&](const auto& progress) {
+		off_thread |= std::this_thread::get_id() != caller;
+		parallel_last = progress;
+	};
+	check(parallel.prepare_playback(64, options), "parallel preparation succeeds");
+	check(!off_thread, "preparation progress is reported on the calling thread");
+	check(parallel_last.completed == parallel_last.total && parallel_last.total == 6 &&
+		parallel_last.cache_bytes == serial_last.cache_bytes &&
+		parallel.phase_cache_stats().analytic_samples == 6,
+		"parallel preparation completes every unique sample");
+	for (auto* engine : {&serial, &parallel})
+		for (uint8_t note = 60; note < 66; ++note)
+			engine->note_on(0, note, 100);
+	check(render(serial, 2048) == render(parallel, 2048),
+		"parallel preparation builds a bit-identical analytic cache");
+}
+
 void test_preparation_budget_and_cancellation()
 {
 	auto bank = make_bank(make_signal(127), 12700);
+	for (uint64_t layer = 1; layer < 4; ++layer)
+	{
+		auto region = bank.regions.front();
+		region.logical_sample_id += layer; // Distinct samples, one transform each.
+		bank.regions.push_back(region);
+	}
 	safsyn::PhaseProcessor processor;
-	processor.configure(settings(safsyn::PhaseMode::IndependentBins, 4));
+	processor.configure(settings(safsyn::PhaseMode::Analytic, 4));
 	safsyn::PhasePreparationOptions options; options.maximum_cache_bytes = 1;
 	bool rejected = false;
 	try { processor.prepare(bank.regions, options); } catch (const std::length_error&) { rejected = true; }
 	check(rejected && processor.stats().cache_bytes == 0 && processor.stats().cached_samples == 0,
-		"oversized phase pools fail before any cache entry or PCM allocation");
+		"oversized phase caches fail before any cache entry or PCM allocation");
 	std::stop_source stop;
-	options = {}; options.stop = stop.get_token();
+	options = {}; options.stop = stop.get_token(); options.threads = 1;
 	options.progress = [&](const auto& p) { if (p.completed == 1) stop.request_stop(); };
-	check(!processor.prepare(bank.regions, options), "preparation stops between variants");
-	check(processor.stats().cached_variants == 1 && processor.stats().failures == 0,
-		"cancelled preparation keeps completed variants without coherent fallback");
-	check(processor.prepare(bank.regions) && processor.stats().cached_variants == 4,
+	check(!processor.prepare(bank.regions, options), "preparation stops between samples");
+	check(processor.stats().analytic_samples == 1 && processor.stats().failures == 0,
+		"cancelled preparation keeps completed samples without coherent fallback");
+	check(processor.prepare(bank.regions) && processor.stats().analytic_samples == 4,
 		"partially prepared cache can resume safely");
 	processor.clear(); processor.configure(settings(safsyn::PhaseMode::Analytic));
 	auto large = make_bank(make_signal(1048576), 48000);
@@ -601,7 +676,7 @@ int main()
 	test_pool_one_is_mutually_coherent();
 	test_pool_sizes_generate_distinct_variants();
 	test_continuous_analytic_is_not_pool_quantized();
-	test_fft_magnitudes_and_dc_nyquist();
+	test_analytic_rotation_preserves_periodic_tone();
 	test_attack_preservation();
 	test_stereo_uses_one_phase_sheet();
 	test_loop_seams_and_render_cache_stability();
@@ -609,6 +684,7 @@ int main()
 	test_modes_preserve_timing_and_voice_counts();
 	test_seed_changes_only_phase_assignment();
 	test_preparation_preserves_audio_and_warms_all_variants();
+	test_parallel_preparation_matches_serial();
 	test_preparation_budget_and_cancellation();
 	if (failures != 0)
 	{

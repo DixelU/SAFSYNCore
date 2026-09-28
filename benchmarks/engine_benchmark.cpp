@@ -55,23 +55,51 @@ int interval_matrix(int argc, char** argv)
 	const size_t repetitions = argc > 3 ? std::stoull(argv[3]) : 7;
 	const size_t capacity = argc > 4 ? std::stoull(argv[4]) : 4096;
 	if (!threads || threads > 64 || !repetitions || !capacity) return 1;
-	std::cout << "mode,cohorts,threads,interval,median_ms_per_1024_frames,min_ms,max_ms,checksum\n";
-	for (const auto mode : {"mono", "stereo", "analytic"})
+	// The first three cases keep their original meaning for older CSVs. Grouped
+	// cases start eight identical onsets per cohort; release cases measure a
+	// long release tail; the filtered case enables the region low-pass.
+	struct Case
 	{
+		std::string_view name;
+		bool stereo = false;
+		bool analytic = false;
+		uint64_t group = 1;
+		bool release = false;
+		bool filtered = false;
+	};
+	const Case cases[] = {
+		{"mono"},
+		{"stereo", true},
+		{"analytic", false, true},
+		{"analytic-stereo", true, true},
+		{"grouped", false, false, 8},
+		{"analytic-grouped", false, true, 8},
+		{"release", false, false, 1, true},
+		{"analytic-release", false, true, 1, true},
+		{"analytic-filtered", false, true, 1, false, true},
+	};
+	std::cout << "mode,cohorts,threads,interval,median_ms_per_1024_frames,min_ms,max_ms,checksum\n";
+	for (const auto& test : cases)
+	{
+		const auto mode = test.name;
 		auto bank = make_bank();
-		const bool stereo = std::string_view(mode) == "stereo";
+		const bool stereo = test.stereo;
 		auto& pcm = bank.sfz_pcm.back();
 		pcm.resize(1024 * (stereo ? 2 : 1));
 		for (size_t i = 0; i < pcm.size(); ++i)
 			pcm[i] = static_cast<int16_t>(std::sin(i * 0.071) * 16384);
 		bank.regions[0].pcm = pcm.data();
 		bank.regions[0].channels = stereo ? 2 : 1;
+		if (test.release)
+			bank.regions[0].release = 10.0f;
+		if (test.filtered)
+			bank.regions[0].filter_cutoff_cents = 9000.0f;
 		for (uint32_t interval : {1u, 9u, 64u, 256u, 1024u})
 		{
 			safsyn::SynthEngine engine(48000, capacity);
 			engine.set_voice_model(safsyn::VoiceModel::Cohorts, capacity);
 			engine.set_render_threads(threads);
-			if (std::string_view(mode) == "analytic")
+			if (test.analytic)
 			{
 				safsyn::PhaseSettings phase;
 				phase.mode = safsyn::PhaseMode::Analytic;
@@ -79,7 +107,19 @@ int interval_matrix(int argc, char** argv)
 			}
 			engine.set_soundfont(&bank);
 			for (uint64_t ordinal = 0; ordinal < capacity; ++ordinal)
-				start_distinct(engine, ordinal, 7);
+			{
+				if (test.group == 1)
+				{
+					start_distinct(engine, ordinal, 7);
+					continue;
+				}
+				engine.control_change(7, 1, static_cast<uint8_t>(ordinal & 0x7f));
+				engine.note_on_batch(7, static_cast<uint8_t>(ordinal & 0x7f),
+					static_cast<uint8_t>(1 + ((ordinal >> 7) % 127)), test.group);
+			}
+			if (test.release)
+				for (uint64_t ordinal = 0; ordinal < capacity; ++ordinal)
+					engine.note_off(7, static_cast<uint8_t>(ordinal & 0x7f));
 			std::vector<float> audio(2048);
 			auto run = [&] {
 				for (uint32_t cursor = 0; cursor < 1024; cursor += interval)

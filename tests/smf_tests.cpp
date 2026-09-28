@@ -770,13 +770,11 @@ void test_render_progress_and_cancellation(const std::filesystem::path& director
 		"cancelled render is finalized as a valid partial WAV");
 
 	// Preparation uses unique sample transforms, independently of audio frames
-	// and runtime cohorts. Two layers sharing PCM still need just one pool.
+	// and runtime cohorts. Two layers sharing PCM still need just one transform.
 	bank.regions.push_back(bank.regions.front());
 	options.phase.pool_size = 4;
-	for (const auto mode : {safsyn::PhaseMode::Analytic,
-		safsyn::PhaseMode::SmoothField, safsyn::PhaseMode::IndependentBins})
+	options.phase.mode = safsyn::PhaseMode::Analytic;
 	{
-		options.phase.mode = mode;
 		ProgressCapture prepared_progress;
 		options.progress_user_data = &prepared_progress;
 		safsyn::SmfRenderResult prepared;
@@ -784,8 +782,16 @@ void test_render_progress_and_cancellation(const std::filesystem::path& director
 			completed_path.string().c_str(), options, prepared) &&
 			prepared_progress.preparation_valid && prepared_progress.saw_preparation_start &&
 			prepared_progress.saw_preparation_complete && prepared_progress.saw_events &&
-			prepared_progress.preparation_total == (mode == safsyn::PhaseMode::Analytic ? 1 : 4),
+			prepared_progress.preparation_total == 1,
 			"render forwards counted sample preparation before advancing audio or events");
+	}
+	// Distinct samples are prepared concurrently; cancelling at the first
+	// completion must stop reporting and never start the timeline.
+	for (uint64_t layer = 1; layer <= 2; ++layer)
+	{
+		auto region = bank.regions.front();
+		region.logical_sample_id = bank.regions.front().logical_sample_id + layer;
+		bank.regions.push_back(region);
 	}
 	ProgressCapture preparation_cancelled_progress;
 	preparation_cancelled_progress.cancel_after_preparation = 1;
@@ -795,12 +801,13 @@ void test_render_progress_and_cancellation(const std::filesystem::path& director
 		cancelled_path.string().c_str(), options, preparation_cancelled) &&
 		preparation_cancelled.cancelled && preparation_cancelled.frames_written == 0 &&
 		preparation_cancelled.scheduled_events == 0 && preparation_cancelled.diagnostics.empty() &&
-		preparation_cancelled.phase.cached_variants == 1 &&
+		preparation_cancelled.phase.analytic_samples >= 1 &&
+		preparation_cancelled.phase.failures == 0 &&
 		preparation_cancelled_progress.preparation_valid &&
-		preparation_cancelled_progress.preparation_total == 4 &&
+		preparation_cancelled_progress.preparation_total == 3 &&
 		preparation_cancelled_progress.preparation_completed == 1 &&
 		!preparation_cancelled_progress.saw_events,
-		"preparation progress cancellation stops after one variant without starting the timeline");
+		"preparation progress cancellation stops after one sample without starting the timeline");
 	const auto preparation_cancelled_bytes = read_file(cancelled_path);
 	check(preparation_cancelled_bytes.size() == 44 &&
 		read_le32(preparation_cancelled_bytes, 40) == 0,

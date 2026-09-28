@@ -66,7 +66,6 @@ enum ControlId : int
 	PhasePool,
 	PhaseContinuous,
 	PhaseSeed,
-	PhaseCorrelation,
 	PhaseAttack,
 	OutputGain,
 	LimiterEnabled,
@@ -147,7 +146,6 @@ struct AppState
 	std::vector<HWND> phase_pool_controls;
 	std::vector<HWND> phase_continuous_controls;
 	std::vector<HWND> phase_seed_controls;
-	std::vector<HWND> phase_correlation_controls;
 	std::vector<HWND> phase_attack_controls;
 	std::thread worker;
 	std::atomic_bool cancel{false};
@@ -344,10 +342,7 @@ safsyn::PhaseMode selected_phase_mode(const AppState& state)
 {
 	const int selection = static_cast<int>(SendDlgItemMessageW(state.window,
 		PhaseMode, CB_GETCURSEL, 0, 0));
-	const safsyn::PhaseMode modes[] = {safsyn::PhaseMode::Coherent,
-		safsyn::PhaseMode::RandomPolarity, safsyn::PhaseMode::Analytic,
-		safsyn::PhaseMode::SmoothField, safsyn::PhaseMode::IndependentBins};
-	return modes[(std::max)(0, (std::min)(selection, 4))];
+	return selection == 1 ? safsyn::PhaseMode::Analytic : safsyn::PhaseMode::Coherent;
 }
 
 void enable_controls(const std::vector<HWND>& controls, bool enabled)
@@ -362,7 +357,6 @@ struct PhaseCapabilities
 	bool pool = false;
 	bool continuous = false;
 	bool seed = false;
-	bool correlation = false;
 	bool attack = false;
 	const wchar_t* description = L"Bit-exact original sample phase. Advanced phase controls do not apply.";
 };
@@ -374,11 +368,6 @@ PhaseCapabilities phase_capabilities(safsyn::PhaseMode mode, bool continuous)
 	{
 		case safsyn::PhaseMode::Coherent:
 			break;
-		case safsyn::PhaseMode::RandomPolarity:
-			capabilities.seed = capabilities.attack = true;
-			capabilities.description =
-				L"Experimental: deterministically keeps or inverts each note. Seed and attack protection apply.";
-			break;
 		case safsyn::PhaseMode::Analytic:
 			capabilities.strength = capabilities.continuous =
 				capabilities.seed = capabilities.attack = true;
@@ -386,18 +375,6 @@ PhaseCapabilities phase_capabilities(safsyn::PhaseMode mode, bool continuous)
 			capabilities.description = continuous
 				? L"Experimental: notes sharing a key, channel and tick share a random rotation; the finite pool is bypassed."
 				: L"Experimental: analytic rotations come from a deterministic, reusable variant pool.";
-			break;
-		case safsyn::PhaseMode::SmoothField:
-			capabilities.strength = capabilities.pool = capabilities.seed =
-				capabilities.correlation = capabilities.attack = true;
-			capabilities.description =
-				L"Experimental: FFT phase offsets vary smoothly; correlation controls their bandwidth.";
-			break;
-		case safsyn::PhaseMode::IndependentBins:
-			capabilities.strength = capabilities.pool =
-				capabilities.seed = capabilities.attack = true;
-			capabilities.description =
-				L"Experimental: each FFT bin gets an independent offset from a deterministic variant pool.";
 			break;
 	}
 	return capabilities;
@@ -415,7 +392,6 @@ void update_phase_controls(AppState& state)
 	enable_controls(state.phase_pool_controls, editable && capabilities.pool);
 	enable_controls(state.phase_continuous_controls, editable && capabilities.continuous);
 	enable_controls(state.phase_seed_controls, editable && capabilities.seed);
-	enable_controls(state.phase_correlation_controls, editable && capabilities.correlation);
 	enable_controls(state.phase_attack_controls, editable && capabilities.attack);
 }
 
@@ -600,7 +576,6 @@ bool read_request(AppState& state, RenderRequest& request)
 	const PhaseCapabilities capabilities = phase_capabilities(options.phase.mode,
 		options.phase.continuous);
 	double phase_strength = options.phase.strength;
-	double correlation = options.phase.correlation_hz;
 	double attack = options.phase.preserve_attack_ms;
 	uint64_t pool = options.phase.pool_size;
 	uint64_t seed = options.phase.seed;
@@ -611,16 +586,12 @@ bool read_request(AppState& state, RenderRequest& request)
 			L"Phase pool", 1, 64, pool)) ||
 		(capabilities.seed && !parse_unsigned(state.window, GetDlgItem(state.window, PhaseSeed),
 			L"Phase seed", 0, (std::numeric_limits<uint64_t>::max)(), seed)) ||
-		(capabilities.correlation && !parse_number(state.window,
-			GetDlgItem(state.window, PhaseCorrelation), L"Phase correlation",
-			0.001, 1000000.0, correlation)) ||
 		(capabilities.attack && !parse_number(state.window, GetDlgItem(state.window, PhaseAttack),
 			L"Preserved attack", 0.0, 60000.0, attack)))
 		return false;
 	options.phase.strength = static_cast<float>(phase_strength);
 	options.phase.pool_size = static_cast<uint32_t>(pool);
 	options.phase.seed = seed;
-	options.phase.correlation_hz = static_cast<float>(correlation);
 	options.phase.preserve_attack_ms = static_cast<float>(attack);
 
 	double gain = 0.0, ceiling = 0.0, lookahead = 0.0, release = 0.0;
@@ -972,8 +943,7 @@ void create_ui(AppState& state)
 		54, rows[0], 820, 24);
 	add_page_label(state, 1, L"Phase mode", left_label, rows[1], 145);
 	add_page_combo(state, 1, PhaseMode, left_field, rows[1] - 3, 190,
-		{L"Direct sampling", L"Random polarity", L"Analytic", L"Smooth field",
-			L"Independent bins"}, 0);
+		{L"Direct sampling", L"Analytic"}, 0);
 	state.phase_strength_controls = {
 		add_page_label(state, 1, L"Strength (0-1)", left_label, rows[2], 145),
 		add_page_edit(state, 1, PhaseStrength, L"1", left_field, rows[2] - 3, 160)};
@@ -986,12 +956,9 @@ void create_ui(AppState& state)
 	state.phase_seed_controls = {
 		add_page_label(state, 1, L"Seed", right_label, rows[1], 180),
 		add_page_edit(state, 1, PhaseSeed, L"0", right_field, rows[1] - 3, 160)};
-	state.phase_correlation_controls = {
-		add_page_label(state, 1, L"Correlation (Hz)", right_label, rows[2], 180),
-		add_page_edit(state, 1, PhaseCorrelation, L"250", right_field, rows[2] - 3, 160)};
 	state.phase_attack_controls = {
-		add_page_label(state, 1, L"Preserve attack (ms)", right_label, rows[3], 180),
-		add_page_edit(state, 1, PhaseAttack, L"0", right_field, rows[3] - 3, 160)};
+		add_page_label(state, 1, L"Preserve attack (ms)", right_label, rows[2], 180),
+		add_page_edit(state, 1, PhaseAttack, L"0", right_field, rows[2] - 3, 160)};
 
 	add_page_label(state, 2,
 		L"Mastering follows the raw mix. Leave gain at 0 dB and limiter off for the reference output.",
@@ -1042,7 +1009,7 @@ void update_progress_ui(AppState& state, const ProgressUpdate& update)
 		progress.preparation.total != 0)
 	{
 		const auto& preparation = progress.preparation;
-		set_text(state.status_title, L"Prerendering sample variants " +
+		set_text(state.status_title, L"Preparing analytic samples " +
 			format_count(preparation.completed) + L"/" + format_count(preparation.total) + L"...");
 		const double fraction = static_cast<double>(preparation.completed) / preparation.total;
 		SendMessageW(state.progress, PBM_SETPOS, static_cast<int>(fraction * 1000.0), 0);

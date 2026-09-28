@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <thread>
 #include <unordered_map>
@@ -93,20 +94,11 @@ struct OnsetKeyHash
 	}
 };
 
-struct VariantTerm
-{
-	const float* left = nullptr;
-	const float* right = nullptr;
-	uint64_t count = 0;
-	detail::StereoFilterState filter_state;
-};
-
 struct PhaseAggregate
 {
 	uint64_t multiplicity = 0;
 	uint64_t coherent_count = 0;
 	uint64_t transformed_count = 0;
-	double polarity_sum = 0.0;
 	double cosine_left = 0.0;
 	double sine_left = 0.0;
 	double cosine_right = 0.0;
@@ -115,7 +107,6 @@ struct PhaseAggregate
 	const float* quadrature_right = nullptr;
 	uint32_t attack_hold_frames = 0;
 	uint32_t attack_fade_frames = 0;
-	std::vector<VariantTerm> variants;
 	PhaseVoiceState singleton;
 	bool singleton_valid = false;
 	// Filter linear basis signals, not the weighted sum. A note-off can then
@@ -125,14 +116,25 @@ struct PhaseAggregate
 	detail::StereoFilterState changed_filter;
 	detail::StereoFilterState quadrature_filter;
 
+	// Without a protected attack every blend is exactly one: the protected basis
+	// only ever filters zeros and the changed basis equals the original one.
+	// Attack settings are engine-wide, so a cohort never switches between forms.
+	bool attack_window() const noexcept
+	{
+		return attack_hold_frames != 0 || attack_fade_frames != 0;
+	}
+
+	uint32_t protected_frames() const noexcept
+	{
+		return attack_hold_frames + attack_fade_frames;
+	}
+
 	void clear_filter_history() noexcept
 	{
 		original_filter = {};
 		protected_filter = {};
 		changed_filter = {};
 		quadrature_filter = {};
-		for (auto& term : variants)
-			term.filter_state = {};
 	}
 
 	void inherit_filter_history(const PhaseAggregate& source) noexcept
@@ -141,31 +143,23 @@ struct PhaseAggregate
 		protected_filter = source.protected_filter;
 		changed_filter = source.changed_filter;
 		quadrature_filter = source.quadrature_filter;
-		for (auto& term : variants)
-		{
-			const auto found = std::find_if(source.variants.begin(), source.variants.end(),
-				[&](const VariantTerm& other) {
-					return term.left == other.left && term.right == other.right;
-				});
-			if (found != source.variants.end())
-				term.filter_state = found->filter_state;
-		}
 	}
 
 	std::array<float, 2> filtered_sample(const std::array<float, 2>& original0,
 		const std::array<float, 2>& original1, uint32_t index0, uint32_t index1,
 		float fraction, float envelope, const detail::FilterRamp& filter) noexcept
 	{
+		const bool window = attack_window();
 		auto blend_at = [&](uint32_t index) {
 			if (index < attack_hold_frames)
 				return 0.0f;
-			if (attack_fade_frames == 0 || index >= attack_hold_frames + attack_fade_frames)
+			if (attack_fade_frames == 0 || index >= protected_frames())
 				return 1.0f;
 			const float u = static_cast<float>(index - attack_hold_frames) / attack_fade_frames;
 			return u * u * (3.0f - 2.0f * u);
 		};
-		const float blend0 = blend_at(index0);
-		const float blend1 = blend_at(index1);
+		const float blend0 = window ? blend_at(index0) : 1.0f;
+		const float blend1 = window ? blend_at(index1) : 1.0f;
 		auto interpolate = [&](float a, float b) { return (a + (b - a) * fraction) * envelope; };
 		std::array<float, 2> output{};
 		for (size_t channel = 0; channel < 2; ++channel)
@@ -176,12 +170,15 @@ struct PhaseAggregate
 			double result = static_cast<double>(original) * coherent_count;
 			if (transformed_count != 0)
 			{
-				const float protected_sample = protected_filter.process(
-					interpolate(a * (1.0f - blend0), b * (1.0f - blend1)), channel, filter);
-				const float changed = changed_filter.process(
-					interpolate(a * blend0, b * blend1), channel, filter);
-				result += static_cast<double>(protected_sample) * transformed_count;
-				result += static_cast<double>(changed) * polarity_sum;
+				float changed = original;
+				if (window)
+				{
+					const float protected_sample = protected_filter.process(
+						interpolate(a * (1.0f - blend0), b * (1.0f - blend1)), channel, filter);
+					changed = changed_filter.process(
+						interpolate(a * blend0, b * blend1), channel, filter);
+					result += static_cast<double>(protected_sample) * transformed_count;
+				}
 				if (quadrature_left)
 				{
 					const auto* quadrature = channel == 0 ? quadrature_left : quadrature_right;
@@ -189,15 +186,6 @@ struct PhaseAggregate
 						quadrature[index0] * blend0, quadrature[index1] * blend1), channel, filter);
 					result += static_cast<double>(changed) * (channel == 0 ? cosine_left : cosine_right) -
 						static_cast<double>(shifted) * (channel == 0 ? sine_left : sine_right);
-				}
-				for (auto& term : variants)
-				{
-					if (term.count == 0)
-						continue;
-					const auto* sample = channel == 0 ? term.left : term.right;
-					const float changed_variant = term.filter_state.process(interpolate(
-						sample[index0] * blend0, sample[index1] * blend1), channel, filter);
-					result += static_cast<double>(changed_variant) * term.count;
 				}
 			}
 			output[channel] = static_cast<float>(result);
@@ -224,33 +212,12 @@ struct PhaseAggregate
 		transformed_count += count;
 		attack_hold_frames = state.attack_hold_frames;
 		attack_fade_frames = state.attack_fade_frames;
-		switch (state.kind)
-		{
-		case PhaseVoiceState::Kind::Coherent:
-			break;
-		case PhaseVoiceState::Kind::Polarity:
-			polarity_sum += static_cast<double>(state.polarity) * count;
-			break;
-		case PhaseVoiceState::Kind::Analytic:
-			quadrature_left = state.quadrature_left;
-			quadrature_right = state.quadrature_right;
-			cosine_left += static_cast<double>(state.cosine) * state.scale_left * count;
-			sine_left += static_cast<double>(state.sine) * state.scale_left * count;
-			cosine_right += static_cast<double>(state.cosine) * state.scale_right * count;
-			sine_right += static_cast<double>(state.sine) * state.scale_right * count;
-			break;
-		case PhaseVoiceState::Kind::Variant:
-		{
-			auto found = std::find_if(variants.begin(), variants.end(), [&](const VariantTerm& term) {
-				return term.left == state.variant_left && term.right == state.variant_right;
-			});
-			if (found == variants.end())
-				variants.push_back({state.variant_left, state.variant_right, count});
-			else
-				found->count += count;
-			break;
-		}
-		}
+		quadrature_left = state.quadrature_left;
+		quadrature_right = state.quadrature_right;
+		cosine_left += static_cast<double>(state.cosine) * state.scale_left * count;
+		sine_left += static_cast<double>(state.sine) * state.scale_left * count;
+		cosine_right += static_cast<double>(state.cosine) * state.scale_right * count;
+		sine_right += static_cast<double>(state.sine) * state.scale_right * count;
 	}
 
 	void add(const PhaseAggregate& other)
@@ -266,7 +233,6 @@ struct PhaseAggregate
 			singleton_valid = false;
 		coherent_count += other.coherent_count;
 		transformed_count += other.transformed_count;
-		polarity_sum += other.polarity_sum;
 		cosine_left += other.cosine_left;
 		sine_left += other.sine_left;
 		cosine_right += other.cosine_right;
@@ -281,16 +247,6 @@ struct PhaseAggregate
 			attack_hold_frames = other.attack_hold_frames;
 			attack_fade_frames = other.attack_fade_frames;
 		}
-		for (const auto& term : other.variants)
-		{
-			auto found = std::find_if(variants.begin(), variants.end(), [&](const VariantTerm& own) {
-				return own.left == term.left && own.right == term.right;
-			});
-			if (found == variants.end())
-				variants.push_back(term);
-			else
-				found->count += term.count;
-		}
 	}
 
 	void subtract(const PhaseAggregate& other) noexcept
@@ -298,43 +254,27 @@ struct PhaseAggregate
 		multiplicity -= other.multiplicity;
 		coherent_count -= other.coherent_count;
 		transformed_count -= other.transformed_count;
-		polarity_sum -= other.polarity_sum;
 		cosine_left -= other.cosine_left;
 		sine_left -= other.sine_left;
 		cosine_right -= other.cosine_right;
 		sine_right -= other.sine_right;
-		for (const auto& term : other.variants)
-		{
-			auto found = std::find_if(variants.begin(), variants.end(), [&](const VariantTerm& own) {
-				return own.left == term.left && own.right == term.right;
-			});
-			if (found != variants.end())
-				found->count -= term.count;
-		}
 		if (multiplicity != 1)
 			singleton_valid = false;
 	}
 
+	// The scalar reference for SIMD kernels; they must reproduce it exactly.
 	float sample(float original, uint32_t index, bool right) const noexcept
 	{
 		if (multiplicity == 1 && singleton_valid)
 			return singleton.apply(original, index, right);
 		double changed = 0.0;
-		changed += static_cast<double>(original) * polarity_sum;
 		if (quadrature_left)
 		{
 			const float* quadrature = right ? quadrature_right : quadrature_left;
 			const double cosine = right ? cosine_right : cosine_left;
 			const double sine = right ? sine_right : sine_left;
-			changed += static_cast<double>(original) * cosine -
+			changed = static_cast<double>(original) * cosine -
 				static_cast<double>(quadrature[index]) * sine;
-		}
-		for (const auto& term : variants)
-		{
-			if (term.count == 0)
-				continue;
-			const float* values = right ? term.right : term.left;
-			changed += static_cast<double>(values[index]) * term.count;
 		}
 		const double coherent = static_cast<double>(original) * coherent_count;
 		if (transformed_count == 0)
@@ -385,61 +325,74 @@ struct RenderCohort
 };
 
 #if defined(_M_X64) || defined(__SSE2__)
-// Four independent output frames, with the original sequential double position
-// updates and float operation order. Stop before any loop/sample boundary so
-// the general renderer retains all wrapping and retirement decisions.
-template<bool Stereo, bool Planar = false>
-uint32_t render_coherent_sustain(RenderCohort& cohort, float* out, uint32_t frames,
-	double increment, bool valid_loop, float amplitude) noexcept
+// How a vectorized cohort turns its source sample into a mixed sample. Each
+// form evaluates exactly the scalar arithmetic it replaces, lane by lane.
+enum class VectorSource : uint8_t
 {
-	const auto& region = *cohort.region;
-	const double end = valid_loop ? region.loop_end : region.pcm_len;
+	Coherent,       // one coherent voice: the PCM sample itself
+	CoherentSum,    // float(x * coherent_count)
+	AnalyticSingle, // PhaseVoiceState::apply after the protected attack
+	AnalyticSum,    // PhaseAggregate::sample after the protected attack
+};
+
+__m128i load_low_64(const void* source) noexcept
+{
+	return _mm_loadl_epi64(static_cast<const __m128i*>(source));
+}
+
+// 16-bit sample and its successor as one 32-bit lane (low half first).
+int32_t load_pcm_pair(const int16_t* pcm) noexcept
+{
+	int32_t pair;
+	std::memcpy(&pair, pcm, sizeof(pair));
+	return pair;
+}
+
+template<int Control>
+__m128i shuffle_lanes(__m128i a, __m128i b) noexcept
+{
+	return _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(a), _mm_castsi128_ps(b), Control));
+}
+
+// Lanes of [x[i] | x[i + 1] << 16] become the float endpoints x[i] and x[i + 1].
+void split_pcm_pairs(__m128i pairs, __m128& first, __m128& second) noexcept
+{
 	const __m128 scale = _mm_set1_ps(1.0f / 32768.0f);
-	const __m128 envelope = _mm_set1_ps(region.sustain);
-	const __m128 gain_l = _mm_set1_ps(cohort.gain_l);
-	const __m128 gain_r = _mm_set1_ps(cohort.gain_r);
-	const __m128 amp = _mm_set1_ps(amplitude);
-	uint32_t frame = 0;
-	for (; frames - frame >= 4; frame += 4)
-	{
-		const double p0 = cohort.pos;
-		const double p1 = p0 + increment;
-		const double p2 = p1 + increment;
-		const double p3 = p2 + increment;
-		const double p4 = p3 + increment;
-		if (!(p0 >= 0.0 && p3 < end - 1.0 && p4 < end)) break;
-		const uint32_t i0 = static_cast<uint32_t>(p0);
-		const uint32_t i1 = static_cast<uint32_t>(p1);
-		const uint32_t i2 = static_cast<uint32_t>(p2);
-		const uint32_t i3 = static_cast<uint32_t>(p3);
-		const __m128 fraction = _mm_setr_ps(static_cast<float>(p0 - i0),
-			static_cast<float>(p1 - i1), static_cast<float>(p2 - i2),
-			static_cast<float>(p3 - i3));
-		constexpr size_t stride = Stereo && !Planar ? 2 : 1;
-		auto interpolate = [&](const int16_t* pcm) {
-			const __m128 first = _mm_mul_ps(scale, _mm_cvtepi32_ps(_mm_setr_epi32(
-				pcm[size_t{i0} * stride], pcm[size_t{i1} * stride],
-				pcm[size_t{i2} * stride], pcm[size_t{i3} * stride])));
-			const __m128 second = _mm_mul_ps(scale, _mm_cvtepi32_ps(_mm_setr_epi32(
-				pcm[(size_t{i0} + 1) * stride], pcm[(size_t{i1} + 1) * stride],
-				pcm[(size_t{i2} + 1) * stride], pcm[(size_t{i3} + 1) * stride])));
-			return _mm_add_ps(first, _mm_mul_ps(_mm_sub_ps(second, first), fraction));
-		};
-		const __m128 sample_l = interpolate(region.pcm);
-		__m128 sample_r = sample_l;
-		if constexpr (Stereo)
-			sample_r = interpolate(Planar ? region.pcm_right : region.pcm + 1);
-		const __m128 left = _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(sample_l, envelope), gain_l), amp);
-		const __m128 right = _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(sample_r, envelope), gain_r), amp);
-		float* destination = out + static_cast<size_t>(frame) * 2;
-		_mm_storeu_ps(destination, _mm_add_ps(_mm_loadu_ps(destination),
-			_mm_unpacklo_ps(left, right)));
-		_mm_storeu_ps(destination + 4, _mm_add_ps(_mm_loadu_ps(destination + 4),
-			_mm_unpackhi_ps(left, right)));
-		cohort.pos = p4;
-		cohort.env = region.sustain;
-	}
-	return frame;
+	first = _mm_mul_ps(scale, _mm_cvtepi32_ps(_mm_srai_epi32(_mm_slli_epi32(pairs, 16), 16)));
+	second = _mm_mul_ps(scale, _mm_cvtepi32_ps(_mm_srai_epi32(pairs, 16)));
+}
+
+// Adjacent 32-bit elements at four element indices, split into element i and
+// i + 1. Interleaved stereo PCM uses one L/R pair as its 32-bit element.
+void load_adjacent(const void* values, uint32_t i0, uint32_t i1, uint32_t i2,
+	uint32_t i3, __m128i& first, __m128i& second) noexcept
+{
+	const auto* bytes = static_cast<const unsigned char*>(values);
+	auto at = [&](uint32_t index) { return load_low_64(bytes + size_t{index} * 4); };
+	const __m128i low = _mm_unpacklo_epi64(at(i0), at(i1));
+	const __m128i high = _mm_unpacklo_epi64(at(i2), at(i3));
+	first = shuffle_lanes<_MM_SHUFFLE(2, 0, 2, 0)>(low, high);
+	second = shuffle_lanes<_MM_SHUFFLE(3, 1, 3, 1)>(low, high);
+}
+
+// float(x * count), evaluated in double like the scalar cohort path.
+__m128 scaled_sum(__m128 x, __m128d count) noexcept
+{
+	const __m128 low = _mm_cvtpd_ps(_mm_mul_pd(_mm_cvtps_pd(x), count));
+	const __m128 high = _mm_cvtpd_ps(_mm_mul_pd(_mm_cvtps_pd(_mm_movehl_ps(x, x)), count));
+	return _mm_movelh_ps(low, high);
+}
+
+// float(x * count + (x * cosine - q * sine)), evaluated in double.
+__m128 rotated_sum(__m128 x, __m128 q, __m128d count, __m128d cosine, __m128d sine) noexcept
+{
+	auto half = [&](__m128 xs, __m128 qs) {
+		const __m128d xd = _mm_cvtps_pd(xs);
+		const __m128d qd = _mm_cvtps_pd(qs);
+		return _mm_cvtpd_ps(_mm_add_pd(_mm_mul_pd(xd, count),
+			_mm_sub_pd(_mm_mul_pd(xd, cosine), _mm_mul_pd(qd, sine))));
+	};
+	return _mm_movelh_ps(half(x, q), half(_mm_movehl_ps(x, x), _mm_movehl_ps(q, q)));
 }
 #endif
 
@@ -898,7 +851,7 @@ struct CohortEngineState
 		return true;
 	}
 
-	float advance_envelope(SynthEngine& owner, RenderCohort& cohort) noexcept
+	static float advance_envelope(SynthEngine& owner, RenderCohort& cohort) noexcept
 	{
 		switch (cohort.stage)
 		{
@@ -1433,6 +1386,338 @@ struct CohortEngineState
 		return parallel_render ? parallel_render->scratch.size() : 1;
 	}
 
+#if defined(_M_X64) || defined(__SSE2__)
+	using VectorKernel = uint32_t (*)(SynthEngine&, RenderCohort&, float*, uint32_t,
+		double, bool, float) noexcept;
+
+	// Four output frames per step with the scalar kernel's sequential double
+	// positions, envelope order, and float/double operation order. Stops before
+	// any loop/sample boundary and before a release would end, so the general
+	// renderer keeps every wrapping and retirement decision.
+	template<VectorSource Source, bool Stereo, bool Planar>
+	static uint32_t render_vector_frames(SynthEngine& owner, RenderCohort& cohort, float* out,
+		uint32_t frames, double increment, bool valid_loop, float amplitude) noexcept
+	{
+		constexpr bool analytic = Source == VectorSource::AnalyticSingle ||
+			Source == VectorSource::AnalyticSum;
+		constexpr bool singleton = Source == VectorSource::AnalyticSingle;
+		const auto& region = *cohort.region;
+		const auto& phase = cohort.phase;
+		const auto& single = phase.singleton;
+		const double end = valid_loop ? region.loop_end : region.pcm_len;
+		const __m128 gain_l = _mm_set1_ps(cohort.gain_l);
+		const __m128 gain_r = _mm_set1_ps(cohort.gain_r);
+		const __m128 amp = _mm_set1_ps(amplitude);
+		// Each instantiation uses only its own source weights.
+		[[maybe_unused]] const __m128d count = _mm_set1_pd(static_cast<double>(phase.coherent_count));
+		[[maybe_unused]] const __m128d cosine_l = _mm_set1_pd(phase.cosine_left);
+		[[maybe_unused]] const __m128d sine_l = _mm_set1_pd(phase.sine_left);
+		[[maybe_unused]] const __m128d cosine_r = _mm_set1_pd(phase.cosine_right);
+		[[maybe_unused]] const __m128d sine_r = _mm_set1_pd(phase.sine_right);
+		[[maybe_unused]] const __m128 single_cosine = _mm_set1_ps(single.cosine);
+		[[maybe_unused]] const __m128 single_sine = _mm_set1_ps(single.sine);
+		[[maybe_unused]] const __m128 single_scale_l = _mm_set1_ps(single.scale_left);
+		[[maybe_unused]] const __m128 single_scale_r = _mm_set1_ps(single.scale_right);
+		[[maybe_unused]] const float* quadrature_l = singleton ? single.quadrature_left : phase.quadrature_left;
+		[[maybe_unused]] const float* quadrature_r = singleton ? single.quadrature_right : phase.quadrature_right;
+		[[maybe_unused]] const uint32_t protect = singleton ? single.protected_frames() : phase.protected_frames();
+
+		auto source = [&](__m128 x, [[maybe_unused]] __m128 q, [[maybe_unused]] bool right) {
+			if constexpr (Source == VectorSource::Coherent)
+				return x;
+			else if constexpr (Source == VectorSource::CoherentSum)
+				return scaled_sum(x, count);
+			else if constexpr (Source == VectorSource::AnalyticSingle)
+				return _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(single_cosine, x),
+					_mm_mul_ps(single_sine, q)), right ? single_scale_r : single_scale_l);
+			else
+				return rotated_sum(x, q, count, right ? cosine_r : cosine_l,
+					right ? sine_r : sine_l);
+		};
+		auto interpolate = [](__m128 first, __m128 second, __m128 fraction) {
+			return _mm_add_ps(first, _mm_mul_ps(_mm_sub_ps(second, first), fraction));
+		};
+
+		uint32_t frame = 0;
+		for (; frames - frame >= 4; frame += 4)
+		{
+			const double p0 = cohort.pos;
+			const double p1 = p0 + increment;
+			const double p2 = p1 + increment;
+			const double p3 = p2 + increment;
+			const double p4 = p3 + increment;
+			if (!(p0 >= 0.0 && p3 < end - 1.0 && p4 < end)) break;
+			const uint32_t i0 = static_cast<uint32_t>(p0);
+			const uint32_t i1 = static_cast<uint32_t>(p1);
+			const uint32_t i2 = static_cast<uint32_t>(p2);
+			const uint32_t i3 = static_cast<uint32_t>(p3);
+			if constexpr (analytic)
+				if (i0 < protect) break;
+
+			// Envelope values in per-frame order. A release that would end inside
+			// these frames stays scalar so the cohort retires on its exact frame.
+			__m128 envelope;
+			switch (cohort.stage)
+			{
+			case CohortStage::Sustain:
+				envelope = _mm_set1_ps(region.sustain);
+				cohort.env = region.sustain;
+				break;
+			case CohortStage::Release:
+			{
+				const float e0 = cohort.env * cohort.release_coefficient;
+				const float e1 = e0 * cohort.release_coefficient;
+				const float e2 = e1 * cohort.release_coefficient;
+				const float e3 = e2 * cohort.release_coefficient;
+				if (!(e0 > 1.0e-5f && e1 > 1.0e-5f && e2 > 1.0e-5f && e3 > 1.0e-5f))
+					return frame;
+				cohort.env = e3;
+				envelope = _mm_setr_ps(e0, e1, e2, e3);
+				break;
+			}
+			case CohortStage::Off:
+				return frame;
+			default:
+			{
+				// Attack, hold, and decay can only advance towards sustain.
+				const float e0 = advance_envelope(owner, cohort);
+				const float e1 = advance_envelope(owner, cohort);
+				const float e2 = advance_envelope(owner, cohort);
+				const float e3 = advance_envelope(owner, cohort);
+				envelope = _mm_setr_ps(e0, e1, e2, e3);
+				break;
+			}
+			}
+
+			const __m128 fraction = _mm_setr_ps(static_cast<float>(p0 - i0),
+				static_cast<float>(p1 - i1), static_cast<float>(p2 - i2),
+				static_cast<float>(p3 - i3));
+			__m128 first_l, second_l, first_r, second_r;
+			if constexpr (Stereo && !Planar)
+			{
+				// One 64-bit load per frame holds L/R at i and i + 1.
+				__m128i first, second;
+				load_adjacent(region.pcm, i0, i1, i2, i3, first, second);
+				const __m128 scale = _mm_set1_ps(1.0f / 32768.0f);
+				first_l = _mm_mul_ps(scale, _mm_cvtepi32_ps(_mm_srai_epi32(_mm_slli_epi32(first, 16), 16)));
+				first_r = _mm_mul_ps(scale, _mm_cvtepi32_ps(_mm_srai_epi32(first, 16)));
+				second_l = _mm_mul_ps(scale, _mm_cvtepi32_ps(_mm_srai_epi32(_mm_slli_epi32(second, 16), 16)));
+				second_r = _mm_mul_ps(scale, _mm_cvtepi32_ps(_mm_srai_epi32(second, 16)));
+			}
+			else
+			{
+				const int16_t* pcm = region.pcm;
+				split_pcm_pairs(_mm_setr_epi32(load_pcm_pair(pcm + i0), load_pcm_pair(pcm + i1),
+					load_pcm_pair(pcm + i2), load_pcm_pair(pcm + i3)), first_l, second_l);
+				if constexpr (Planar)
+				{
+					const int16_t* right = region.pcm_right;
+					split_pcm_pairs(_mm_setr_epi32(load_pcm_pair(right + i0), load_pcm_pair(right + i1),
+						load_pcm_pair(right + i2), load_pcm_pair(right + i3)), first_r, second_r);
+				}
+			}
+			__m128i quadrature_first_l{}, quadrature_second_l{};
+			__m128i quadrature_first_r{}, quadrature_second_r{};
+			if constexpr (analytic)
+			{
+				load_adjacent(quadrature_l, i0, i1, i2, i3, quadrature_first_l, quadrature_second_l);
+				if constexpr (Stereo)
+					load_adjacent(quadrature_r, i0, i1, i2, i3, quadrature_first_r, quadrature_second_r);
+			}
+			const __m128 sample_l = interpolate(
+				source(first_l, _mm_castsi128_ps(quadrature_first_l), false),
+				source(second_l, _mm_castsi128_ps(quadrature_second_l), false), fraction);
+			__m128 sample_r = sample_l;
+			if constexpr (Stereo)
+				sample_r = interpolate(
+					source(first_r, _mm_castsi128_ps(quadrature_first_r), true),
+					source(second_r, _mm_castsi128_ps(quadrature_second_r), true), fraction);
+			const __m128 left = _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(sample_l, envelope), gain_l), amp);
+			const __m128 right = _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(sample_r, envelope), gain_r), amp);
+			float* destination = out + static_cast<size_t>(frame) * 2;
+			_mm_storeu_ps(destination, _mm_add_ps(_mm_loadu_ps(destination),
+				_mm_unpacklo_ps(left, right)));
+			_mm_storeu_ps(destination + 4, _mm_add_ps(_mm_loadu_ps(destination + 4),
+				_mm_unpackhi_ps(left, right)));
+			cohort.pos = p4;
+		}
+		return frame;
+	}
+
+	// One frame per step for filtered cohorts: the recursive filter cannot span
+	// frames, so the four linear bases (original and quadrature, left and right)
+	// share one vector with the scalar StereoFilterState operation order. Only
+	// cohorts without a protected attack qualify (no protected/changed bases).
+	template<bool Analytic, bool Stereo, bool Planar>
+	static uint32_t render_filtered_frames(SynthEngine& owner, RenderCohort& cohort, float* out,
+		uint32_t frames, double increment, bool valid_loop, float amplitude) noexcept
+	{
+		auto& filter = cohort.filter;
+		if (!filter.active())
+			return 0;
+		const auto& region = *cohort.region;
+		auto& phase = cohort.phase;
+		const double end = valid_loop ? region.loop_end : region.pcm_len;
+		const __m128 scale = _mm_set1_ps(1.0f / 32768.0f);
+		const __m128 gain = _mm_setr_ps(cohort.gain_l, cohort.gain_r, 0.0f, 0.0f);
+		const __m128 amp = _mm_set1_ps(amplitude);
+		const __m128d count = _mm_set1_pd(static_cast<double>(phase.coherent_count));
+		[[maybe_unused]] const __m128d cosine = _mm_setr_pd(phase.cosine_left, phase.cosine_right);
+		[[maybe_unused]] const __m128d sine = _mm_setr_pd(phase.sine_left, phase.sine_right);
+		// Lanes: original left, original right, quadrature left, quadrature right.
+		__m128 z1 = _mm_setr_ps(phase.original_filter.z1[0], phase.original_filter.z1[1],
+			phase.quadrature_filter.z1[0], phase.quadrature_filter.z1[1]);
+		__m128 z2 = _mm_setr_ps(phase.original_filter.z2[0], phase.original_filter.z2[1],
+			phase.quadrature_filter.z2[0], phase.quadrature_filter.z2[1]);
+		__m128 b0, b1, a1, a2, mix;
+		auto load_coefficients = [&] {
+			b0 = _mm_set1_ps(filter.current.b0);
+			b1 = _mm_set1_ps(filter.current.b1);
+			a1 = _mm_set1_ps(filter.current.a1);
+			a2 = _mm_set1_ps(filter.current.a2);
+			mix = _mm_set1_ps(filter.mix);
+		};
+		load_coefficients();
+
+		uint32_t frame = 0;
+		for (; frame < frames; ++frame)
+		{
+			const double position = cohort.pos;
+			const double next = position + increment;
+			if (!(position >= 0.0 && position < end - 1.0 && next < end))
+				break;
+			if (cohort.stage == CohortStage::Off || (cohort.stage == CohortStage::Release &&
+				!(cohort.env * cohort.release_coefficient > 1.0e-5f)))
+				break;
+			const float envelope = advance_envelope(owner, cohort);
+			const uint32_t index = static_cast<uint32_t>(position);
+			const float fraction = static_cast<float>(position - index);
+
+			// Sixteen-bit [L(i) R(i) L(i + 1) R(i + 1)]; mono repeats its channel.
+			__m128i pcm16;
+			if constexpr (Stereo && !Planar)
+				pcm16 = load_low_64(region.pcm + size_t{index} * 2);
+			else if constexpr (Planar)
+				pcm16 = _mm_unpacklo_epi16(_mm_cvtsi32_si128(load_pcm_pair(region.pcm + index)),
+					_mm_cvtsi32_si128(load_pcm_pair(region.pcm_right + index)));
+			else
+			{
+				const __m128i pair = _mm_cvtsi32_si128(load_pcm_pair(region.pcm + index));
+				pcm16 = _mm_unpacklo_epi16(pair, pair);
+			}
+			const __m128 pcm = _mm_mul_ps(scale,
+				_mm_cvtepi32_ps(_mm_srai_epi32(_mm_unpacklo_epi16(pcm16, pcm16), 16)));
+			__m128 quadrature = _mm_setzero_ps();
+			if constexpr (Analytic)
+			{
+				const __m128 left = _mm_castsi128_ps(load_low_64(phase.quadrature_left + index));
+				const __m128 right = Stereo
+					? _mm_castsi128_ps(load_low_64(phase.quadrature_right + index)) : left;
+				quadrature = _mm_unpacklo_ps(left, right);
+			}
+			const __m128 first = _mm_movelh_ps(pcm, quadrature);
+			const __m128 second = _mm_movehl_ps(quadrature, pcm);
+			const __m128 input = _mm_mul_ps(_mm_add_ps(first, _mm_mul_ps(_mm_sub_ps(second, first),
+				_mm_set1_ps(fraction))), _mm_set1_ps(envelope));
+			const __m128 wet = _mm_add_ps(_mm_mul_ps(b0, input), z1);
+			z1 = _mm_add_ps(_mm_sub_ps(_mm_mul_ps(b1, input), _mm_mul_ps(a1, wet)), z2);
+			z2 = _mm_sub_ps(_mm_mul_ps(b0, input), _mm_mul_ps(a2, wet));
+			const __m128 filtered = _mm_add_ps(input, _mm_mul_ps(_mm_sub_ps(wet, input), mix));
+
+			const __m128d original = _mm_cvtps_pd(filtered);
+			__m128d result = _mm_mul_pd(original, count);
+			if constexpr (Analytic)
+				result = _mm_add_pd(result, _mm_sub_pd(_mm_mul_pd(original, cosine),
+					_mm_mul_pd(_mm_cvtps_pd(_mm_movehl_ps(filtered, filtered)), sine)));
+			const __m128 mixed = _mm_mul_ps(_mm_mul_ps(_mm_cvtpd_ps(result), gain), amp);
+			float* destination = out + static_cast<size_t>(frame) * 2;
+			_mm_storel_epi64(reinterpret_cast<__m128i*>(destination), _mm_castps_si128(
+				_mm_add_ps(_mm_castsi128_ps(load_low_64(destination)), mixed)));
+			cohort.pos = next;
+			if (filter.remaining != 0)
+			{
+				filter.advance();
+				// A finished bypass ramp continues on the unfiltered path.
+				if (!filter.active())
+				{
+					++frame;
+					break;
+				}
+				load_coefficients();
+			}
+		}
+
+		alignas(16) float history1[4];
+		alignas(16) float history2[4];
+		_mm_store_ps(history1, z1);
+		_mm_store_ps(history2, z2);
+		phase.original_filter.z1 = {history1[0], history1[1]};
+		phase.original_filter.z2 = {history2[0], history2[1]};
+		if constexpr (Analytic)
+		{
+			phase.quadrature_filter.z1 = {history1[2], history1[3]};
+			phase.quadrature_filter.z2 = {history2[2], history2[3]};
+		}
+		return frame;
+	}
+
+	template<VectorSource Source>
+	static VectorKernel layout_kernel(const SampleRegion& region) noexcept
+	{
+		if (region.channels != 2)
+			return &render_vector_frames<Source, false, false>;
+		if (region.pcm_right)
+			return &render_vector_frames<Source, true, true>;
+		return &render_vector_frames<Source, true, false>;
+	}
+
+	template<bool Analytic>
+	static VectorKernel filtered_kernel(const SampleRegion& region) noexcept
+	{
+		if (region.channels != 2)
+			return &render_filtered_frames<Analytic, false, false>;
+		if (region.pcm_right)
+			return &render_filtered_frames<Analytic, true, true>;
+		return &render_filtered_frames<Analytic, true, false>;
+	}
+
+	// start receives the first position at which the kernel can run (the end of
+	// a protected attack). Null means this cohort always uses the general kernel.
+	static VectorKernel select_vector_kernel(const RenderCohort& cohort, double& start) noexcept
+	{
+		const auto& region = *cohort.region;
+		if (!cohort.loop_dir_fwd || region.loop_mode == LoopMode::PingPong)
+			return nullptr;
+		const auto& phase = cohort.phase;
+		if (cohort.filter.active())
+		{
+			if (phase.transformed_count == 0)
+				return filtered_kernel<false>(region);
+			if (phase.attack_window() || !phase.quadrature_left || !phase.quadrature_right)
+				return nullptr;
+			return filtered_kernel<true>(region);
+		}
+		if (cohort.filter.remaining != 0)
+			return nullptr;
+		if (phase.transformed_count == 0)
+			return phase.coherent_count == 1 ? layout_kernel<VectorSource::Coherent>(region)
+				: layout_kernel<VectorSource::CoherentSum>(region);
+		if (phase.multiplicity == 1 && phase.singleton_valid)
+		{
+			const auto& single = phase.singleton;
+			if (single.kind != PhaseVoiceState::Kind::Analytic ||
+				!single.quadrature_left || !single.quadrature_right)
+				return nullptr;
+			start = single.protected_frames();
+			return layout_kernel<VectorSource::AnalyticSingle>(region);
+		}
+		if (!phase.quadrature_left || !phase.quadrature_right)
+			return nullptr;
+		start = phase.protected_frames();
+		return layout_kernel<VectorSource::AnalyticSum>(region);
+	}
+#endif
+
 	void render_range(SynthEngine& owner, float* out, uint32_t frames,
 		uint32_t begin, uint32_t end, std::vector<uint32_t>* retired) noexcept
 	{
@@ -1472,30 +1757,22 @@ struct CohortEngineState
 				region.loop_end <= region.pcm_len && region.loop_end - region.loop_start >= 2;
 			const bool coherent_phase = cohort.phase.transformed_count == 0;
 			const double coherent_count = static_cast<double>(cohort.phase.coherent_count);
-			// Grouped cohorts retain their double multiplicity arithmetic. Phase,
-			// changing envelopes, filters and ping-pong playback use the general kernel.
+			// Ping-pong playback, protected attacks, and loop/sample boundaries
+			// use the general kernel.
 #if defined(_M_X64) || defined(__SSE2__)
-			const bool vector_sustain = Vectorize && coherent_phase && coherent_count == 1.0 &&
-				!cohort.filter.active() && cohort.filter.remaining == 0 &&
-				cohort.loop_dir_fwd && region.loop_mode != LoopMode::PingPong;
+			VectorKernel vector_kernel = nullptr;
+			double vector_start = 0.0;
+			if constexpr (Vectorize)
+				vector_kernel = select_vector_kernel(cohort, vector_start);
 #endif
 			for (uint32_t frame = 0; frame < frames && slot.occupied; ++frame)
 			{
 #if defined(_M_X64) || defined(__SSE2__)
-				if (vector_sustain && cohort.stage == CohortStage::Sustain && frames - frame >= 4)
+				if (vector_kernel && frames - frame >= 4 && cohort.pos >= vector_start)
 				{
 					const float channel_amplitude = channel.volume * channel.expression * owner.master_volume_;
-					float* destination = out + static_cast<size_t>(frame) * 2;
-					const uint32_t count = frames - frame;
-					if (region.channels != 2)
-						frame += render_coherent_sustain<false>(cohort, destination,
-							count, increment, valid_loop, channel_amplitude);
-					else if (region.pcm_right)
-						frame += render_coherent_sustain<true, true>(cohort, destination,
-							count, increment, valid_loop, channel_amplitude);
-					else
-						frame += render_coherent_sustain<true>(cohort, destination,
-							count, increment, valid_loop, channel_amplitude);
+					frame += vector_kernel(owner, cohort, out + static_cast<size_t>(frame) * 2,
+						frames - frame, increment, valid_loop, channel_amplitude);
 					if (frame == frames) break;
 				}
 #endif

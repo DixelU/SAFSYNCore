@@ -101,11 +101,8 @@ Script make_repeated_script(uint32_t sample_rate, double repeat_hz, uint32_t cou
 
 safsyn::PhaseMode parse_phase_mode(const std::string& value)
 {
-	if (value == "coherent") return safsyn::PhaseMode::Coherent;
-	if (value == "polarity") return safsyn::PhaseMode::RandomPolarity;
+	if (value == "coherent" || value == "direct") return safsyn::PhaseMode::Coherent;
 	if (value == "analytic") return safsyn::PhaseMode::Analytic;
-	if (value == "smooth-field") return safsyn::PhaseMode::SmoothField;
-	if (value == "independent-bins") return safsyn::PhaseMode::IndependentBins;
 	throw std::invalid_argument("unknown phase mode");
 }
 
@@ -114,10 +111,7 @@ const char* phase_mode_name(safsyn::PhaseMode mode)
 	switch (mode)
 	{
 	case safsyn::PhaseMode::Coherent: return "coherent";
-	case safsyn::PhaseMode::RandomPolarity: return "polarity";
 	case safsyn::PhaseMode::Analytic: return "analytic";
-	case safsyn::PhaseMode::SmoothField: return "smooth-field";
-	case safsyn::PhaseMode::IndependentBins: return "independent-bins";
 	}
 	return "unknown";
 }
@@ -363,8 +357,6 @@ int run_smf(int argc, char** argv)
 			else if (option == "--phase-continuous") phase_settings.continuous = true;
 			else if (option == "--phase-seed" && index + 1 < argc)
 				phase_settings.seed = std::stoull(argv[++index]);
-			else if (option == "--phase-correlation-hz" && index + 1 < argc)
-				phase_settings.correlation_hz = std::stof(argv[++index]);
 			else if (option == "--phase-preserve-attack-ms" && index + 1 < argc)
 				phase_settings.preserve_attack_ms = std::stof(argv[++index]);
 			else
@@ -381,7 +373,7 @@ int run_smf(int argc, char** argv)
 			bank > 16383 || program > 127 || block_frames == 0 || block_frames > 1'048'576U ||
 			phase_settings.strength < 0.0f || phase_settings.strength > 1.0f ||
 			phase_settings.pool_size == 0 || phase_settings.pool_size > 64 ||
-			phase_settings.correlation_hz <= 0.0f || phase_settings.preserve_attack_ms < 0.0f ||
+			phase_settings.preserve_attack_ms < 0.0f ||
 			!seconds_to_frames(tail_seconds, sample_rate, tail_frames) ||
 			!seconds_to_frames(maximum_tail_seconds, sample_rate, maximum_tail_frames) ||
 			!seconds_to_frames(controller_trace_seconds, sample_rate, controller_trace_frames) ||
@@ -592,9 +584,9 @@ void print_usage()
 		"  safsyn-render --demo output.wav [--sample-rate N] [--voices N]\n"
 		"  safsyn-render bank.sfz|bank.sf2 output.wav [--bank N] [--program N]\n"
 		"      [--sample-rate N] [--voices N] [--all-regions]\n"
-		"  Phase: --phase-mode coherent|polarity|analytic|smooth-field|independent-bins\n"
+		"  Phase: --phase-mode coherent|direct|analytic\n"
 		"      [--phase-strength 0..1] [--phase-pool 1..64] [--phase-continuous]\n"
-		"      [--phase-seed N] [--phase-correlation-hz N]\n"
+		"      [--phase-seed N]\n"
 		"      [--phase-preserve-attack-ms N]\n"
 		"  SMF: [--tail-seconds N] [--max-render-seconds N] [--analyze|--dry-run]\n"
 		"      [--block-size N] [--cohorts|--individual-voices] [--max-cohorts N]\n"
@@ -663,8 +655,6 @@ int main(int argc, char** argv)
 			phase_settings.continuous = true;
 		else if (option == "--phase-seed" && index + 1 < argc)
 			phase_settings.seed = std::stoull(argv[++index]);
-		else if (option == "--phase-correlation-hz" && index + 1 < argc)
-			phase_settings.correlation_hz = std::stof(argv[++index]);
 		else if (option == "--phase-preserve-attack-ms" && index + 1 < argc)
 			phase_settings.preserve_attack_ms = std::stof(argv[++index]);
 		else
@@ -678,7 +668,7 @@ int main(int argc, char** argv)
 		repeat_hz <= 0.0 || repeat_hz > 2000.0 || repeat_count == 0 ||
 		phase_settings.strength < 0.0f || phase_settings.strength > 1.0f ||
 		phase_settings.pool_size == 0 || phase_settings.pool_size > 64 ||
-		phase_settings.correlation_hz <= 0.0f || phase_settings.preserve_attack_ms < 0.0f)
+		phase_settings.preserve_attack_ms < 0.0f)
 	{
 		std::cerr << "Invalid renderer option value.\n";
 		return 2;

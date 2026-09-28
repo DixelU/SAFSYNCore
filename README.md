@@ -2,7 +2,7 @@
 
 SAFSYNCore includes a standalone Windows MIDI synthesizer and a deterministic
 streaming Standard MIDI File renderer with a
-bit-exact coherent baseline, opt-in experimental phase-decorrelation modes, and
+bit-exact coherent baseline, an opt-in analytic phase-decorrelation mode, and
 an optional post-mix mastering stage. Raw unclipped float output remains the
 offline default so DSP experiments retain a reproducible baseline.
 
@@ -82,8 +82,8 @@ click **Play MIDI file**; this uses the exact scheduler directly, without
 routing millions of events through WinMM. Drag-and-drop accepts banks and MIDI.
 The **Black MIDI preset** selects 512 cohorts, four render threads, and ten
 seconds of buffering for dense files. The **Phase mode** selector defaults to
-coherent (off), with polarity, analytic, and FFT modes available. Stop to change
-mode. Phase samples and finite variant pools are precomputed before playback,
+direct sampling (coherent), with analytic rotation available. Stop to change
+mode. Analytic sample quadratures are precomputed in parallel before playback,
 with progress, cancellation, and an adjustable cache limit; large banks can take
 time and memory to prepare. Cohort storage and worker buffers are reserved at
 startup, while cohort membership follows MIDI events.
@@ -145,9 +145,10 @@ reference path, while `--max-cohorts N` gives cohorts an explicit deterministic
 safety ceiling; zero means dynamic offline growth. `--drain-tail` renders until
 all represented logical voices finish or `--max-tail-seconds` is reached.
 `--render-threads N` enables the fast cohort mixer; the default of one retains
-the accumulation order used by the reference hashes. Coherent sustained
-single-voice cohorts use an exact SSE2 frame kernel where available. See
-`docs/MIXER_PERFORMANCE.md` for worker-handoff changes, measurements, and limits.
+the accumulation order used by the reference hashes. Coherent and analytic
+cohorts, single or grouped and in every envelope stage, use exact SSE2 kernels
+where available; filtered cohorts vectorize their filter bases per frame. See
+`docs/MIXER_PERFORMANCE.md` for kernel coverage, measurements, and limits.
 
 Run an opt-in phase experiment with the same scripted events:
 
@@ -156,12 +157,12 @@ build/Release/safsyn-render piano.sf2 analytic.wav --bank 0 --program 0 --phase-
 build/Release/safsyn-render --demo repeated.wav --script repeated --repeat-hz 40 --repeat-count 128 --phase-mode analytic --phase-continuous
 ```
 
-Available modes are `coherent`, `polarity`, `analytic`, `smooth-field`, and
-`independent-bins`. Phase controls are `--phase-strength 0..1`,
-`--phase-pool 1..64`, `--phase-continuous`, `--phase-seed N`,
-`--phase-correlation-hz N`, and `--phase-preserve-attack-ms N`. Coherent is the
-default, strength zero takes the exact coherent path, and no experimental mode
-has been selected as a production default.
+Available modes are `coherent` (alias `direct`) and `analytic`. Phase controls
+are `--phase-strength 0..1`, `--phase-pool 1..64`, `--phase-continuous`,
+`--phase-seed N`, and `--phase-preserve-attack-ms N`. Coherent is the default,
+strength zero takes the exact coherent path, and analytic has not been selected
+as a production default. The random-polarity and FFT phase-field modes were
+retired; see `docs/PHASE_EXPERIMENT.md`.
 
 SMF analysis also reports identical-note group histograms, group locations,
 logical-note/cohort peak estimates, and onset compression. These are MIDI-only
