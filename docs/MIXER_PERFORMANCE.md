@@ -258,7 +258,9 @@ is audio duration over dispatch plus mixing time.
 `--live` runs the real `BufferedSynth` with a wall-clock sender and a 10 ms
 audio consumer. Hypernova from 95 to 125 s (104M events, 4,096-frame ring,
 automatic threads) had 7.54 s of underrun silence in 1,134 gaps before and
-0.55 s in 110 gaps after.
+0.55 s in 110 gaps after. With `--shed` (`PlaybackOptions::shed_notes`, see
+LIVE_SYNTH.md) the same passage plays without an underrun and drops 3.2 million
+note-ons.
 
 ### Validation
 

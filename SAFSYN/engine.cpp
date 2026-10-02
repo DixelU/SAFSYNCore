@@ -816,6 +816,7 @@ void SynthEngine::consume_short_message(uint32_t message) noexcept
 	const uint8_t data1 = static_cast<uint8_t>((message >> 8) & 0x7f);
 	const uint8_t data2 = static_cast<uint8_t>((message >> 16) & 0x7f);
 	const uint8_t channel = status & 0x0f;
+
 	switch (status & 0xf0)
 	{
 	case 0x80:
@@ -839,11 +840,14 @@ void SynthEngine::consume_short_message(uint32_t message) noexcept
 	}
 }
 
-void SynthEngine::consume_short_messages(const uint32_t* messages, size_t count,
+void SynthEngine::consume_short_messages(
+	const uint32_t* messages,
+	size_t count,
 	std::optional<uint64_t> tick) noexcept
 {
 	if (!messages || count == 0)
 		return;
+
 	midi_tick_ = tick;
 	for (size_t index = 0; index < count;)
 	{
@@ -861,6 +865,7 @@ void SynthEngine::consume_short_messages(const uint32_t* messages, size_t count,
 			++index;
 			continue;
 		}
+
 		size_t end = index + 1;
 		while (end < count)
 		{

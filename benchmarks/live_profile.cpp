@@ -8,7 +8,7 @@
 // --live runs the real BufferedSynth instead: a sender submits the events at
 // their wall-clock times, as a file player does, and a consumer reads audio at
 // the device rate. It reports what a listener would get: underruns and how far
-// the sender is pushed behind.
+// the sender is pushed behind. --shed turns on overload note shedding.
 
 #include "core.h"
 #include "playback.h"
@@ -72,6 +72,7 @@ struct Options
 	double duration_seconds = 30.0;
 	bool timeline = false;
 	bool live = false;
+	bool shed = false;
 };
 
 uint32_t short_message(const safsyn::SmfEvent& event)
@@ -89,7 +90,7 @@ int usage()
 	std::cerr << "usage: safsyn-live-profile <bank.sf2|.sfz> <file.mid> [--threads 1,4,16]\n"
 		"       [--cohorts 4096] [--analytic] [--rate 48000] [--block 256]\n"
 		"       [--start seconds] [--duration seconds] [--timeline]\n"
-		"       [--live [--buffer 4096]]   (--threads 0 selects the automatic count)\n";
+		"       [--live [--buffer 4096] [--shed]]   (--threads 0 selects the automatic count)\n";
 	return 2;
 }
 
@@ -247,7 +248,7 @@ int play_live(const Options& options, std::shared_ptr<const safsyn::Soundfont> b
 	const uint64_t last_frame = first_frame +
 		static_cast<uint64_t>(options.duration_seconds * options.sample_rate);
 	std::cout << "threads,audio_s,underruns,underrun_ms,sender_late_ms,sender_blocked_ms,"
-		"overloaded_share,peak_render_load,events,peak_cohorts\n";
+		"overloaded_share,peak_render_load,events,shed_notes,peak_cohorts\n";
 	for (const size_t threads : options.threads)
 	{
 		safsyn::PlaybackOptions playback;
@@ -256,6 +257,7 @@ int play_live(const Options& options, std::shared_ptr<const safsyn::Soundfont> b
 		playback.buffer_frames = options.buffer_frames;
 		playback.maximum_cohorts = options.maximum_cohorts;
 		playback.render_threads = threads;
+		playback.shed_notes = options.shed;
 		if (options.analytic)
 			playback.phase.mode = safsyn::PhaseMode::Analytic;
 		safsyn::BufferedSynth synth(bank, playback);
@@ -348,7 +350,8 @@ int play_live(const Options& options, std::shared_ptr<const safsyn::Soundfont> b
 				1000.0 / options.sample_rate
 			<< ',' << latest * 1000.0 << ',' << blocked * 1000.0
 			<< ',' << (load_samples ? static_cast<double>(overloaded) / load_samples : 0.0)
-			<< ',' << peak_load << ',' << events << ',' << peak_cohorts << std::endl;
+			<< ',' << peak_load << ',' << events
+			<< ',' << after.shed_notes - before.shed_notes << ',' << peak_cohorts << std::endl;
 	}
 	return 0;
 }
@@ -380,6 +383,7 @@ int main(int argc, char** argv)
 		else if (name == "--duration") options.duration_seconds = std::stod(value());
 		else if (name == "--timeline") options.timeline = true;
 		else if (name == "--live") options.live = true;
+		else if (name == "--shed") options.shed = true;
 		else return usage();
 	}
 	if (options.threads.empty() || !options.block_frames) return usage();

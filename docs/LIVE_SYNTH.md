@@ -165,6 +165,16 @@ file mode for reliable black MIDI scheduling.
   with wall time; repeated starvation therefore makes playback late. Raising
   buffering only absorbs temporary bursts. Sustained overload needs a lower
   cohort ceiling, different phase mode, or a lower synthesis workload.
+- `PlaybackOptions::shed_notes` (off by default, live input only) keeps time
+  instead of keeping every note. The producer reads the audio ring's fill at
+  each block: above half, nothing is dropped, so bursts the ring can absorb
+  stay lossless; from half down to one eighth, a rising velocity threshold
+  drops note-ons, quietest first, with notes near the threshold thinned evenly
+  rather than cut together. Each dropped note-on also swallows the note-off
+  that would have released it, paired newest-first as the engine releases
+  held notes. Controllers, programs, bends, and master volume always pass.
+  `PlaybackStats::shed_notes` counts the dropped note-ons. Direct file mode
+  and the offline renderer never shed.
 - The live MIDI queue holds 262,144 messages by default and accepts multiple
   producers. Overflow is reported, increments a generation, and resets voices
   and controllers on the synth producer. Old-generation messages are discarded

@@ -21,6 +21,10 @@ struct PlaybackOptions
 	size_t maximum_cohorts = 4096; // Required finite live safety ceiling.
 	size_t render_threads = 0; // Auto: every logical CPU but two, at most 64.
 	size_t midi_queue_capacity = 262144;
+	// Live input only. When the producer has used up half of the audio ring,
+	// drop the quietest note-ons (and their note-offs) instead of falling
+	// behind. Off keeps every event and lets sustained overload delay playback.
+	bool shed_notes = false;
 	uint16_t initial_bank = 0;
 	uint8_t initial_program = 0;
 	uint32_t maximum_tail_seconds = 10;
@@ -41,6 +45,7 @@ struct PlaybackStats
 	uint64_t underrun_frames = 0;
 	uint64_t underruns = 0;
 	uint64_t rejected_midi_events = 0;
+	uint64_t shed_notes = 0; // Note-ons dropped by overload shedding.
 	uint64_t midi_recoveries = 0;
 	uint64_t safety_clamped_samples = 0;
 	size_t active_voices = 0;

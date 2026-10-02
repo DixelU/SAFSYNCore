@@ -111,6 +111,88 @@ public:
 	}
 };
 
+// Overload shedding for live note events. Under pressure it drops the quietest
+// note-ons and swallows the note-off that would have released each dropped
+// note, so the engine receives a thinner but consistent stream. Controllers,
+// programs and bends always pass. Owned by the single queue consumer.
+class NoteGate
+{
+	// Note-ons still pending on one key, oldest first, starting at the oldest
+	// dropped one: 1 reached the engine, 0 was dropped. The engine releases its
+	// newest held note first, so note-offs pair with these newest-first.
+	struct Key
+	{
+		std::vector<uint8_t> admitted;
+		uint32_t dropped = 0;
+	};
+	std::vector<Key> keys_ = std::vector<Key>(16 * 128);
+	float pressure_ = 0.0f;
+	float dither_ = 0.0f;
+	uint64_t shed_ = 0;
+public:
+	// Velocity range over which notes thin out gradually around the threshold.
+	static constexpr float velocity_spread = 32.0f;
+
+	// Zero admits every note and one admits none.
+	void set_pressure(float pressure) noexcept
+	{
+		pressure_ = std::clamp(pressure, 0.0f, 1.0f);
+	}
+	uint64_t shed_notes() const noexcept { return shed_; }
+	void clear() noexcept
+	{
+		for (auto& key : keys_) { key.admitted.clear(); key.dropped = 0; }
+	}
+	// False means the message must not reach the engine.
+	bool admit(uint32_t message)
+	{
+		const uint32_t command = message & 0xf0, channel = message & 0x0f;
+		const uint32_t data1 = (message >> 8) & 0x7f, data2 = (message >> 16) & 0x7f;
+		if (command == 0x90 && data2 != 0)
+		{
+			auto& key = keys_[channel * 128 + data1];
+			bool keep = true;
+			if (pressure_ > 0.0f)
+			{
+				// Louder notes pass first. The golden-ratio sequence spreads the
+				// survivors of one velocity evenly instead of cutting them at once.
+				dither_ += 0.61803398875f;
+				if (dither_ >= 1.0f) dither_ -= 1.0f;
+				keep = static_cast<float>(data2) + velocity_spread * dither_ >
+					pressure_ * (127.0f + velocity_spread);
+			}
+			if (keep)
+			{
+				if (key.dropped != 0) key.admitted.push_back(1);
+				return true;
+			}
+			key.admitted.push_back(0);
+			++key.dropped;
+			++shed_;
+			return false;
+		}
+		if (command == 0x80 || command == 0x90)
+		{
+			auto& key = keys_[channel * 128 + data1];
+			if (key.dropped == 0) return true;
+			const bool reached_engine = key.admitted.back() != 0;
+			key.admitted.pop_back();
+			if (reached_engine) return true;
+			--key.dropped;
+			return false;
+		}
+		// The engine forgets its held notes here, so later note-offs are its own.
+		if (command == 0xb0 && (data1 == 120 || data1 >= 123))
+			for (size_t note = 0; note < 128; ++note)
+			{
+				auto& key = keys_[channel * 128 + note];
+				key.admitted.clear();
+				key.dropped = 0;
+			}
+		return true;
+	}
+};
+
 } // namespace safsyn::detail
 
 #ifdef _MSC_VER

@@ -253,6 +253,106 @@ void live_recovery_test()
 	synth.stop(); check(synth.finished(), "stop did not join producer");
 	check(!synth.enqueue_short_message(0x00643c90), "stopped synth accepts events");
 }
+void note_gate_test()
+{
+	constexpr uint32_t on = 0x00643c90, quiet = 0x00283c90, loud = 0x007f3c90, off = 0x00003c80;
+	safsyn::detail::NoteGate gate;
+	for (uint32_t message : {on, off, quiet, 0x00003c90u, 0x004001b0u, 0x000005c0u, 0x007f7fe0u})
+		check(gate.admit(message), "an idle gate must pass every message");
+	check(gate.shed_notes() == 0, "an idle gate counted a dropped note");
+
+	gate.set_pressure(1);
+	check(!gate.admit(loud) && !gate.admit(off), "full pressure kept a note or its note-off");
+	check(gate.admit(0x004001b0) && gate.admit(0x000005c0) && gate.admit(0x007f7fe0),
+		"shedding dropped a controller, program or bend");
+	check(gate.shed_notes() == 1, "dropped note count");
+
+	// Note-offs pair newest-first, as the engine releases its held notes.
+	check(!gate.admit(on), "dropped A");
+	gate.set_pressure(0);
+	check(gate.admit(on) && gate.admit(off), "B and its note-off must both reach the engine");
+	check(!gate.admit(off) && gate.admit(off), "A's note-off must be swallowed exactly once");
+	check(gate.admit(on), "held C");
+	gate.set_pressure(1);
+	check(!gate.admit(on) && !gate.admit(0x00003c90), "D and its velocity-zero note-off stay out");
+	check(gate.admit(off), "C's note-off must still reach the engine");
+
+	// All-notes-off makes the engine forget held notes, so the gate forgets too.
+	check(!gate.admit(on) && gate.admit(0x00007bb0) && gate.admit(off), "CC123 did not clear the key");
+	check(!gate.admit(0x00643c91) && gate.admit(0x00007bb0) && !gate.admit(0x00003c81),
+		"CC123 on one channel cleared another");
+	check(!gate.admit(0x00643c91), "dropped note before a reset");
+	gate.clear();
+	check(gate.admit(0x00003c81), "clear() left a pending dropped note");
+
+	// Partial pressure keeps loud notes, drops quiet ones, and thins the middle evenly.
+	gate.set_pressure(0.5f);
+	size_t kept = 0, longest_gap = 0, gap = 0;
+	for (size_t i = 0; i < 1000; ++i)
+	{
+		check(gate.admit(loud) && gate.admit(off), "partial pressure dropped the loudest notes");
+		check(!gate.admit(quiet) && !gate.admit(off), "partial pressure kept the quietest notes");
+		const bool middle = gate.admit(0x00403c90);
+		check(gate.admit(off) == middle, "a thinned note and its note-off disagree");
+		kept += middle; gap = middle ? 0 : gap + 1; longest_gap = (std::max)(longest_gap, gap);
+	}
+	check(kept > 400 && kept < 600 && longest_gap <= 4, "equal velocities were not thinned evenly");
+
+	// Whatever is shed, the engine sees as many note-offs as note-ons per key.
+	uint32_t state = 12345;
+	std::array<int, 4> held{}, sent{};
+	for (size_t i = 0; i < 20000; ++i)
+	{
+		state = state * 1664525u + 1013904223u;
+		const uint32_t key = (state >> 8) % 4;
+		if (i % 97 == 0) gate.set_pressure(static_cast<float>((state >> 16) % 5) * 0.25f);
+		const bool start = held[key] == 0 || ((state >> 20) & 1);
+		const uint32_t velocity = 1 + (state >> 24) % 127;
+		const bool passed = gate.admit((start ? 0x90u | (velocity << 16) : 0x80u) | ((60 + key) << 8));
+		held[key] += start ? 1 : -1;
+		if (passed) sent[key] += start ? 1 : -1;
+		check(sent[key] >= 0, "a note-off reached the engine without its note-on");
+	}
+	gate.set_pressure(0);
+	for (uint32_t key = 0; key < 4; ++key)
+	{
+		for (; held[key] > 0; --held[key])
+			if (gate.admit(0x80u | ((60 + key) << 8))) --sent[key];
+		check(sent[key] == 0, "shedding left a note without its note-off");
+	}
+}
+void shedding_test()
+{
+	// The undrained ring keeps the producer blocked while notes queue up; reading
+	// the whole ring then starts its next block with nothing buffered.
+	for (const bool shed : {false, true})
+	{
+		auto config = options(); config.shed_notes = shed;
+		safsyn::BufferedSynth synth(bank(), config);
+		synth.start(); await([&] { return synth.ready() && synth.stats().buffered_frames == 256; });
+		for (uint32_t note = 40; note < 48; ++note)
+			check(synth.enqueue_short_message(0x00640090 | (note << 8)), "burst note rejected");
+		std::array<float, 512> audio{};
+		synth.read_audio(audio.data(), 256);
+		await([&] { return synth.stats().scheduled_events == 8; });
+		auto stats = synth.stats();
+		check(stats.shed_notes == (shed ? 8u : 0u) && stats.active_voices == (shed ? 0u : 8u),
+			"an empty ring must shed the queued burst only when shedding is enabled");
+		if (!shed) { synth.stop(); continue; }
+		// One block of room leaves the ring three quarters full, so the gate is
+		// idle: the burst's note-offs are swallowed and a new note plays.
+		await([&] { return synth.stats().buffered_frames == 256; });
+		for (uint32_t note = 40; note < 48; ++note)
+			check(synth.enqueue_short_message(0x00000080 | (note << 8)), "burst note-off rejected");
+		check(synth.enqueue_short_message(0x00643c90), "later note rejected");
+		synth.read_audio(audio.data(), 64);
+		await([&] { return synth.stats().scheduled_events == 17; });
+		stats = synth.stats();
+		check(stats.shed_notes == 8 && stats.active_voices == 1,
+			"a recovered producer must play new notes and keep the burst silent");
+		synth.stop();
+	}
+}
 void file_sender_backpressure_test()
 {
 	using Result = safsyn::MidiEnqueueResult;
@@ -372,6 +472,7 @@ int main()
 	{
 		queue_test(); ring_test(); file_timing_test(); parallel_test(); live_recovery_test(); lifecycle_and_limiter_test();
 		file_sender_backpressure_test(); phase_preparation_test();
+		note_gate_test(); shedding_test();
 		analytic_tick_queue_test();
 		std::cout << "Playback: concurrent queues, sample timing, dense bursts, workers, overflow, underruns, limiter, lifecycle passed\n";
 		return 0;

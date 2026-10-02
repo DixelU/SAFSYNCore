@@ -14,6 +14,10 @@ namespace safsyn
 {
 namespace
 {
+// Audio ring fill at which note shedding starts and at which it is total.
+constexpr double shed_start_fill = 0.5;
+constexpr double shed_full_fill = 0.125;
+
 PlaybackOptions validated(PlaybackOptions options)
 {
 	if (options.sample_rate < 8000 || options.sample_rate > 192000 ||
@@ -142,6 +146,7 @@ struct BufferedSynth::Impl
 			std::vector<float> block(options.block_frames * 2), output;
 			output.reserve(options.block_frames * 2 + static_cast<size_t>(options.sample_rate / 10) * 2);
 			std::array<uint32_t, 4096> batch{};
+			detail::NoteGate gate;
 			std::optional<uint64_t> batch_tick;
 			auto dispatch = [&](size_t& count) {
 				engine.consume_short_messages(batch.data(), count, batch_tick);
@@ -187,7 +192,17 @@ struct BufferedSynth::Impl
 						engine.reset(); defaults(engine);
 						mastering = StereoMasteringProcessor(options.sample_rate, options.mastering);
 						applied_generation = requested;
+						gate.clear();
 						++current.midi_recoveries;
+					}
+					// The upper half of the ring absorbs bursts without loss. Below it
+					// the producer is behind, and shedding rises until the ring is
+					// nearly empty. Initial buffering is not a deficit.
+					if (options.shed_notes && ready.load(std::memory_order_relaxed))
+					{
+						const double fill = static_cast<double>(audio.size()) / audio.capacity();
+						gate.set_pressure(static_cast<float>(
+							(shed_start_fill - fill) / (shed_start_fill - shed_full_fill)));
 					}
 					// Bound dispatch per block so a runaway live producer cannot starve
 					// audio forever. File bursts use the separate exact scheduler below.
@@ -206,12 +221,14 @@ struct BufferedSynth::Impl
 							dispatch(count);
 							engine.set_master_volume(static_cast<uint16_t>(event.message));
 						}
-						else batch[count++] = event.message;
+						else if (!options.shed_notes || gate.admit(event.message))
+							batch[count++] = event.message;
 						if (count == batch.size())
 							dispatch(count);
 						++current.scheduled_events;
 					}
 					dispatch(count);
+					current.shed_notes = gate.shed_notes();
 				}
 				uint32_t frames = 0;
 				while (frames < options.block_frames && !stopping.load())
