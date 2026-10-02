@@ -206,6 +206,39 @@ void test_pool_sizes_generate_distinct_variants()
 	check(previous == 64, "pool size 64 reaches all deterministic angles");
 }
 
+// A pool variant's rotation is computed once per sample and then reused. The
+// reused values must equal a first computation, also while two samples
+// alternate under one region index.
+void test_pool_rotations_are_reused_exactly()
+{
+	auto mono = make_bank(make_signal(128), 12800);
+	auto stereo = make_bank(make_signal(96, 2), 9600, 2);
+	stereo.regions[0].logical_sample_id = 0x5048415346ULL;
+	const auto phase = settings(safsyn::PhaseMode::Analytic, 8, 42);
+	safsyn::PhaseProcessor warm;
+	warm.configure(phase);
+	bool exact = true;
+	for (int pass = 0; pass < 2; ++pass)
+		for (uint64_t onset = 0; onset < 48; ++onset)
+			for (const auto* bank : {&mono, &stereo})
+			{
+				const auto& region = bank->regions[0];
+				const auto channel = static_cast<uint8_t>(onset % 16);
+				const auto note = static_cast<uint8_t>(60 + onset % 3);
+				safsyn::PhaseProcessor fresh;
+				fresh.configure(phase);
+				const auto expected = fresh.assign(region, 0, onset, channel, note);
+				const auto reused = pass == 0 ? warm.assign(region, 0, onset, channel, note) :
+					warm.reconstruct(region, 0, onset, channel, note);
+				exact = exact && reused.kind == safsyn::PhaseVoiceState::Kind::Analytic &&
+					expected.cosine == reused.cosine && expected.sine == reused.sine &&
+					expected.scale_left == reused.scale_left &&
+					expected.scale_right == reused.scale_right;
+			}
+	check(exact && warm.stats().cached_samples == 2 && warm.stats().assignments == 96,
+		"reused pool rotations equal a first computation for every sample");
+}
+
 void test_continuous_analytic_is_not_pool_quantized()
 {
 	auto bank = make_bank(make_signal(96), 9600);
@@ -675,6 +708,7 @@ int main()
 	test_determinism_and_block_invariance();
 	test_pool_one_is_mutually_coherent();
 	test_pool_sizes_generate_distinct_variants();
+	test_pool_rotations_are_reused_exactly();
 	test_continuous_analytic_is_not_pool_quantized();
 	test_analytic_rotation_preserves_periodic_tone();
 	test_attack_preservation();

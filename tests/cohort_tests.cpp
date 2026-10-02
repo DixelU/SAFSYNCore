@@ -520,7 +520,9 @@ void test_safety_limit_stealing()
 		"explicit cohort ceiling steals deterministically and accounts logical multiplicity");
 }
 
-void test_prepared_region_index()
+// Three banks of three programs with overlapping key and velocity layers, plus
+// a reversed stress view whose levels differ from the preset view.
+safsyn::Soundfont make_layered_bank()
 {
 	auto bank = make_bank(4000);
 	const auto prototype = bank.regions.front();
@@ -540,6 +542,12 @@ void test_prepared_region_index()
 	bank.stress_regions = bank.regions;
 	std::reverse(bank.stress_regions.begin(), bank.stress_regions.end());
 	for (auto& region : bank.stress_regions) region.attenuation *= 0.3f;
+	return bank;
+}
+
+void test_prepared_region_index()
+{
+	auto bank = make_layered_bank();
 	safsyn::SynthEngine reference(4000, 256), indexed(4000, 256);
 	indexed.set_voice_model(safsyn::VoiceModel::Cohorts, 256);
 	for (auto* engine : {&reference, &indexed}) engine->set_soundfont(&bank);
@@ -568,6 +576,53 @@ void test_prepared_region_index()
 	}
 	check(close_audio(render(reference, 32), render(indexed, 32)),
 		"soundbank replacement rebuilds prepared region pointers");
+}
+
+// The cohort engine remembers the layers of each preset/key/velocity. Without
+// a reset between notes, program changes on several channels, the stress mode
+// and a replaced bank must keep selecting the individual reference's regions.
+void test_region_match_reuse()
+{
+	auto bank = make_layered_bank();
+	safsyn::SynthEngine reference(4000, 256), remembered(4000, 256);
+	remembered.set_voice_model(safsyn::VoiceModel::Cohorts, 256);
+	for (auto* engine : {&reference, &remembered}) engine->set_soundfont(&bank);
+	auto silence = [&](uint8_t channel) {
+		for (auto* engine : {&reference, &remembered}) engine->control_change(channel, 120, 0);
+	};
+	for (int pass = 0; pass < 2; ++pass)
+		for (bool all : {false, true})
+			for (uint16_t selected_bank : {0, 128, 256, 999})
+				for (uint8_t program : {0, 1, 2, 127})
+					for (uint8_t velocity : {10, 70, 127})
+					{
+						const uint8_t channel = static_cast<uint8_t>((program + velocity) % 3);
+						for (auto* engine : {&reference, &remembered})
+						{
+							engine->set_all_regions_mode(all);
+							engine->control_change(channel, 0, static_cast<uint8_t>(selected_bank >> 7));
+							engine->control_change(channel, 32, static_cast<uint8_t>(selected_bank & 127));
+							engine->program_change(channel, program);
+							for (uint8_t note : {20, 41, 60, 70, 100}) engine->note_on(channel, note, velocity);
+						}
+						check(reference.stats().started_voices == remembered.stats().started_voices &&
+							close_audio(render(reference, 32), render(remembered, 32)),
+							"remembered preset/key/velocity layers follow program, bank and mode changes");
+						silence(channel);
+					}
+	auto replacement = make_bank(4000, true);
+	for (auto* engine : {&reference, &remembered})
+	{
+		engine->set_all_regions_mode(false);
+		engine->control_change(0, 0, 0);
+		engine->control_change(0, 32, 0);
+		engine->program_change(0, 0);
+		engine->set_soundfont(&replacement);
+		engine->note_on(0, 60, 100);
+	}
+	check(reference.stats().started_voices == remembered.stats().started_voices &&
+		close_audio(render(reference, 32), render(remembered, 32)),
+		"a replaced bank drops the remembered layers");
 }
 
 void test_parallel_cohort_render(bool filtered = false)
@@ -789,6 +844,46 @@ void test_worker_handoff_lifecycle()
 	parallel.set_render_threads(1);
 	repeat.set_render_threads(1);
 }
+
+// More mixer threads than most machines have processors: workers that wake
+// after the chunks have run out are withdrawn, and which thread mixed which
+// chunk must still not reach the audio.
+void test_oversubscribed_handoff()
+{
+	constexpr uint32_t count = 2048;
+	auto bank = make_linked_stereo_bank(4000);
+	safsyn::SynthEngine scalar(4000, count), parallel(4000, count), repeat(4000, count);
+	for (auto* engine : {&scalar, &parallel, &repeat})
+	{
+		engine->set_voice_model(safsyn::VoiceModel::Cohorts, count);
+		engine->set_soundfont(&bank);
+		engine->prepare_playback(300);
+		for (uint32_t i = 0; i < count; ++i)
+		{
+			engine->control_change(0, 1, static_cast<uint8_t>(i & 127));
+			engine->note_on(0, static_cast<uint8_t>(40 + i % 48), 87);
+		}
+	}
+	parallel.set_render_threads(64);
+	repeat.set_render_threads(64);
+	for (uint32_t job = 0; job < 48; ++job)
+	{
+		if (job == 32)
+			for (auto* engine : {&scalar, &parallel, &repeat})
+				engine->control_change(0, 123, 0);
+		const uint32_t frames = job % 3 == 0 ? 300 : 40;
+		const auto expected = render(scalar, frames);
+		const auto actual = render(parallel, frames);
+		check(actual == render(repeat, frames) && close_audio(expected, actual),
+			"oversubscribed workers still publish deterministic audio");
+		check(scalar.active_voice_count() == parallel.active_voice_count() &&
+			parallel.active_voice_count() == repeat.active_voice_count(),
+			"oversubscribed workers retire the same cohorts");
+	}
+	check(parallel.render_threads() == 64 && parallel.stats().parallel_render_calls > 32 &&
+		parallel.active_voice_count() == 0,
+		"oversubscription stress uses the pool and drains its release cohorts");
+}
 }
 
 int main()
@@ -807,7 +902,9 @@ int main()
 	test_coherent_vector_boundaries();
 	test_phase_vector_boundaries();
 	test_worker_handoff_lifecycle();
+	test_oversubscribed_handoff();
 	test_prepared_region_index();
+	test_region_match_reuse();
 	if (failures != 0)
 	{
 		std::cerr << failures << " cohort test(s) failed\n";

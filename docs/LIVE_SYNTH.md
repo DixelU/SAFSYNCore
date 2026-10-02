@@ -105,15 +105,16 @@ Scheduled SMF stream (file mode only) ----------+-> synth producer
                                       WASAPI delivery thread -> Windows output
 ```
 
-One producer owns every mutable synth operation. The existing pool renders
-disjoint cohort ranges into private buffers and reduces them in fixed lane
+One producer owns every mutable synth operation. The pool cuts the cohort slots
+into more chunks than it has threads; every thread pulls the next chunk, mixes
+it into that chunk's private buffer, and the producer adds the buffers in chunk
 order. It does not assign whole MIDI channels to separate workers, which would
-perform poorly on channel-skewed black MIDI. `0` render threads chooses at most
-16 lanes and leaves two logical CPUs free where possible; `1` uses the scalar
-reference. The producer participates in rendering, so N means N total mixer
-lanes, not N additional worker threads. Small jobs retain the existing scalar
-fallback to avoid synchronization overhead. The UI reports the actual count,
-including fallback to one lane if thread creation fails.
+perform poorly on channel-skewed black MIDI. `0` render threads uses every
+logical CPU but two (at most 64); `1` uses the scalar reference. The producer
+participates in rendering, so N means N total mixer threads, not N additional
+workers. Small jobs retain the scalar fallback and short event intervals wake
+only as many workers as they can keep busy. The UI reports the actual count,
+including fallback to one thread if thread creation fails.
 
 The WASAPI event thread is registered with MMCSS's Pro Audio task. All its COM
 interfaces stay on that thread. Shared mode requests stereo float32 and Windows

@@ -418,6 +418,16 @@ struct PhaseProcessor::Impl
 		double quadrature_energy_right = 0.0;
 		double cross_energy_right = 0.0;
 		std::vector<bool> analytic_variants_seen;
+		// A pool variant's angle and scales depend only on this sample, so they
+		// are computed on first use and valid wherever the variant has been seen.
+		struct Rotation
+		{
+			float cosine = 1.0f;
+			float sine = 0.0f;
+			float scale_left = 1.0f;
+			float scale_right = 1.0f;
+		};
+		std::vector<Rotation> rotations;
 
 		bool prepared() const noexcept { return !quadrature_left.empty(); }
 	};
@@ -425,9 +435,13 @@ struct PhaseProcessor::Impl
 	PhaseSettings settings;
 	PhaseCacheStats statistics;
 	std::unordered_map<SampleKey, std::unique_ptr<Entry>, SampleKeyHash> entries;
+	// Last entry resolved for each region index; notes then skip hashing the key.
+	static constexpr uint64_t maximum_indexed_regions = uint64_t{1} << 20;
+	std::vector<Entry*> region_entries;
 
 	void reset_cache() noexcept
 	{
+		region_entries.clear();
 		entries.clear();
 		statistics = {};
 	}
@@ -455,15 +469,29 @@ struct PhaseProcessor::Impl
 	Entry& entry_for(const SampleRegion& region, uint64_t region_id)
 	{
 		const SampleKey key = make_key(region, region_id);
+		if (region_id < region_entries.size())
+			if (Entry* indexed = region_entries[region_id]; indexed && indexed->key == key)
+				return *indexed;
+		Entry* result = nullptr;
 		auto found = entries.find(key);
 		if (found != entries.end())
-			return *found->second;
-		auto entry = std::make_unique<Entry>();
-		entry->key = key;
-		entry->analytic_variants_seen.resize(settings.pool_size, false);
-		Entry* result = entry.get();
-		entries.emplace(key, std::move(entry));
-		++statistics.cached_samples;
+			result = found->second.get();
+		else
+		{
+			auto entry = std::make_unique<Entry>();
+			entry->key = key;
+			entry->analytic_variants_seen.resize(settings.pool_size, false);
+			entry->rotations.resize(settings.pool_size);
+			result = entry.get();
+			entries.emplace(key, std::move(entry));
+			++statistics.cached_samples;
+		}
+		if (region_id < maximum_indexed_regions)
+		{
+			if (region_entries.size() <= region_id)
+				region_entries.resize(region_id + 1, nullptr);
+			region_entries[region_id] = result;
+		}
 		return *result;
 	}
 
@@ -527,30 +555,40 @@ struct PhaseProcessor::Impl
 
 		Entry& entry = entry_for(region, region_id);
 		ensure_analytic(entry, region);
-		uint64_t angle_hash = identity;
-		if (!settings.continuous)
-		{
-			const uint32_t variant_index = static_cast<uint32_t>(identity % settings.pool_size);
-			angle_hash = hash_combine(hash_combine(settings.seed, variant_index), 0x414e474c45ULL);
-			if (!entry.analytic_variants_seen[variant_index])
-			{
-				entry.analytic_variants_seen[variant_index] = true;
-				++statistics.cached_variants;
-			}
-		}
-		const double angle = (unit_from_hash(splitmix64(angle_hash)) * 2.0 - 1.0) *
-			pi * settings.strength;
 		state.kind = PhaseVoiceState::Kind::Analytic;
 		state.quadrature_left = entry.quadrature_left.data();
 		state.quadrature_right = region.channels == 2 ? entry.quadrature_right.data() :
 			entry.quadrature_left.data();
-		state.cosine = static_cast<float>(std::cos(angle));
-		state.sine = static_cast<float>(std::sin(angle));
-		state.scale_left = analytic_scale(state.cosine, state.sine,
-			entry.original_energy_left, entry.quadrature_energy_left, entry.cross_energy_left);
-		state.scale_right = region.channels == 2 ? analytic_scale(state.cosine, state.sine,
-			entry.original_energy_right, entry.quadrature_energy_right, entry.cross_energy_right) :
-			state.scale_left;
+		auto rotate = [&](uint64_t angle_hash) {
+			const double angle = (unit_from_hash(splitmix64(angle_hash)) * 2.0 - 1.0) *
+				pi * settings.strength;
+			state.cosine = static_cast<float>(std::cos(angle));
+			state.sine = static_cast<float>(std::sin(angle));
+			state.scale_left = analytic_scale(state.cosine, state.sine,
+				entry.original_energy_left, entry.quadrature_energy_left, entry.cross_energy_left);
+			state.scale_right = region.channels == 2 ? analytic_scale(state.cosine, state.sine,
+				entry.original_energy_right, entry.quadrature_energy_right, entry.cross_energy_right) :
+				state.scale_left;
+		};
+		if (settings.continuous)
+		{
+			rotate(identity);
+			return state;
+		}
+		const uint32_t variant_index = static_cast<uint32_t>(identity % settings.pool_size);
+		auto& rotation = entry.rotations[variant_index];
+		if (!entry.analytic_variants_seen[variant_index])
+		{
+			rotate(hash_combine(hash_combine(settings.seed, variant_index), 0x414e474c45ULL));
+			rotation = {state.cosine, state.sine, state.scale_left, state.scale_right};
+			entry.analytic_variants_seen[variant_index] = true;
+			++statistics.cached_variants;
+			return state;
+		}
+		state.cosine = rotation.cosine;
+		state.sine = rotation.sine;
+		state.scale_left = rotation.scale_left;
+		state.scale_right = rotation.scale_right;
 		return state;
 	}
 

@@ -38,7 +38,7 @@ PlaybackOptions validated(PlaybackOptions options)
 	if (options.render_threads == 0)
 	{
 		const auto cpus = std::thread::hardware_concurrency();
-		options.render_threads = (std::min)(size_t{16}, size_t{cpus > 2 ? cpus - 2 : 1});
+		options.render_threads = (std::min)(size_t{64}, size_t{cpus > 2 ? cpus - 2 : 1});
 	}
 	return options;
 }

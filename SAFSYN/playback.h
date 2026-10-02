@@ -19,7 +19,7 @@ struct PlaybackOptions
 	uint32_t block_frames = 256;
 	uint32_t buffer_frames = 4096;
 	size_t maximum_cohorts = 4096; // Required finite live safety ceiling.
-	size_t render_threads = 0; // Auto: up to 16, leaving two logical CPUs free.
+	size_t render_threads = 0; // Auto: every logical CPU but two, at most 64.
 	size_t midi_queue_capacity = 262144;
 	uint16_t initial_bank = 0;
 	uint8_t initial_program = 0;

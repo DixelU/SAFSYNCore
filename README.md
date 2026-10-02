@@ -89,7 +89,7 @@ time and memory to prepare. Cohort storage and worker buffers are reserved at
 startup, while cohort membership follows MIDI events.
 
 Live playback uses a finite cohort ceiling (default 4096), an automatic persistent
-render pool (up to 16 threads, reserving two logical CPUs), and a separate WASAPI
+render pool (every logical CPU but two, at most 64 threads), and a separate WASAPI
 delivery thread. Buffering is adjustable; the GUI starts at 100 ms. Live output
 starts at -12 dB with a -1 dB sample-peak limiter and a final safety clamp.
 Offline renderer settings and reference hashes are unchanged.

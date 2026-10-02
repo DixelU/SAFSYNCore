@@ -174,6 +174,107 @@ forms by one ulp changed exactly the scenarios that exercise it, which confirms
 the kernels run. The analytic-group and filtered-analytic perturbations also
 fail the new cohort fixtures, so the suite itself checks exactness.
 
+## Chunked handoff and note dispatch (October 2, 2026)
+
+`safsyn-live-profile` replays a real MIDI file through the engine the way the
+live producer does (events dispatched at block boundaries, one render call per
+256-frame block) and times dispatch and mixing separately. With an 867 MB piano
+SF2, 8,192 cohorts and analytic phase it showed two limits that the
+sustained-cohort microbenchmarks above cannot:
+
+- Each lane owned a fixed range of cohort slots. Occupied slots and expensive
+  cohorts are not spread evenly, so every block waited for its slowest lane
+  while the others were parked: 16 threads mixed live material only 7.6 times
+  faster than one.
+- In dense passages the owner's serial note dispatch, not the mixer, sets the
+  block time. At 2.4 million events per second it cost 0.69 s per second of
+  audio against 0.31 s of mixing.
+
+### Mixer
+
+The slot range is now cut into up to eight chunks per thread (at least 16 slots
+each). Every participant pulls the next chunk from one atomic cursor, mixes it
+into that chunk's own buffer, and the owner adds the buffers in chunk order.
+A thread that is preempted, on a slower core, or holding costlier cohorts
+delays a block by one chunk at most. The audio depends on the chunk layout
+(thread count, slot count and block length), never on which thread rendered
+which chunk, so fixed-thread renders stay deterministic. Their last bits differ
+from the earlier lane-order reduction; one thread keeps the scalar reference
+order and its hashes. Retirements are still applied by the owner in ascending
+slot order.
+
+Each lane has one atomic word holding an epoch and a phase. The owner requests,
+the worker claims and completes, and the owner withdraws any request that its
+worker has not claimed once the chunks have run out, so a worker that wakes late
+costs nothing. A block wakes one participant per 8,192 cohort frames, which
+replaces the per-workload worker count from the earlier target list: the
+nine-frame, 16-thread coherent case above drops from 4.76 to 3.22 ms. Summing
+the chunk buffers takes about 10 microseconds per 256-frame block.
+
+Automatic live thread selection now uses every logical CPU but two (at most 64)
+instead of stopping at 16.
+
+### Dispatch
+
+Three changes remove repeated work from each note without changing a sample:
+
+- The regions a preset plays for a key and velocity, with their pitch
+  increments, are filtered once and reused until the bank is replaced.
+- A pool variant's rotation (cosine, sine and channel scales) is computed once
+  per sample, and a region index resolves its cache entry without hashing.
+- A recycled logical batch keeps its link storage instead of allocating per
+  note, and voice stealing estimates each probed cohort's level once.
+
+### Measurements
+
+Host: AMD Ryzen 9 7900X, 12 cores / 24 logical processors, MSVC 19.51, Release
+`/O2`. Mixing seconds for 16 s of audio (coherent, up to 4,380 live cohorts):
+
+| Threads | Before (s) | After (s) | Scaling before | Scaling after |
+|---:|---:|---:|---:|---:|
+| 1 | 9.78 | 9.87 | 1.0x | 1.0x |
+| 2 | 5.61 | 5.08 | 1.7x | 1.9x |
+| 4 | 3.25 | 2.66 | 3.0x | 3.7x |
+| 8 | 1.85 | 1.40 | 5.3x | 7.1x |
+| 12 | 1.27 | 1.04 | 7.7x | 9.5x |
+| 16 | 1.28 | 1.00 | 7.6x | 9.9x |
+| 22 | - | 0.93 | - | 10.6x |
+
+Whole pipeline, analytic phase, 8,192 cohorts, automatic threads (16 before,
+22 after). Late blocks took longer than their own 5.33 ms; the realtime factor
+is audio duration over dispatch plus mixing time.
+
+| Material | Dispatch (s) | Mixing (s) | Realtime factor | Late blocks |
+|---|---:|---:|---:|---:|
+| 18M-note file, 30 s at 250k events/s, before | 3.11 | 8.90 | 2.50 | 3 of 5,625 |
+| after | 2.44 | 6.62 | 3.31 | 0 |
+| Hypernova, 8 s at 2.4M events/s, before | 5.52 | 2.45 | 1.00 | 281 of 1,500 |
+| after | 3.79 | 1.85 | 1.42 | 168 |
+| Hypernova, 2.5 s at 10M events/s, before | 2.62 | 0.78 | 0.74 | 446 of 469 |
+| after | 1.67 | 0.60 | 1.10 | 83 |
+| Hypernova, whole file (131 s, 125M events), before | 26.59 | 24.77 | 2.55 | 1,567 of 24,555 |
+| after | 18.29 | 17.72 | 3.64 | 515 |
+
+`--live` runs the real `BufferedSynth` with a wall-clock sender and a 10 ms
+audio consumer. Hypernova from 95 to 125 s (104M events, 4,096-frame ring,
+automatic threads) had 7.54 s of underrun silence in 1,134 gaps before and
+0.55 s in 110 gaps after.
+
+### Validation
+
+Single-thread renders of three references (40 s coherent and analytic at 8,192
+cohorts, 70 s analytic at 512 cohorts with one million steals) hash identically
+before and after. New fixtures cover remembered layers across program, bank and
+stress-mode changes and a replaced bank, reused pool rotations against a first
+computation, and 64 mixer threads on fewer processors.
+
+```text
+build/syncore-perf/Release/safsyn-live-profile bank.sf2 file.mid --analytic
+    --cohorts 8192 --threads 16,22 --start 103 --duration 8
+build/syncore-perf/Release/safsyn-live-profile bank.sf2 file.mid --analytic
+    --cohorts 8192 --threads 0 --start 95 --duration 30 --live
+```
+
 ## Next targets
 
 1. **SIMD across cohorts for short intervals.** Frame kernels cannot help
@@ -185,11 +286,13 @@ fail the new cohort fixtures, so the suite itself checks exactness.
 2. **Analytic preparation arithmetic.** A real-input or radix-4 FFT would cut
    preparation further, but changes cached quadratures in their last bits
    and needs new reference hashes for analytic renders.
-3. **Choose useful worker counts per workload.** Four workers outperform sixteen
-   in the measured coherent nine-frame case; sixteen win on long blocks. The
-   current threshold uses active cohort count times frames, while partitioning
-   still divides allocated slot ranges. Sparse/skewed pools and stage-dependent
-   costs need profiling before changing lane assignment and its rounding order.
+3. **Serial note dispatch.** After the October pass dispatch is half of all work
+   on dense files and two thirds of it in their densest passages, on one thread
+   at roughly 70-200 ns per event. The remaining cost is structural: stealing
+   probes up to 32 cohorts that render workers wrote last, a note-off copies
+   its cohort into a release cohort, and both walk shared lists. Going further
+   needs a layout that keeps steal-relevant fields with the owner, or a
+   dispatch that is partitioned rather than only cheaper.
 4. **Producer wakeups and telemetry.** `BufferedSynth` polls a full audio ring
    with a one-millisecond timed wait, and `read_audio` does not signal newly
    available space. A bounded notification protocol could reduce refill delay.
@@ -197,6 +300,7 @@ fail the new cohort fixtures, so the suite itself checks exactness.
    cannot establish this benefit. The existing MIDI queue and audio ring already
    use atomics with separated producer/consumer indices.
 
-A real soundfont/MIDI pass should precede further default thread-policy changes:
-event dispatch, release-heavy passages, phase-cache bandwidth, sparse pools, and
-audio delivery are not represented by these sustained-cohort measurements.
+The sustained-cohort measurements do not represent event dispatch,
+release-heavy passages, phase-cache bandwidth, or sparse pools. Check thread
+policy and dispatch changes with `safsyn-live-profile` on a real bank and file,
+and audio delivery with WASAPI.

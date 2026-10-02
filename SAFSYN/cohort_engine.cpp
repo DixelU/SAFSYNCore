@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -434,47 +435,136 @@ struct LogicalSlot
 	uint32_t generation = 1;
 	bool occupied = false;
 };
+
+// One layer a note plays, with its pitch increment for that key.
+struct RegionMatch
+{
+	size_t region_id = 0;
+	const SampleRegion* region = nullptr;
+	double base_increment = 0.0;
+};
+
+// A bank is immutable while attached, so the layers a preset plays for a key
+// and velocity are filtered once and reused until the bank is replaced.
+struct RegionMatchCache
+{
+	static constexpr uint32_t unknown = (std::numeric_limits<uint32_t>::max)();
+	struct Entry
+	{
+		uint32_t begin = unknown;
+		uint32_t count = 0;
+		bool has_exclusive = false;
+		bool has_one_shot = false;
+	};
+
+	const Soundfont* bank = nullptr;
+	// Bank/program to a key-by-velocity table of ranges in matches.
+	std::unordered_map<uint32_t, std::vector<Entry>> presets;
+	std::vector<RegionMatch> matches;
+	std::array<uint32_t, 16> channel_presets;
+	std::array<Entry*, 16> channel_tables{};
+
+	RegionMatchCache() noexcept { channel_presets.fill(unknown); }
+
+	void clear() noexcept
+	{
+		bank = nullptr;
+		presets.clear();
+		matches.clear();
+		channel_presets.fill(unknown);
+		channel_tables.fill(nullptr);
+	}
+};
 }
 
 struct CohortEngineState
 {
-	struct RenderScratch
+	// Retirements found while rendering a slot range, applied later by the owner.
+	struct RetiredList
 	{
-		std::vector<float> audio;
-		std::vector<uint32_t> retired;
+		uint32_t* indices = nullptr;
+		uint32_t count = 0;
+
+		void push_back(uint32_t index) noexcept { indices[count++] = index; }
 	};
 
 	struct ParallelRenderState
 	{
-		// No shared completion counter: each lane owns its acknowledgement.
-		// Separate cache lines keep unrelated workers from invalidating it.
+		// The slot range is cut into more chunks than there are threads, and every
+		// participant pulls the next chunk from one shared cursor. A thread that is
+		// preempted, on a slower core, or holding costlier cohorts therefore delays
+		// the block by one chunk at most. Each chunk mixes into its own buffer and
+		// the owner adds them in chunk order, so the audio depends on the chunk
+		// layout but never on which thread rendered which chunk.
+		struct Chunk
+		{
+			uint32_t retired = 0;
+			bool mixed = false;
+		};
+		static constexpr size_t chunks_per_lane = 8;
+		static constexpr size_t minimum_chunk_slots = 16;
+		// Bounds chunk buffers for very long offline blocks (float samples).
+		static constexpr size_t maximum_audio_samples = size_t{1} << 23;
+		// Cohort frames that make a participant worth its wake-up.
+		static constexpr uint64_t work_per_participant = 8192;
+
+		// Each lane owns one word: an epoch above a two-bit phase. The owner
+		// requests, the worker claims and completes, and the owner takes back any
+		// request its worker has not claimed once the chunks have run out, so a
+		// late wake-up costs nothing. Separate cache lines keep lanes independent.
+		enum Phase : uint64_t { Idle, Requested, Running, Done };
+		static constexpr uint64_t epoch_step = 4;
+		static constexpr uint64_t stop = (std::numeric_limits<uint64_t>::max)();
 #ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable: 4324) // Intentional cache-line separation of worker signals.
 #endif
 		struct alignas(64) Signal
 		{
-			std::atomic<uint64_t> requested{0};
-			std::atomic<uint64_t> completed{0};
+			std::atomic<uint64_t> state{0};
 		};
+		std::array<Signal, 64> signals;
+		alignas(64) std::atomic<size_t> next_chunk{0};
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
-		static constexpr uint64_t stop_epoch = (std::numeric_limits<uint64_t>::max)();
-		std::array<Signal, 64> signals;
 		std::vector<std::jthread> workers;
-		std::vector<RenderScratch> scratch;
+		std::vector<float> audio;
+		std::vector<uint32_t> retired;
+		std::vector<Chunk> chunks;
 		SynthEngine* owner = nullptr;
 		uint32_t frames = 0;
 		size_t slot_count = 0;
+		size_t chunk_count = 0;
+		size_t stride = 0;
 		uint64_t epoch = 0;
+
+		size_t lanes() const noexcept { return workers.size() + 1; }
+
+		size_t chunk_begin(size_t chunk) const noexcept
+		{
+			return slot_count * chunk / chunk_count;
+		}
+
+		// One spare cache line between chunk buffers keeps their writers apart.
+		static size_t stride_for(size_t samples) noexcept
+		{
+			return (samples + 15) / 16 * 16 + 16;
+		}
+
+		size_t chunks_for(size_t slots, size_t samples) const noexcept
+		{
+			const size_t affordable = (std::max)(lanes(), maximum_audio_samples / stride_for(samples));
+			return (std::max)(size_t{1}, (std::min)({lanes() * chunks_per_lane,
+				slots / minimum_chunk_slots, affordable}));
+		}
 
 		~ParallelRenderState()
 		{
 			for (size_t lane = 1; lane <= workers.size(); ++lane)
 			{
-				signals[lane].requested.store(stop_epoch, std::memory_order_release);
-				signals[lane].requested.notify_one();
+				signals[lane].state.store(stop, std::memory_order_release);
+				signals[lane].state.notify_one();
 			}
 			workers.clear();
 		}
@@ -494,7 +584,9 @@ struct CohortEngineState
 	std::array<uint32_t, 16 * 128> note_heads{};
 	size_t maximum_cohorts = 0;
 	std::unique_ptr<ParallelRenderState> parallel_render;
-	std::vector<std::pair<size_t, const SampleRegion*>> matching_regions_scratch;
+	std::vector<RegionMatch> matching_regions_scratch;
+	RegionMatchCache region_matches;
+	std::vector<LogicalRegionLink> links_scratch;
 
 	CohortEngineState() noexcept
 	{
@@ -620,15 +712,15 @@ struct CohortEngineState
 			return static_cast<double>(cohort.env) * channel.volume * channel.expression *
 				owner.master_volume_ * gain * cohort.phase.multiplicity;
 		};
-		auto prefer = [&](uint32_t selected, uint32_t challenger) {
+		// Each probed cohort's level is estimated once and kept with the leaders.
+		auto prefer = [&](uint32_t selected, double candidate_level, uint32_t challenger,
+			double current_level) {
 			if (selected == invalid_index)
 				return true;
 			const auto& current = cohorts[challenger].cohort;
 			const auto& candidate = cohorts[selected].cohort;
 			const bool current_releasing = current.stage == CohortStage::Release;
 			const bool candidate_releasing = candidate.stage == CohortStage::Release;
-			const double current_level = estimated_level(current);
-			const double candidate_level = estimated_level(candidate);
 			return (current_releasing && !candidate_releasing) ||
 				(current_releasing == candidate_releasing &&
 					(current_level < candidate_level ||
@@ -681,15 +773,24 @@ struct CohortEngineState
 			index = head;
 		uint32_t best = invalid_index;
 		uint32_t best_different_key = invalid_index;
+		double best_level = 0.0;
+		double best_different_key_level = 0.0;
 		for (size_t offset = 0; offset < probe_count; ++offset)
 		{
-			if (prefer(best, index))
-				best = index;
 			const auto& cohort = cohorts[index].cohort;
+			const double level = estimated_level(cohort);
+			if (prefer(best, best_level, index, level))
+			{
+				best = index;
+				best_level = level;
+			}
 			const bool same_key = cohort.channel == request_channel &&
 				cohort.note == request_note;
-			if (!same_key && prefer(best_different_key, index))
+			if (!same_key && prefer(best_different_key, best_different_key_level, index, level))
+			{
 				best_different_key = index;
+				best_different_key_level = level;
+			}
 			index = cohorts[index].channel_next != invalid_index
 				? cohorts[index].channel_next : head;
 		}
@@ -774,14 +875,18 @@ struct CohortEngineState
 		return {index, slot.generation};
 	}
 
-	StableHandle allocate_logical(LogicalBatch batch)
+	// A retired slot keeps its link storage, so a recycled slot copies the new
+	// links without allocating. Nothing leaves the free list if a copy fails.
+	StableHandle allocate_logical(LogicalBatch batch, const std::vector<LogicalRegionLink>& links)
 	{
 		uint32_t index = invalid_index;
 		if (!free_logical_batches.empty())
 		{
 			index = free_logical_batches.back();
-			free_logical_batches.pop_back();
 			auto& slot = logical_batches[index];
+			slot.batch.links.assign(links.begin(), links.end());
+			batch.links = std::move(slot.batch.links);
+			free_logical_batches.pop_back();
 			if (++slot.generation == 0)
 				++slot.generation;
 		}
@@ -789,6 +894,7 @@ struct CohortEngineState
 		{
 			if (logical_batches.size() >= invalid_index)
 				return {};
+			batch.links = links;
 			index = static_cast<uint32_t>(logical_batches.size());
 			logical_batches.push_back({});
 		}
@@ -804,7 +910,10 @@ struct CohortEngineState
 		if (!slot)
 			return;
 		slot->occupied = false;
+		auto storage = std::move(slot->batch.links);
+		storage.clear();
 		slot->batch = {};
+		slot->batch.links = std::move(storage);
 		free_logical_batches.push_back(handle.index);
 	}
 
@@ -1023,8 +1132,8 @@ struct CohortEngineState
 	}
 
 	void start_batch(SynthEngine& owner, uint8_t channel, uint8_t note,
-		uint8_t velocity, uint64_t count,
-		const std::vector<std::pair<size_t, const SampleRegion*>>& regions)
+		uint8_t velocity, uint64_t count, std::span<const RegionMatch> regions,
+		bool has_one_shot)
 	{
 		const uint64_t first_serial = owner.next_serial_;
 		owner.next_serial_ += count;
@@ -1035,12 +1144,16 @@ struct CohortEngineState
 		batch.first_serial = first_serial;
 		batch.held = count;
 		batch.onset_identity = owner.midi_tick_.value_or(owner.stats_.rendered_frames);
-		batch.one_shot_blocking = std::any_of(regions.begin(), regions.end(),
-			[](const auto& item) { return item.second->loop_mode == LoopMode::OneShot; });
+		batch.one_shot_blocking = has_one_shot;
 		const bool allow_onset_merge = !batch.one_shot_blocking;
-		batch.links.reserve(regions.size());
-		for (const auto& [region_id, region] : regions)
+		// The slot that receives the batch keeps its own link storage.
+		auto& links = links_scratch;
+		links.clear();
+		links.reserve(regions.size());
+		for (const RegionMatch& match : regions)
 		{
+			const size_t region_id = match.region_id;
+			const SampleRegion* region = match.region;
 			PhaseAggregate aggregate = make_phase_aggregate(owner, *region, region_id,
 				first_serial, count, channel, note, batch.onset_identity, true);
 			const OnsetKey key{region, channel, note, velocity};
@@ -1065,7 +1178,7 @@ struct CohortEngineState
 			}
 			if (handle.valid())
 			{
-				batch.links.push_back({handle, region_id});
+				links.push_back({handle, region_id});
 				owner.stats_.started_voices += count;
 				owner.stats_.logical_voices_started += count;
 				update_average_multiplicity(owner);
@@ -1077,7 +1190,7 @@ struct CohortEngineState
 			cohort.note = note;
 			cohort.velocity = velocity;
 			cohort.channel = channel;
-			cohort.base_inc = owner.compute_base_increment(*region, note);
+			cohort.base_inc = match.base_increment;
 			cohort.birth_frame = owner.stats_.rendered_frames;
 			cohort.oldest_serial = first_serial;
 			owner.compute_gains(*region, channel, velocity, cohort.gain_l, cohort.gain_r);
@@ -1087,7 +1200,7 @@ struct CohortEngineState
 			handle = allocate_cohort(owner, std::move(cohort), true);
 			if (handle.valid())
 			{
-				batch.links.push_back({handle, region_id});
+				links.push_back({handle, region_id});
 				if (allow_onset_merge)
 					onset_candidates[key] = handle;
 			}
@@ -1100,19 +1213,19 @@ struct CohortEngineState
 			}
 			update_average_multiplicity(owner);
 		}
-		if (!batch.links.empty())
+		if (!links.empty())
 		{
-			const StableHandle logical = allocate_logical(std::move(batch));
+			const StableHandle logical = allocate_logical(std::move(batch), links);
 			if (logical.valid())
 				note_stacks[note_index(channel, note)].push_back(logical);
 		}
 	}
 
-	void note_on_batch(SynthEngine& owner, uint8_t channel, uint8_t note,
-		uint8_t velocity, uint64_t count)
+	// Regions a note plays, in bank order. The result stays valid until the next
+	// lookup that has to filter (a new preset/key/velocity or the stress mode).
+	std::span<const RegionMatch> matching_regions(SynthEngine& owner, uint8_t channel,
+		uint8_t note, uint8_t velocity, bool& has_exclusive, bool& has_one_shot)
 	{
-		if (count == 0 || velocity == 0 || !owner.soundfont_ || channel >= 16 || note >= 128)
-			return;
 		const auto& channel_state = owner.channels_[channel];
 		const uint16_t selected_bank = static_cast<uint16_t>(
 			(static_cast<uint16_t>(channel_state.controllers[0]) << 7) |
@@ -1120,27 +1233,80 @@ struct CohortEngineState
 		const auto& render_regions = owner.all_regions_mode_ &&
 			!owner.soundfont_->stress_regions.empty()
 			? owner.soundfont_->stress_regions : owner.soundfont_->regions;
-		auto& matches = matching_regions_scratch;
-		matches.clear();
+		auto collect = [&](std::vector<RegionMatch>& matches)
+		{
+			auto consider = [&](size_t region_id)
+			{
+				const auto& region = render_regions[region_id];
+				if (!region.pcm || region.pcm_len == 0 || region.channels < 1 || region.channels > 2 ||
+					(!owner.all_regions_mode_ && (region.preset_bank != selected_bank ||
+						region.preset_program != channel_state.program)) ||
+					note < region.lo_key || note > region.hi_key ||
+					velocity < region.lo_vel || velocity > region.hi_vel)
+					return;
+				matches.push_back({region_id, &region, owner.compute_base_increment(region, note)});
+				has_exclusive = has_exclusive || region.exclusive_class != 0;
+				has_one_shot = has_one_shot || region.loop_mode == LoopMode::OneShot;
+			};
+			if (const auto* candidates = owner.region_candidates(selected_bank, channel_state.program, note))
+				for (const auto id : *candidates) consider(id);
+			else
+				for (size_t id = 0; id < render_regions.size(); ++id) consider(id);
+		};
+		if (owner.all_regions_mode_)
+		{
+			matching_regions_scratch.clear();
+			collect(matching_regions_scratch);
+			return matching_regions_scratch;
+		}
+
+		auto& cache = region_matches;
+		if (cache.bank != owner.soundfont_)
+		{
+			cache.clear();
+			cache.bank = owner.soundfont_;
+		}
+		const uint32_t preset = (uint32_t{selected_bank} << 16) | channel_state.program;
+		if (cache.channel_presets[channel] != preset || !cache.channel_tables[channel])
+		{
+			auto& table = cache.presets[preset];
+			if (table.empty())
+				table.resize(size_t{128} * 128);
+			cache.channel_tables[channel] = table.data();
+			cache.channel_presets[channel] = preset;
+		}
+		auto& entry = cache.channel_tables[channel][size_t{note} * 128 + velocity];
+		if (entry.begin == RegionMatchCache::unknown)
+		{
+			const size_t begin = cache.matches.size();
+			try
+			{
+				collect(cache.matches);
+			}
+			catch (...)
+			{
+				cache.matches.resize(begin);
+				throw;
+			}
+			entry.count = static_cast<uint32_t>(cache.matches.size() - begin);
+			entry.has_exclusive = has_exclusive;
+			entry.has_one_shot = has_one_shot;
+			entry.begin = static_cast<uint32_t>(begin);
+		}
+		has_exclusive = entry.has_exclusive;
+		has_one_shot = entry.has_one_shot;
+		return {cache.matches.data() + entry.begin, entry.count};
+	}
+
+	void note_on_batch(SynthEngine& owner, uint8_t channel, uint8_t note,
+		uint8_t velocity, uint64_t count)
+	{
+		if (count == 0 || velocity == 0 || !owner.soundfont_ || channel >= 16 || note >= 128)
+			return;
 		bool has_exclusive = false;
 		bool has_one_shot = false;
-		auto consider = [&](size_t region_id)
-		{
-			const auto& region = render_regions[region_id];
-			if (!region.pcm || region.pcm_len == 0 || region.channels < 1 || region.channels > 2 ||
-				(!owner.all_regions_mode_ && (region.preset_bank != selected_bank ||
-					region.preset_program != channel_state.program)) ||
-				note < region.lo_key || note > region.hi_key ||
-				velocity < region.lo_vel || velocity > region.hi_vel)
-				return;
-			matches.push_back({region_id, &region});
-			has_exclusive = has_exclusive || region.exclusive_class != 0;
-			has_one_shot = has_one_shot || region.loop_mode == LoopMode::OneShot;
-		};
-		if (const auto* candidates = owner.region_candidates(selected_bank, channel_state.program, note))
-			for (const auto id : *candidates) consider(id);
-		else
-			for (size_t id = 0; id < render_regions.size(); ++id) consider(id);
+		const std::span<const RegionMatch> matches = matching_regions(owner, channel, note,
+			velocity, has_exclusive, has_one_shot);
 		if (matches.empty())
 		{
 			owner.next_serial_ += count;
@@ -1152,9 +1318,9 @@ struct CohortEngineState
 				note_on_batch(owner, channel, note, velocity, 1);
 			return;
 		}
-		for (const auto& [region_id, region] : matches)
+		for (const RegionMatch& match : matches)
 		{
-			(void)region_id;
+			const SampleRegion* region = match.region;
 			if (region->exclusive_class == 0)
 				continue;
 			for (uint32_t index = 0; index < cohorts.size(); ++index)
@@ -1168,7 +1334,7 @@ struct CohortEngineState
 					retire_cohort(owner, index, true);
 			}
 		}
-		start_batch(owner, channel, note, velocity, count, matches);
+		start_batch(owner, channel, note, velocity, count, matches, has_one_shot);
 	}
 
 	void note_off_batch(SynthEngine& owner, uint8_t channel, uint8_t note, uint64_t count)
@@ -1346,31 +1512,30 @@ struct CohortEngineState
 		try
 		{
 			auto state = std::make_unique<ParallelRenderState>();
-			state->scratch.resize(thread_count);
+			state->workers.reserve(thread_count - 1);
 			for (size_t lane = 1; lane < thread_count; ++lane)
 				state->workers.emplace_back([this, shared = state.get(), lane] {
-					uint64_t observed_epoch = 0;
-					auto& signal = shared->signals[lane];
+					using Phase = ParallelRenderState::Phase;
+					auto& signal = shared->signals[lane].state;
+					uint64_t observed = signal.load(std::memory_order_acquire);
 					for (;;)
 					{
-						observed_epoch = wait_for_change(signal.requested, observed_epoch);
-						if (observed_epoch == ParallelRenderState::stop_epoch)
+						if (observed == ParallelRenderState::stop)
 							return;
-						SynthEngine* owner = shared->owner;
-						const uint32_t frames = shared->frames;
-						const size_t slot_count = shared->slot_count;
-						const size_t lanes = shared->scratch.size();
-						const size_t begin = slot_count * lane / lanes;
-						const size_t end = slot_count * (lane + 1) / lanes;
-
-						auto& scratch = shared->scratch[lane];
-						std::fill_n(scratch.audio.data(), static_cast<size_t>(frames) * 2, 0.0f);
-						render_range(*owner, scratch.audio.data(), frames,
-							static_cast<uint32_t>(begin), static_cast<uint32_t>(end),
-							&scratch.retired);
-
-						signal.completed.store(observed_epoch, std::memory_order_release);
-						signal.completed.notify_one();
+						if ((observed & 3) != Phase::Requested)
+						{
+							observed = wait_for_change(signal, observed);
+							continue;
+						}
+						// Losing this exchange means the owner withdrew the request.
+						const uint64_t epoch = observed - Phase::Requested;
+						if (!signal.compare_exchange_strong(observed, epoch + Phase::Running,
+							std::memory_order_acq_rel, std::memory_order_acquire))
+							continue;
+						render_chunks(*shared);
+						observed = epoch + Phase::Done;
+						signal.store(observed, std::memory_order_release);
+						signal.notify_one();
 					}
 				});
 			parallel_render = std::move(state);
@@ -1383,7 +1548,35 @@ struct CohortEngineState
 
 	size_t render_threads() const noexcept
 	{
-		return parallel_render ? parallel_render->scratch.size() : 1;
+		return parallel_render ? parallel_render->lanes() : 1;
+	}
+
+	// Runs on the owner and on every claimed worker until the cursor runs out.
+	void render_chunks(ParallelRenderState& state) noexcept
+	{
+		const size_t samples = static_cast<size_t>(state.frames) * 2;
+		for (;;)
+		{
+			const size_t chunk = state.next_chunk.fetch_add(1, std::memory_order_relaxed);
+			if (chunk >= state.chunk_count)
+				return;
+			const uint32_t begin = static_cast<uint32_t>(state.chunk_begin(chunk));
+			const uint32_t end = static_cast<uint32_t>(state.chunk_begin(chunk + 1));
+			uint32_t first = begin;
+			while (first < end && !cohorts[first].occupied)
+				++first;
+			auto& result = state.chunks[chunk];
+			result.retired = 0;
+			result.mixed = first != end;
+			if (!result.mixed)
+				continue;
+			float* audio = state.audio.data() + chunk * state.stride;
+			std::fill_n(audio, samples, 0.0f);
+			// A chunk can retire at most its own slots, so its list lives in them.
+			RetiredList retired{state.retired.data() + begin};
+			render_range(*state.owner, audio, state.frames, first, end, &retired);
+			result.retired = retired.count;
+		}
 	}
 
 #if defined(_M_X64) || defined(__SSE2__)
@@ -1719,7 +1912,7 @@ struct CohortEngineState
 #endif
 
 	void render_range(SynthEngine& owner, float* out, uint32_t frames,
-		uint32_t begin, uint32_t end, std::vector<uint32_t>* retired) noexcept
+		uint32_t begin, uint32_t end, RetiredList* retired) noexcept
 	{
 		// Tiny event intervals must not pay for SIMD eligibility or setup.
 		if (frames == 1)
@@ -1732,7 +1925,7 @@ struct CohortEngineState
 
 	template<bool Vectorize, bool SingleFrame = false>
 	void render_range_impl(SynthEngine& owner, float* out, uint32_t frames,
-		uint32_t begin, uint32_t end, std::vector<uint32_t>* retired) noexcept
+		uint32_t begin, uint32_t end, RetiredList* retired) noexcept
 	{
 		if constexpr (SingleFrame) frames = 1;
 		for (uint32_t cohort_index = begin; cohort_index < end; ++cohort_index)
@@ -1869,25 +2062,25 @@ struct CohortEngineState
 	bool render_parallel(SynthEngine& owner, float* out, uint32_t frames) noexcept
 	{
 		if (!parallel_render ||
-			active_cohort_count < parallel_render->scratch.size() * 16)
+			active_cohort_count < ParallelRenderState::minimum_chunk_slots * 2)
 			return false;
 		const uint64_t work = static_cast<uint64_t>(active_cohort_count) * frames;
-		if (work < 8192)
+		if (work < ParallelRenderState::work_per_participant)
 			return false;
+		using Phase = ParallelRenderState::Phase;
 		auto& state = *parallel_render;
 		const size_t samples = static_cast<size_t>(frames) * 2;
 		const size_t slot_count = cohorts.size();
+		const size_t chunk_count = state.chunks_for(slot_count, samples);
+		const size_t stride = ParallelRenderState::stride_for(samples);
 		try
 		{
-			for (size_t lane = 0; lane < state.scratch.size(); ++lane)
-			{
-				auto& scratch = state.scratch[lane];
-				scratch.audio.resize(samples);
-				scratch.retired.clear();
-				const size_t begin = slot_count * lane / state.scratch.size();
-				const size_t end = slot_count * (lane + 1) / state.scratch.size();
-				scratch.retired.reserve(end - begin);
-			}
+			if (state.audio.size() < chunk_count * stride)
+				state.audio.resize(chunk_count * stride);
+			if (state.retired.size() < slot_count)
+				state.retired.resize(slot_count);
+			if (state.chunks.size() < chunk_count)
+				state.chunks.resize(chunk_count);
 		}
 		catch (...)
 		{
@@ -1897,28 +2090,43 @@ struct CohortEngineState
 		state.owner = &owner;
 		state.frames = frames;
 		state.slot_count = slot_count;
-		const uint64_t previous_epoch = state.epoch;
-		// Reserve the sentinel and retain distinct consecutive generations on wrap.
-		if (++state.epoch == ParallelRenderState::stop_epoch) state.epoch = 1;
-		for (size_t lane = 1; lane < state.scratch.size(); ++lane)
+		state.chunk_count = chunk_count;
+		state.stride = stride;
+		state.next_chunk.store(0, std::memory_order_relaxed);
+		state.epoch += ParallelRenderState::epoch_step;
+		// Short event intervals wake only as many workers as they can keep busy.
+		const size_t participants = static_cast<size_t>((std::min)({
+			uint64_t{state.lanes()}, uint64_t{chunk_count},
+			(std::max)(uint64_t{2}, work / ParallelRenderState::work_per_participant)}));
+		for (size_t lane = 1; lane < participants; ++lane)
 		{
-			state.signals[lane].requested.store(state.epoch, std::memory_order_release);
-			state.signals[lane].requested.notify_one();
+			auto& signal = state.signals[lane].state;
+			signal.store(state.epoch + Phase::Requested, std::memory_order_release);
+			signal.notify_one();
 		}
-		const size_t main_end = slot_count / state.scratch.size();
-		std::fill_n(state.scratch[0].audio.data(), samples, 0.0f);
-		render_range(owner, state.scratch[0].audio.data(), frames, 0,
-			static_cast<uint32_t>(main_end), &state.scratch[0].retired);
-		for (size_t lane = 1; lane < state.scratch.size(); ++lane)
-			wait_for_change(state.signals[lane].completed, previous_epoch);
+		render_chunks(state);
+		for (size_t lane = 1; lane < participants; ++lane)
+		{
+			auto& signal = state.signals[lane].state;
+			uint64_t observed = state.epoch + Phase::Requested;
+			if (signal.compare_exchange_strong(observed, state.epoch + Phase::Idle,
+				std::memory_order_acq_rel, std::memory_order_acquire))
+				continue;
+			while (observed != state.epoch + Phase::Done)
+				observed = wait_for_change(signal, observed);
+		}
 
 		std::fill(out, out + samples, 0.0f);
-		for (const auto& scratch : state.scratch)
-			add_mix_buffer(out, scratch.audio.data(), samples);
-		for (auto& scratch : state.scratch)
-			for (const uint32_t index : scratch.retired)
-				if (cohorts[index].occupied)
-					retire_cohort(owner, index, true);
+		for (size_t chunk = 0; chunk < chunk_count; ++chunk)
+			if (state.chunks[chunk].mixed)
+				add_mix_buffer(out, state.audio.data() + chunk * stride, samples);
+		for (size_t chunk = 0; chunk < chunk_count; ++chunk)
+		{
+			const uint32_t* retired = state.retired.data() + state.chunk_begin(chunk);
+			for (uint32_t index = 0; index < state.chunks[chunk].retired; ++index)
+				if (cohorts[retired[index]].occupied)
+					retire_cohort(owner, retired[index], true);
+		}
 		++owner.stats_.parallel_render_calls;
 		owner.stats_.parallel_rendered_frames += frames;
 		return true;
@@ -1947,6 +2155,7 @@ struct CohortEngineState
 		for (auto& stack : note_stacks)
 			stack.clear();
 		onset_candidates.clear();
+		region_matches.clear();
 		active_logical = 0;
 		active_cohort_count = 0;
 		active_cohorts_by_channel.fill(0);
@@ -1986,11 +2195,14 @@ void CohortEngine::reserve_playback(uint32_t maximum_block_frames, size_t region
 	state.onset_candidates.reserve(capacity);
 	state.matching_regions_scratch.reserve(region_count);
 	if (state.parallel_render)
-		for (auto& scratch : state.parallel_render->scratch)
-		{
-			scratch.audio.resize(static_cast<size_t>(maximum_block_frames) * 2);
-			scratch.retired.reserve((capacity + state.render_threads() - 1) / state.render_threads());
-		}
+	{
+		auto& parallel = *state.parallel_render;
+		const size_t samples = static_cast<size_t>(maximum_block_frames) * 2;
+		const size_t chunk_count = parallel.chunks_for(capacity, samples);
+		parallel.audio.resize(chunk_count * CohortEngineState::ParallelRenderState::stride_for(samples));
+		parallel.retired.resize(capacity);
+		parallel.chunks.resize(chunk_count);
+	}
 }
 
 size_t CohortEngine::render_threads() const noexcept
