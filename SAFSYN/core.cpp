@@ -243,75 +243,118 @@ static bool build_seed_loader_region(const SF2Shdr& sh, const GenSet& generators
 //  SF2 loader
 // ============================================================
 
+// Reads whole files through 64-bit stream offsets: ftell's long is 32 bits on
+// Windows, so it cannot size the multi-gigabyte banks that are common.
+static bool read_file_bytes(const char* path, std::vector<uint8_t>& out)
+{
+	std::ifstream file(path, std::ios::binary | std::ios::ate);
+	if (!file) return false;
+	const std::streamoff size = file.tellg();
+	if (size < 0 || static_cast<uint64_t>(size) > SIZE_MAX) return false;
+	out.resize(static_cast<size_t>(size));
+	file.seekg(0);
+	return out.empty() || file.read(reinterpret_cast<char*>(out.data()), size);
+}
+
 bool load_sf2(const char* path, Soundfont& sf)
 {
-	FILE* f = fopen(path, "rb");
-	if (!f) return false;
+	// Only the sample pool and the small pdta list are read: the rest of a
+	// bank is never needed, and copying it would double the peak memory.
+	std::ifstream file(path, std::ios::binary | std::ios::ate);
+	if (!file) return false;
+	const std::streamoff file_end = file.tellg();
+	if (file_end < 12) return false;
+	const uint64_t fsz = static_cast<uint64_t>(file_end);
 
-	fseek(f, 0, SEEK_END);
-	long fsz = ftell(f);
-	rewind(f);
-	std::vector<uint8_t> buf((size_t)fsz);
-	fread(buf.data(), 1, (size_t)fsz, f);
-	fclose(f);
+	const auto read_at = [&file](uint64_t offset, void* destination, uint64_t size)
+	{
+		file.clear();
+		if (!file.seekg(static_cast<std::streamoff>(offset)))
+			return false;
+		for (auto* out = static_cast<char*>(destination); size;)
+		{
+			const uint64_t part = (std::min)(size, uint64_t{1} << 30);
+			if (!file.read(out, static_cast<std::streamsize>(part)))
+				return false;
+			out += part;
+			size -= part;
+		}
+		return true;
+	};
 
-	if (fsz < 12) return false;
-	if (memcmp(buf.data(), "RIFF", 4) != 0) return false;
-	if (memcmp(buf.data() + 8, "sfbk", 4) != 0) return false;
+	uint8_t riff[12];
+	if (!read_at(0, riff, sizeof(riff))) return false;
+	if (memcmp(riff, "RIFF", 4) != 0) return false;
+	if (memcmp(riff + 8, "sfbk", 4) != 0) return false;
 
 	auto rd32 = [](const uint8_t* p) -> uint32_t
 	{
 		return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 	};
 
-	// Walk top-level LIST chunks to locate sdta and pdta
-	const uint8_t* sdta = nullptr, * pdta = nullptr;
-	uint32_t sdta_sz = 0, pdta_sz = 0;
+	// Walk top-level LIST chunks to locate sdta and pdta. Chunk contents are
+	// clamped to the file so a truncated bank cannot address past its end.
+	uint64_t sdta = 0, pdta = 0, sdta_sz = 0, pdta_sz = 0;
 	{
-		size_t pos = 12;
-		while (pos + 8 <= (size_t)fsz)
+		uint64_t pos = 12;
+		while (pos + 8 <= fsz)
 		{
-			const uint8_t* cp = buf.data() + pos;
+			uint8_t cp[12];
+			const bool has_list_type = pos + 12 <= fsz;
+			if (!read_at(pos, cp, has_list_type ? 12 : 8)) return false;
 			uint32_t csz = rd32(cp + 4);
-			if (memcmp(cp, "LIST", 4) == 0 && pos + 12 <= (size_t)fsz)
+			if (memcmp(cp, "LIST", 4) == 0 && has_list_type && csz >= 4)
 			{
-				if (memcmp(cp + 8, "sdta", 4) == 0) { sdta = cp + 12; sdta_sz = csz - 4; }
-				if (memcmp(cp + 8, "pdta", 4) == 0) { pdta = cp + 12; pdta_sz = csz - 4; }
+				const uint64_t size = (std::min)(uint64_t{csz} - 4, fsz - (pos + 12));
+				if (memcmp(cp + 8, "sdta", 4) == 0) { sdta = pos + 12; sdta_sz = size; }
+				if (memcmp(cp + 8, "pdta", 4) == 0) { pdta = pos + 12; pdta_sz = size; }
 			}
-			pos += 8 + csz + (csz & 1);
+			pos += 8 + uint64_t{csz} + (csz & 1);
 		}
 	}
 	if (!sdta || !pdta) return false;
 
-	// Extract smpl chunk
-	const int16_t* smpl = nullptr; uint32_t smpl_frames = 0;
+	// Locate the smpl chunk
+	uint64_t smpl = 0; uint32_t smpl_frames = 0;
 	{
-		size_t pos = 0;
+		uint64_t pos = 0;
 		while (pos + 8 <= sdta_sz)
 		{
-			const uint8_t* cp = sdta + pos;
+			uint8_t cp[8];
+			if (!read_at(sdta + pos, cp, sizeof(cp))) return false;
 			uint32_t csz = rd32(cp + 4);
-			if (memcmp(cp, "smpl", 4) == 0) { smpl = (const int16_t*)(cp + 8); smpl_frames = csz / 2; }
-			pos += 8 + csz + (csz & 1);
+			if (memcmp(cp, "smpl", 4) == 0)
+			{
+				smpl = sdta + pos + 8;
+				smpl_frames = static_cast<uint32_t>((std::min)(uint64_t{csz}, sdta_sz - (pos + 8)) / 2);
+			}
+			pos += 8 + uint64_t{csz} + (csz & 1);
 		}
 	}
 	if (!smpl || smpl_frames == 0) return false;
+
+	std::vector<uint8_t> pdta_bytes(static_cast<size_t>(pdta_sz));
+	if (!read_at(pdta, pdta_bytes.data(), pdta_sz)) return false;
+
 	sf = Soundfont{};
-	sf.pcm_pool.assign(smpl, smpl + smpl_frames);
+	sf.pcm_pool.resize(smpl_frames);
+	if (!read_at(smpl, sf.pcm_pool.data(), uint64_t{smpl_frames} * sizeof(int16_t))) return false;
 
 	// Extract all pdta sub-chunks
 	struct { const uint8_t* p; uint32_t sz; } C[7] = {};
 	enum { PHDR, PBAG, PGEN, INST, IBAG, IGEN, SHDR };
 	static const char* names[7] = {"phdr","pbag","pgen","inst","ibag","igen","shdr"};
 	{
-		size_t pos = 0;
+		uint64_t pos = 0;
 		while (pos + 8 <= pdta_sz)
 		{
-			const uint8_t* cp = pdta + pos;
+			const uint8_t* cp = pdta_bytes.data() + pos;
 			uint32_t csz = rd32(cp + 4);
+			const uint32_t available = static_cast<uint32_t>(
+				(std::min)(uint64_t{csz}, pdta_sz - (pos + 8)));
 			for (int i = 0; i < 7; i++)
-				if (memcmp(cp, names[i], 4) == 0) { C[i].p = cp + 8; C[i].sz = csz; }
-			pos += 8 + csz + (csz & 1);
+				if (memcmp(cp, names[i], 4) == 0) { C[i].p = cp + 8; C[i].sz = available; }
+			pos += 8 + uint64_t{csz} + (csz & 1);
 		}
 	}
 	for (int i = 0; i < 7; i++) if (!C[i].p) return false;
@@ -524,13 +567,9 @@ static bool load_wav(
 	uint32_t& out_rate,
 	uint8_t& out_ch)
 {
-	FILE* f = fopen(path, "rb");
-	if (!f) return false;
-	fseek(f, 0, SEEK_END);
-	long fsz = ftell(f); rewind(f);
-	std::vector<uint8_t> buf((size_t)fsz);
-	fread(buf.data(), 1, (size_t)fsz, f);
-	fclose(f);
+	std::vector<uint8_t> buf;
+	if (!read_file_bytes(path, buf)) return false;
+	const size_t fsz = buf.size();
 
 	if (fsz < 44) return false;
 	if (memcmp(buf.data(), "RIFF", 4) != 0) return false;
@@ -546,12 +585,12 @@ static bool load_wav(
 	uint32_t sample_rate = 0;
 	const uint8_t* data_ptr = nullptr; uint32_t data_sz = 0;
 
-	size_t pos = 12;
-	while (pos + 8 <= (size_t)fsz)
+	uint64_t pos = 12;
+	while (pos + 8 <= fsz)
 	{
 		const uint8_t* cp = buf.data() + pos;
 		uint32_t csz = u32(cp + 4);
-		if (memcmp(cp, "fmt ", 4) == 0 && csz >= 16)
+		if (memcmp(cp, "fmt ", 4) == 0 && csz >= 16 && pos + 24 <= fsz)
 		{
 			fmt_tag = u16(cp + 8);
 			channels = u16(cp + 10);
@@ -560,19 +599,22 @@ static bool load_wav(
 		}
 		else if (memcmp(cp, "data", 4) == 0)
 		{
-			data_ptr = cp + 8; data_sz = csz;
+			data_ptr = cp + 8;
+			data_sz = static_cast<uint32_t>((std::min)(uint64_t{csz}, fsz - (pos + 8)));
 		}
-		pos += 8 + csz + (csz & 1);
+		pos += 8 + uint64_t{csz} + (csz & 1);
 	}
 
 	if (!data_ptr || !sample_rate || channels == 0) return false;
 	if (fmt_tag != 1 && fmt_tag != 3) return false; // PCM or IEEE float only
 
+	uint32_t bytes_per_sample = bps / 8;
+	uint32_t frame_stride = bytes_per_sample * channels;
+	if (frame_stride == 0) return false;
+
 	out_rate = sample_rate;
 	out_ch = (uint8_t)std::min<uint16_t>(channels, 2);
 
-	uint32_t bytes_per_sample = bps / 8;
-	uint32_t frame_stride = bytes_per_sample * channels;
 	uint32_t frames = data_sz / frame_stride;
 	out.resize((size_t)frames * out_ch);
 

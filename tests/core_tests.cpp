@@ -5,11 +5,18 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#include <winioctl.h>
+#endif
 
 namespace
 {
@@ -117,7 +124,8 @@ void append_shdr(std::vector<uint8_t>& data, const char* name, uint32_t start,
 	append_u16(data, type);
 }
 
-void write_sf2_fixture(const std::filesystem::path& path)
+// junk_size inserts an unknown top-level chunk of that size before pdta.
+bool write_sf2_fixture(const std::filesystem::path& path, uint32_t junk_size = 0)
 {
 	// Generator IDs used by this deliberately small fixture.
 	constexpr uint16_t pan = 17;
@@ -205,12 +213,46 @@ void write_sf2_fixture(const std::filesystem::path& path)
 
 	std::vector<uint8_t> riff = {'s', 'f', 'b', 'k'};
 	append_chunk(riff, "LIST", sdta);
-	append_chunk(riff, "LIST", pdta);
-	std::ofstream stream(path, std::ios::binary);
-	stream.write("RIFF", 4);
-	write_u32(stream, static_cast<uint32_t>(riff.size()));
-	stream.write(reinterpret_cast<const char*>(riff.data()),
-		static_cast<std::streamsize>(riff.size()));
+	std::vector<uint8_t> tail;
+	append_chunk(tail, "LIST", pdta);
+
+	if (junk_size == 0)
+	{
+		riff.insert(riff.end(), tail.begin(), tail.end());
+		std::ofstream stream(path, std::ios::binary);
+		stream.write("RIFF", 4);
+		write_u32(stream, static_cast<uint32_t>(riff.size()));
+		stream.write(reinterpret_cast<const char*>(riff.data()),
+			static_cast<std::streamsize>(riff.size()));
+		return true;
+	}
+
+#ifdef _WIN32
+	// A sparse unknown chunk between sdta and pdta: the file is as large as a
+	// big piano bank without writing (or occupying) that much disk space.
+	const uint64_t junk_end = 8 + riff.size() + 8 + uint64_t{junk_size} + (junk_size & 1);
+	std::vector<uint8_t> head = {'R', 'I', 'F', 'F'};
+	append_u32(head, static_cast<uint32_t>(junk_end - 8 + tail.size()));
+	head.insert(head.end(), riff.begin(), riff.end());
+	head.insert(head.end(), {'J', 'U', 'N', 'K'});
+	append_u32(head, junk_size);
+
+	const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE)
+		return false;
+	DWORD written = 0;
+	LARGE_INTEGER tail_offset{};
+	tail_offset.QuadPart = static_cast<LONGLONG>(junk_end);
+	const bool ok = DeviceIoControl(file, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &written, nullptr) &&
+		WriteFile(file, head.data(), static_cast<DWORD>(head.size()), &written, nullptr) &&
+		SetFilePointerEx(file, tail_offset, nullptr, FILE_BEGIN) &&
+		WriteFile(file, tail.data(), static_cast<DWORD>(tail.size()), &written, nullptr);
+	CloseHandle(file);
+	return ok;
+#else
+	return false;
+#endif
 }
 
 void write_pcm16_wav(const std::filesystem::path& path, const std::vector<int16_t>& pcm,
@@ -974,6 +1016,35 @@ void test_sf2_preset_loader(const std::filesystem::path& directory)
 	check(a == b, "selected-preset SF2 renders are deterministic across block sizes");
 }
 
+// Piano banks above 2 GiB failed with "vector too long": the file was sized
+// through ftell, whose long is 32 bits on Windows.
+void test_sf2_beyond_2gib(const std::filesystem::path& directory)
+{
+	std::filesystem::create_directories(directory);
+	const auto sf2_path = directory / "beyond-2gib.sf2";
+	if (!write_sf2_fixture(sf2_path, 0x88000000u))
+	{
+		std::filesystem::remove(sf2_path);
+		std::cout << "SKIP: sparse files are unavailable for the >2 GiB SF2 test\n";
+		return;
+	}
+	check(std::filesystem::file_size(sf2_path) > 0x80000000ull, "fixture exceeds 2 GiB");
+	safsyn::Soundfont bank;
+	try
+	{
+		check(safsyn::load_sf2(sf2_path.string().c_str(), bank), "SF2 larger than 2 GiB loads");
+	}
+	catch (const std::exception& error)
+	{
+		std::cerr << "load_sf2 threw: " << error.what() << '\n';
+		check(false, "SF2 larger than 2 GiB loads without throwing");
+	}
+	check(bank.presets.size() == 2 && bank.regions.size() == 3 && bank.pcm_pool.size() == 16 &&
+		bank.pcm_pool.front() == 1000 && bank.pcm_pool.back() == 12000,
+		"SF2 beyond 2 GiB keeps its presets, regions, and samples");
+	std::filesystem::remove(sf2_path);
+}
+
 void test_sfz_loader(const std::filesystem::path& directory)
 {
 	std::filesystem::create_directories(directory);
@@ -1061,6 +1132,7 @@ int main(int argc, char** argv)
 	test_voice_stealing_and_midi_messages();
 	test_channel_preset_selection_and_stress_mode();
 	test_sf2_preset_loader(test_directory);
+	test_sf2_beyond_2gib(test_directory);
 	test_sfz_loader(test_directory);
 	test_float_wav(test_directory);
 	if (failures != 0)
