@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -191,6 +192,107 @@ public:
 			}
 		return true;
 	}
+};
+
+// Places timed live events on the output stream. After every read the audio
+// consumer reports how far the stream has played, as consumed frames minus
+// steady-clock seconds times the rate. A late read only lowers that offset, so
+// the producer follows the largest recent one, at a limited rate so that read
+// jitter does not move events. An event due at time t plays at the stream
+// frame of t plus a fixed delay, which covers everything the producer may
+// already have rendered ahead, plus a margin. An event that lands before the
+// next frame to render plays at once and widens the margin by its lateness.
+// After half a second without late events the margin shrinks back slowly,
+// which compresses event spacing by well under one percent.
+class LiveTimeline
+{
+	double rate_;
+	double delay_;
+	double minimum_margin_;
+	double maximum_margin_;
+	double margin_;
+	double previous_ = -std::numeric_limits<double>::infinity();
+	double current_ = -std::numeric_limits<double>::infinity();
+	double estimate_ = 0.0;
+	double bucket_start_ = 0.0;
+	double observed_at_ = 0.0;
+	bool clocked_ = false;
+	uint64_t last_ = 0;
+	uint64_t quiet_ = 0;
+	uint64_t late_ = 0;
+public:
+	static constexpr double bucket_seconds = 0.5;
+	// Fastest the estimate follows the reports, as a share of elapsed time.
+	// Clock drift between the device and the steady clock is far smaller.
+	static constexpr double slew = 0.005;
+
+	LiveTimeline(double sample_rate, double delay_frames, double minimum_margin,
+		double maximum_margin) noexcept : rate_(sample_rate), delay_(delay_frames),
+		minimum_margin_(minimum_margin), maximum_margin_(maximum_margin),
+		margin_(minimum_margin) {}
+
+	// Consumer report taken at `now_seconds`. A reset (the stream stalled)
+	// drops the history, which assumed the stream kept playing.
+	void observe(double offset, double now_seconds, bool reset) noexcept
+	{
+		if (!clocked_ || reset)
+		{
+			previous_ = -std::numeric_limits<double>::infinity();
+			current_ = offset;
+			estimate_ = offset;
+			bucket_start_ = now_seconds;
+			observed_at_ = now_seconds;
+			clocked_ = true;
+			return;
+		}
+		if (now_seconds - bucket_start_ >= bucket_seconds)
+		{
+			previous_ = current_;
+			current_ = offset;
+			bucket_start_ = now_seconds;
+		}
+		else current_ = (std::max)(current_, offset);
+		const double step = slew * (now_seconds - observed_at_) * rate_;
+		estimate_ += std::clamp((std::max)(previous_, current_) - estimate_, -step, step);
+		observed_at_ = now_seconds;
+	}
+	// Frame for an event due at `due_seconds`: never before `cursor`, the next
+	// frame to render, nor before an earlier event. With no report yet, the
+	// event plays at once.
+	uint64_t place(double due_seconds, uint64_t cursor) noexcept
+	{
+		const double next = static_cast<double>(cursor);
+		double target = next;
+		if (clocked_)
+		{
+			target = estimate_ + due_seconds * rate_ + delay_ + margin_;
+			const double lateness = next - target;
+			if (lateness > 0.0)
+			{
+				// Lateness beyond the largest margin is a stalled sender, not jitter
+				// worth delaying everything for.
+				if (lateness <= maximum_margin_)
+					margin_ = (std::min)(maximum_margin_, margin_ + lateness);
+				++late_;
+				quiet_ = 0;
+			}
+			target = (std::min)(target, next + delay_ + maximum_margin_);
+		}
+		const uint64_t frame = (std::max)(target > next ? static_cast<uint64_t>(target) : cursor, last_);
+		last_ = frame;
+		return frame;
+	}
+	// The producer rendered `frames` more frames.
+	void advance(uint64_t frames) noexcept
+	{
+		quiet_ += frames;
+		if (quiet_ > rate_ * bucket_seconds && margin_ > minimum_margin_)
+			margin_ = (std::max)(minimum_margin_, margin_ - static_cast<double>(frames) / 256.0);
+	}
+	// After a reset, new events are not ordered after discarded ones.
+	void restart() noexcept { last_ = 0; }
+	uint64_t late() const noexcept { return late_; }
+	double margin_frames() const noexcept { return margin_; }
 };
 
 } // namespace safsyn::detail

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -28,6 +29,7 @@ PlaybackOptions validated(PlaybackOptions options)
 		options.render_threads > 64 || options.midi_queue_capacity < 2 ||
 		options.midi_queue_capacity > 4194304 || options.initial_bank > 16383 ||
 		options.initial_program > 127 || options.maximum_tail_seconds > 60 ||
+		options.live_event_grid_frames > options.block_frames ||
 		static_cast<unsigned>(options.phase.mode) > static_cast<unsigned>(PhaseMode::Analytic) ||
 		!mastering_settings_valid(options.mastering))
 		throw std::invalid_argument("invalid live playback options");
@@ -56,6 +58,7 @@ struct BufferedSynth::Impl
 		uint32_t message;
 		bool master;
 		std::optional<uint64_t> tick;
+		MidiClock::time_point due;
 	};
 	std::shared_ptr<const Soundfont> bank;
 	std::shared_ptr<const SmfFile> midi;
@@ -71,6 +74,17 @@ struct BufferedSynth::Impl
 	std::mutex wait_mutex;
 	std::condition_variable wake;
 	bool started = false;
+	// The consumer's latest stream position for live event timing: consumed
+	// frames minus seconds since `epoch` times the rate. Resets count reads
+	// that came up short, after which the stream is no longer where it was.
+	const MidiClock::time_point epoch = MidiClock::now();
+	std::atomic<double> audio_clock{0.0};
+	std::atomic<uint64_t> audio_clock_reports{0}, audio_clock_resets{0};
+
+	double seconds_since_epoch(MidiClock::time_point time) const noexcept
+	{
+		return std::chrono::duration<double>(time - epoch).count();
+	}
 
 	Impl(std::shared_ptr<const Soundfont> source, const PlaybackOptions& settings,
 		std::shared_ptr<const SmfFile> file) : bank(std::move(source)), midi(std::move(file)),
@@ -156,6 +170,105 @@ struct BufferedSynth::Impl
 			ScheduledSmfEvent next;
 			bool has_event = false, tail = false;
 			uint64_t cursor = 0, tail_end = 0, applied_generation = generation.load();
+
+			// Live events wait here, in queue order, for the frame they play at.
+			struct PendingEvent
+			{
+				uint64_t frame;
+				std::optional<uint64_t> tick;
+				uint32_t message;
+				bool master;
+			};
+			std::deque<PendingEvent> pending;
+			const bool timed = options.live_event_grid_frames != 0;
+			// The producer can be ahead of the consumer by the whole ring plus
+			// the limiter lookahead, so that is the fixed part of the delay.
+			detail::LiveTimeline timeline(options.sample_rate,
+				static_cast<double>(audio.capacity() + mastering.stats().lookahead_frames),
+				options.block_frames, static_cast<double>(audio.capacity()));
+			// Every distinct event frame splits rendering, and each render call
+			// visits every active cohort. The grid that events are rounded down to
+			// therefore coarsens while the producer is busy, towards one render
+			// call per block, and refines once it has been idle for a while.
+			uint32_t grid = options.live_event_grid_frames;
+			double load_average = 0.0;
+			uint64_t grid_held_frames = 0;
+			auto grid_frame = [&](uint64_t frame) {
+				return timed ? frame - frame % grid : frame;
+			};
+			uint64_t clock_resets = 0;
+			auto sync_generation = [&] {
+				const auto requested = generation.load(std::memory_order_acquire);
+				if (requested == applied_generation)
+					return;
+				engine.reset(); defaults(engine);
+				mastering = StereoMasteringProcessor(options.sample_rate, options.mastering);
+				applied_generation = requested;
+				gate.clear();
+				pending.clear();
+				timeline.restart();
+				++current.midi_recoveries;
+			};
+			// Moves queued live events into `pending`, each placed on the stream.
+			// The pending bound turns a sender that outruns dispatch back into
+			// queue backpressure.
+			const size_t pending_limit = options.midi_queue_capacity * 8;
+			auto drain_live = [&] {
+				sync_generation();
+				if (timed && audio_clock_reports.load(std::memory_order_acquire) != 0)
+				{
+					const uint64_t resets = audio_clock_resets.load(std::memory_order_acquire);
+					timeline.observe(audio_clock.load(std::memory_order_acquire),
+						seconds_since_epoch(MidiClock::now()), resets != clock_resets);
+					clock_resets = resets;
+				}
+				MidiEvent event{};
+				while (pending.size() < pending_limit && !stopping.load() && events.pop(event))
+				{
+					if (event.generation != applied_generation)
+					{
+						// Older generations were cancelled. A newer one was requested
+						// after this producer last looked.
+						if (event.generation < applied_generation)
+							continue;
+						sync_generation();
+						if (event.generation != applied_generation)
+							continue;
+					}
+					const uint64_t frame = timed
+						? timeline.place(seconds_since_epoch(event.due), cursor) : cursor;
+					pending.push_back({frame, event.tick, event.message, event.master});
+				}
+			};
+			// Bound dispatch per block so a runaway live sender cannot starve
+			// audio forever; the rest plays from the next block on.
+			constexpr size_t live_dispatch_limit = 65536;
+			auto dispatch_live = [&](size_t& dispatched) {
+				size_t count = 0;
+				while (!pending.empty() && grid_frame(pending.front().frame) <= cursor &&
+					dispatched < live_dispatch_limit && !stopping.load())
+				{
+					const PendingEvent& event = pending.front();
+					if (event.tick != batch_tick)
+					{
+						dispatch(count);
+						batch_tick = event.tick;
+					}
+					if (event.master)
+					{
+						dispatch(count);
+						engine.set_master_volume(static_cast<uint16_t>(event.message));
+					}
+					else if (!options.shed_notes || gate.admit(event.message))
+						batch[count++] = event.message;
+					if (count == batch.size())
+						dispatch(count);
+					++current.scheduled_events;
+					++dispatched;
+					pending.pop_front();
+				}
+				dispatch(count);
+			};
 			if (midi) { stream.emplace(*midi, options.sample_rate); has_event = stream->next(next); }
 			auto check_stream = [&] {
 				if (stream && !stream->good())
@@ -186,15 +299,6 @@ struct BufferedSynth::Impl
 				const auto started_at = std::chrono::steady_clock::now();
 				if (!midi)
 				{
-					const auto requested = generation.load(std::memory_order_acquire);
-					if (requested != applied_generation)
-					{
-						engine.reset(); defaults(engine);
-						mastering = StereoMasteringProcessor(options.sample_rate, options.mastering);
-						applied_generation = requested;
-						gate.clear();
-						++current.midi_recoveries;
-					}
 					// The upper half of the ring absorbs bursts without loss. Below it
 					// the producer is behind, and shedding rises until the ring is
 					// nearly empty. Initial buffering is not a deficit.
@@ -204,35 +308,14 @@ struct BufferedSynth::Impl
 						gate.set_pressure(static_cast<float>(
 							(shed_start_fill - fill) / (shed_start_fill - shed_full_fill)));
 					}
-					// Bound dispatch per block so a runaway live producer cannot starve
-					// audio forever. File bursts use the separate exact scheduler below.
-					size_t count = 0;
-					MidiEvent event{};
-					for (size_t i = 0; i < 65536 && !stopping.load() && events.pop(event); ++i)
-					{
-						if (event.generation != applied_generation) continue;
-						if (event.tick != batch_tick)
-						{
-							dispatch(count);
-							batch_tick = event.tick;
-						}
-						if (event.master)
-						{
-							dispatch(count);
-							engine.set_master_volume(static_cast<uint16_t>(event.message));
-						}
-						else if (!options.shed_notes || gate.admit(event.message))
-							batch[count++] = event.message;
-						if (count == batch.size())
-							dispatch(count);
-						++current.scheduled_events;
-					}
-					dispatch(count);
-					current.shed_notes = gate.shed_notes();
+					drain_live();
 				}
+				size_t live_dispatched = 0;
 				uint32_t frames = 0;
 				while (frames < options.block_frames && !stopping.load())
 				{
+					if (!midi)
+						dispatch_live(live_dispatched);
 					if (midi && has_event && next.sample <= cursor)
 					{
 						size_t count = 0;
@@ -271,9 +354,19 @@ struct BufferedSynth::Impl
 					if (tail && (cursor >= tail_end || engine.active_voice_count() == 0)) break;
 					uint32_t count = options.block_frames - frames;
 					if (has_event) count = static_cast<uint32_t>((std::min)(uint64_t{count}, next.sample - cursor));
+					if (!pending.empty() && grid_frame(pending.front().frame) > cursor)
+						count = static_cast<uint32_t>((std::min)(uint64_t{count},
+							grid_frame(pending.front().frame) - cursor));
 					if (tail) count = static_cast<uint32_t>((std::min)(uint64_t{count}, tail_end - cursor));
 					engine.render_audio(block.data() + frames * 2, count);
 					frames += count; cursor += count;
+				}
+				if (!midi)
+				{
+					timeline.advance(frames);
+					current.shed_notes = gate.shed_notes();
+					current.late_midi_events = timeline.late();
+					current.live_margin_ms = timeline.margin_frames() * 1000.0 / options.sample_rate;
 				}
 				for (size_t i = 0; i < frames * 2; ++i)
 					current.raw_peak = (std::max)(current.raw_peak, std::abs(block[i]));
@@ -286,6 +379,28 @@ struct BufferedSynth::Impl
 				current.active_cohorts = engine.active_cohort_count();
 				if (frames) current.render_load = std::chrono::duration<double>(
 					std::chrono::steady_clock::now() - started_at).count() * options.sample_rate / frames;
+				if (timed && frames)
+				{
+					// Falling behind real time goes straight to block-start dispatch;
+					// otherwise the grid doubles or halves one step at a time.
+					load_average += (current.render_load - load_average) / 8.0;
+					grid_held_frames += frames;
+					const uint32_t finest = options.live_event_grid_frames;
+					const uint32_t coarsest = options.block_frames;
+					uint32_t wanted = grid;
+					if (load_average > 0.5 && current.render_load > 1.0)
+						wanted = coarsest;
+					else if (load_average > 0.5 && grid_held_frames >= uint64_t{coarsest} * 2)
+						wanted = (std::min)(grid * 2, coarsest);
+					else if (load_average < 0.25 && grid_held_frames >= options.sample_rate / 10)
+						wanted = (std::max)(grid / 2, finest);
+					if (wanted != grid)
+					{
+						grid = wanted;
+						grid_held_frames = 0;
+					}
+					current.live_grid_frames = grid;
+				}
 				publish(current);
 				if (!output.empty() && !push_audio(output.data(), static_cast<uint32_t>(output.size() / 2))) break;
 				if (tail && (cursor >= tail_end || engine.active_voice_count() == 0))
@@ -304,10 +419,12 @@ struct BufferedSynth::Impl
 		ready.store(true, std::memory_order_release);
 	}
 	MidiEnqueueResult try_enqueue(uint32_t message, bool master,
-		std::optional<uint64_t> tick = {}) noexcept
+		std::optional<uint64_t> tick = {},
+		std::optional<MidiClock::time_point> due = {}) noexcept
 	{
 		if (midi || stopping.load() || finished.load()) return MidiEnqueueResult::Unavailable;
-		return events.push({generation.load(std::memory_order_acquire), message, master, tick})
+		return events.push({generation.load(std::memory_order_acquire), message, master, tick,
+			due.value_or(MidiClock::now())})
 			? MidiEnqueueResult::Queued : MidiEnqueueResult::Full;
 	}
 	bool enqueue(uint32_t message, bool master) noexcept
@@ -337,8 +454,8 @@ void BufferedSynth::request_stop() noexcept
 void BufferedSynth::stop() noexcept { request_stop(); if (impl_->producer.joinable()) impl_->producer.join(); }
 bool BufferedSynth::enqueue_short_message(uint32_t message) noexcept { return impl_->enqueue(message, false); }
 MidiEnqueueResult BufferedSynth::try_enqueue_short_message(uint32_t message,
-	std::optional<uint64_t> tick) noexcept
-{ return impl_->try_enqueue(message, false, tick); }
+	std::optional<uint64_t> tick, std::optional<MidiClock::time_point> due) noexcept
+{ return impl_->try_enqueue(message, false, tick, due); }
 bool BufferedSynth::enqueue_master_volume(uint16_t value) noexcept { return impl_->enqueue(value & 16383, true); }
 void BufferedSynth::panic() noexcept { impl_->generation.fetch_add(1, std::memory_order_release); }
 void BufferedSynth::report_input_loss() noexcept { impl_->rejected.fetch_add(1); panic(); }
@@ -346,12 +463,17 @@ uint32_t BufferedSynth::read_audio(float* stereo, uint32_t frames) noexcept
 {
 	if (!ready()) { std::fill_n(stereo, size_t{frames} * 2, 0.0f); return 0; }
 	const auto count = static_cast<uint32_t>(impl_->audio.read(stereo, frames));
-	impl_->consumed.fetch_add(count, std::memory_order_relaxed);
-	if (count < frames && !finished())
+	const uint64_t consumed = impl_->consumed.fetch_add(count, std::memory_order_relaxed) + count;
+	const bool short_read = count < frames && !finished();
+	if (short_read)
 	{
 		impl_->underruns.fetch_add(1, std::memory_order_relaxed);
 		impl_->missing.fetch_add(frames - count, std::memory_order_relaxed);
+		impl_->audio_clock_resets.fetch_add(1, std::memory_order_relaxed);
 	}
+	impl_->audio_clock.store(static_cast<double>(consumed) - impl_->options.sample_rate *
+		impl_->seconds_since_epoch(MidiClock::now()), std::memory_order_relaxed);
+	impl_->audio_clock_reports.fetch_add(1, std::memory_order_release);
 	return count;
 }
 bool BufferedSynth::ready() const noexcept { return impl_->ready.load(std::memory_order_acquire); }

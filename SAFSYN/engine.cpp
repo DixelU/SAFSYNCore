@@ -291,14 +291,18 @@ void SynthEngine::begin_envelope(Voice& voice) noexcept
 	}
 }
 
-void SynthEngine::begin_release(Voice& voice, float seconds_override) noexcept
+// A note-off during the attack lets the attack reach full level before the
+// release starts, as BASSMIDI does; chokes do not. Matches the cohort engine.
+void SynthEngine::begin_release(Voice& voice, float seconds_override,
+	bool finish_attack) noexcept
 {
 	if (!voice.active() || voice.stage == Voice::Stage::Release)
 		return;
 	const float seconds = seconds_override >= 0.0f
 		? seconds_override : release_seconds(*voice.region, voice.channel);
 	voice.note_off_pending = false;
-	if (seconds <= 0.0f || voice.env <= 0.0f)
+	const bool attacking = finish_attack && voice.stage == Voice::Stage::Attack;
+	if (seconds <= 0.0f || (voice.env <= 0.0f && !attacking))
 	{
 		voice = Voice{};
 		return;
@@ -306,6 +310,7 @@ void SynthEngine::begin_release(Voice& voice, float seconds_override) noexcept
 	voice.stage = Voice::Stage::Release;
 	voice.release_coefficient = release_coefficient(seconds);
 	voice.release_override = seconds_override >= 0.0f;
+	voice.finish_attack = attacking;
 }
 
 float SynthEngine::release_seconds(const SampleRegion& region, uint8_t channel) const noexcept
@@ -426,6 +431,17 @@ float SynthEngine::advance_envelope(Voice& voice) noexcept
 		voice.env = voice.region->sustain;
 		break;
 	case Voice::Stage::Release:
+		if (voice.finish_attack)
+		{
+			// The same steps the attack would have taken, then the release.
+			voice.env += voice.env_inc;
+			if (voice.env >= 1.0f)
+			{
+				voice.env = 1.0f;
+				voice.finish_attack = false;
+			}
+			break;
+		}
 		voice.env *= voice.release_coefficient;
 		if (voice.env <= 1.0e-5f)
 		{
@@ -547,7 +563,7 @@ void SynthEngine::note_off(uint8_t channel, uint8_t note) noexcept
 		if (channels_[channel].sustain_pedal)
 			voice.note_off_pending = true;
 		else
-			begin_release(voice);
+			begin_release(voice, -1.0f, true);
 	}
 }
 
@@ -617,7 +633,7 @@ void SynthEngine::all_notes_off(uint8_t channel) noexcept
 			if (channels_[channel].sustain_pedal)
 				voice.note_off_pending = true;
 			else
-				begin_release(voice);
+				begin_release(voice, -1.0f, true);
 		}
 }
 
@@ -693,7 +709,7 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 			else
 				for (auto& voice : voices_)
 					if (voice.active() && voice.channel == channel && voice.note_off_pending)
-						begin_release(voice);
+						begin_release(voice, -1.0f, true);
 		}
 		break;
 	}
@@ -748,7 +764,7 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 			else
 				for (auto& voice : voices_)
 					if (voice.active() && voice.channel == channel && voice.note_off_pending)
-						begin_release(voice);
+						begin_release(voice, -1.0f, true);
 		}
 		update_channel_voice_gains(channel);
 		update_channel_filters(channel);

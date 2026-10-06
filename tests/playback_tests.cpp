@@ -2,6 +2,7 @@
 #include "playback_queue.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -327,7 +328,9 @@ void shedding_test()
 	// the whole ring then starts its next block with nothing buffered.
 	for (const bool shed : {false, true})
 	{
-		auto config = options(); config.shed_notes = shed;
+		// Block-start dispatch: the test steps the ring by hand, and timed events
+		// would wait for a consumer that keeps reading.
+		auto config = options(); config.shed_notes = shed; config.live_event_grid_frames = 0;
 		safsyn::BufferedSynth synth(bank(), config);
 		synth.start(); await([&] { return synth.ready() && synth.stats().buffered_frames == 256; });
 		for (uint32_t note = 40; note < 48; ++note)
@@ -352,6 +355,104 @@ void shedding_test()
 			"a recovered producer must play new notes and keep the burst silent");
 		synth.stop();
 	}
+}
+void live_timeline_test()
+{
+	// 1000 Hz, a 100-frame fixed delay, margins of 10 to 50 frames.
+	safsyn::detail::LiveTimeline timeline(1000.0, 100.0, 10.0, 50.0);
+	check(timeline.place(5.0, 7) == 7, "without a stream report an event must play at once");
+	timeline.restart();
+	timeline.observe(1000.0, 1.0, false);
+	// Stream frame 1000 + 1062.5, delay 100, margin 10.
+	check(timeline.place(1.0625, 2100) == 2172, "due time did not map to stream frame plus delay");
+	check(timeline.place(1089.0 / 1024.0, 2100) == 2173, "frames must round down");
+	check(timeline.place(1.0, 2100) == 2173, "an earlier due time reordered queued events");
+	timeline.restart();
+	timeline.observe(995.0, 1.0078125, false);
+	check(timeline.place(1.0625, 2100) == 2172, "a late read moved the stream earlier");
+
+	timeline.restart();
+	check(timeline.place(0.875, 2010) == 2010 && timeline.late() == 1 && timeline.margin_frames() == 35.0,
+		"a late event must play at once and widen the margin by its lateness");
+	timeline.restart();
+	check(timeline.place(1.0625, 2100) == 2197, "later events lost the wider margin");
+	timeline.restart();
+	check(timeline.place(0.0, 5000) == 5000 && timeline.late() == 2 && timeline.margin_frames() == 35.0,
+		"a stalled sender widened the margin");
+	timeline.advance(500);
+	check(timeline.margin_frames() == 35.0, "the margin shrank within half a second of a late event");
+	timeline.advance(256);
+	check(timeline.margin_frames() == 34.0, "the margin must shrink by 1/256 of rendered frames");
+	timeline.advance(100000);
+	check(timeline.margin_frames() == 10.0, "the margin shrank below its minimum");
+
+	timeline.restart();
+	check(timeline.place(100.0, 2000) == 2150, "a far-future due time was not bounded");
+
+	// An earlier read moves the stream only at 0.5% of elapsed time.
+	timeline.observe(1010.0, 1.015625, false);
+	timeline.restart();
+	check(timeline.place(1.0625, 2100) == 2172, "one early read made the stream jump");
+	timeline.observe(1010.0, 1.4, false);
+	timeline.restart();
+	check(timeline.place(1.0625, 2100) == 2174, "the stream estimate did not follow at the slew rate");
+
+	timeline.restart();
+	timeline.observe(900.0, 1.5, true);
+	check(timeline.place(1.0625, 2000) == 2072, "a stalled stream did not replace older reports");
+	timeline.observe(890.0, 2.125, false);
+	timeline.restart();
+	check(timeline.place(1.0625, 2000) == 2072, "the previous half second must still count");
+	timeline.observe(880.0, 2.75, false);
+	timeline.restart();
+	check(timeline.place(1.0625, 2000) == 2069, "reports older than a second must fade out");
+}
+void timed_live_test()
+{
+	// Events queued together keep their due-time spacing inside a block: two
+	// notes 5 ms apart start 240 frames apart, and a 1 ms note still sounds.
+	auto config = options();
+	config.block_frames = 256; config.buffer_frames = 2048;
+	safsyn::BufferedSynth synth(bank(), config);
+	synth.start(); await([&] { return synth.ready(); });
+	std::vector<float> output;
+	std::atomic<bool> done{false};
+	std::thread consumer([&] {
+		std::array<float, 960> part{};
+		const auto started = safsyn::MidiClock::now();
+		for (int period = 1; !done.load(); ++period)
+		{
+			while (safsyn::MidiClock::now() < started + std::chrono::milliseconds(10) * period)
+				std::this_thread::yield();
+			synth.read_audio(part.data(), 480);
+			output.insert(output.end(), part.begin(), part.end());
+		}
+	});
+	std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	using std::chrono::milliseconds;
+	const auto due = safsyn::MidiClock::now() + milliseconds(50);
+	using Result = safsyn::MidiEnqueueResult;
+	check(synth.try_enqueue_short_message(0x00643c90, {}, due) == Result::Queued &&
+		synth.try_enqueue_short_message(0x00003c80, {}, due + milliseconds(1)) == Result::Queued &&
+		synth.try_enqueue_short_message(0x00643e90, {}, due + milliseconds(5)) == Result::Queued &&
+		synth.try_enqueue_short_message(0x00003e80, {}, due + milliseconds(6)) == Result::Queued,
+		"timed notes rejected");
+	std::this_thread::sleep_for(milliseconds(300));
+	done.store(true);
+	consumer.join();
+	synth.stop();
+	check(synth.stats().late_midi_events == 0, "events due in the future arrived late");
+	std::vector<size_t> onsets;
+	size_t silent = 48;
+	for (size_t frame = 0; frame < output.size() / 2; ++frame)
+	{
+		if (output[frame * 2] == 0.0f) { ++silent; continue; }
+		if (silent >= 48) onsets.push_back(frame);
+		silent = 0;
+	}
+	check(onsets.size() == 2, "both timed notes must sound, separately");
+	const size_t gap = onsets[1] - onsets[0];
+	check(gap >= 236 && gap <= 244, "timed notes lost their spacing within the block");
 }
 void file_sender_backpressure_test()
 {
@@ -474,6 +575,7 @@ int main()
 		file_sender_backpressure_test(); phase_preparation_test();
 		note_gate_test(); shedding_test();
 		analytic_tick_queue_test();
+		live_timeline_test(); timed_live_test();
 		std::cout << "Playback: concurrent queues, sample timing, dense bursts, workers, overflow, underruns, limiter, lifecycle passed\n";
 		return 0;
 	}

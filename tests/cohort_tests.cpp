@@ -269,6 +269,44 @@ void test_lifecycle_split_and_controls()
 		"individual note-offs split release cohorts from sustaining multiplicity");
 }
 
+// A note-off during the attack lets the attack finish before the release, as
+// BASSMIDI does. Live dispatch can deliver a short note's on and off on the
+// same frame, and such a note must still sound.
+void test_note_off_during_attack()
+{
+	auto bank = make_bank(4000, false, 0.01f, 0.02f);
+	auto peak = [](const std::vector<float>& audio) {
+		float result = 0.0f;
+		for (const float sample : audio) result = (std::max)(result, std::abs(sample));
+		return result;
+	};
+	safsyn::SynthEngine held(4000, 4);
+	held.set_soundfont(&bank);
+	held.note_on(0, 60, 100);
+	const float full = peak(render(held, 200));
+	for (const uint32_t length : {0u, 1u, 20u})
+	{
+		safsyn::SynthEngine reference(4000, 4), cohorts(4000, 4);
+		configure_pair(reference, cohorts, bank);
+		auto play = [length](safsyn::SynthEngine& engine) {
+			engine.note_on(0, 60, 100);
+			auto audio = render(engine, length);
+			engine.note_off(0, 60);
+			const auto rest = render(engine, 200 - length);
+			audio.insert(audio.end(), rest.begin(), rest.end());
+			return audio;
+		};
+		const auto expected = play(reference);
+		const auto actual = play(cohorts);
+		check(close_audio(expected, actual),
+			"a note released during its attack matches across voice models");
+		check(peak(expected) > 0.95f * full && peak(actual) > 0.95f * full,
+			"a note released during its attack still reaches full level");
+		check(reference.active_voice_count() == 0 && cohorts.active_voice_count() == 0,
+			"a note released during its attack ends after its release");
+	}
+}
+
 void test_controller_contract_equivalence()
 {
 	auto bank = make_bank(2000, true, 0.0f, 0.004f);
@@ -891,6 +929,7 @@ int main()
 	test_coherent_and_phase_duplicates();
 	test_singleton_bit_exact_modes();
 	test_lifecycle_split_and_controls();
+	test_note_off_during_attack();
 	test_controller_contract_equivalence();
 	test_filtered_phase_splits();
 	test_linked_stereo_and_one_shot();

@@ -144,12 +144,49 @@ If index preparation runs out of memory, the reference scan remains available.
 
 SMF events retain their exact integer sample positions. Same-sample bursts are
 dispatched in fixed-size batches without dropping events or expanding the live
-queue. Cancellation is checked within those bursts. Live short messages are
-ordered at enqueue time and applied at render-block boundaries; incoming WinMM
-millisecond timestamps are not used for sample-accurate live scheduling. The
-live producer dispatches at most 65,536 queued events before producing another
-block, so extreme external bursts can acquire additional latency. Use direct
-file mode for reliable black MIDI scheduling.
+queue. Cancellation is checked within those bursts.
+
+Live short messages are timed, not applied at block starts. Each carries a due
+time: the one a file sender passes to `try_enqueue_short_message`, or its
+arrival otherwise. After every read the audio consumer reports how far the
+stream has played against the steady clock. The producer maps a due time to
+the stream frame of that moment, plus a fixed delay (the ring plus the limiter
+lookahead, everything it may already have rendered ahead) and an adaptive
+margin, and splits rendering there. Events queued together therefore keep
+their spacing within a block, so a sender that wakes late, or a device that
+reads in 10 ms bursts, no longer stacks short notes onto one frame. A
+chopped-note pattern (8 keys, 3.9 ms notes) played live through a SAFC-style
+sender matched the sample-exact file render within -78 dB. The previous
+block-start dispatch was 6 dB louder in error than in signal.
+
+- The stream estimate follows the largest recent report, because a late read
+  only makes the stream look earlier. It moves at most 0.5% of elapsed time,
+  so read jitter does not move events. A short read (underrun) replaces it at
+  once.
+- An event that would land before the next frame to render plays at once and
+  widens the margin by its lateness, up to the ring size. Lateness beyond that
+  is a stalled sender and plays at once without widening. After half a second
+  without late events the margin shrinks by 1/256 of the frames rendered.
+  `PlaybackStats::late_midi_events` and `live_margin_ms` report both.
+- Every distinct event frame costs a render call over all active cohorts, so
+  `PlaybackOptions::live_event_grid_frames` (default 1, exact) is the finest
+  grid that event frames are rounded down to. The producer doubles the grid
+  while its average render load is above 0.5, jumps to the block size when it
+  also falls behind real time, and halves it again after 100 ms below 0.25.
+  Overloaded passages therefore cost what block-start dispatch cost:
+  `Hypernova.mid` at 95-125 s underran for 17.3 s against 17.7 s.
+  `PlaybackStats::live_grid_frames` reports the current grid. 0 restores
+  block-start dispatch.
+- Live events are moved from the queue into the producer's own pending list
+  at every block, so a long delay does not fill the queue. The list is bounded
+  at eight times the queue capacity; beyond that the queue reports `Full` again.
+  At most 65,536 events are dispatched per block. Extreme bursts beyond that
+  play from the next block on.
+- A live session raises the Windows timer resolution to 1 ms, as MIDI drivers
+  such as OmniMIDI do. At the default 15.6 ms tick, producer wake-ups and any
+  sleep-paced host sender run in 15.6 ms bursts.
+
+Use direct file mode for the most reliable black MIDI scheduling.
 
 ## Overload and output protection
 
@@ -157,8 +194,9 @@ file mode for reliable black MIDI scheduling.
   policy applies and is reported. Zero/unbounded is intentionally rejected for
   this host. More threads cannot make arbitrary polyphony affordable.
 - GUI render-ahead buffer: 100 ms; console default: 4096 frames (85.3 ms at
-  48 kHz). Total live latency also includes up to one block, limiter lookahead
-  (5 ms), the device buffer, and Windows processing. For live playing, try
+  48 kHz). Total live latency also includes the limiter lookahead (5 ms), the
+  live timing margin (one block, more after late events), the device buffer,
+  and Windows processing. For live playing, try
   20-40 ms if the machine can sustain it. At least two render blocks must fit.
 - A short ring read produces silence, increments underrun/frame counters, and
   resumes the remaining music later. File events are not skipped to catch up
@@ -198,9 +236,9 @@ file mode for reliable black MIDI scheduling.
 
 Hosts that schedule file events themselves can use
 `BufferedSynth::try_enqueue_short_message` or
-`WindowsSynth::try_send_short_message`. `Full` leaves the queue, controller
-state, and held voices intact; the host retains and retries that same event
-before advancing to the next one. `Unavailable` ends retries when the session
+`WindowsSynth::try_send_short_message`, passing each event's due time.
+`Full` leaves the queue, controller state, and held voices intact; the host
+retains and retries that same event before advancing to the next one. `Unavailable` ends retries when the session
 has stopped or uses the direct SMF scheduler. Capacity waits belong on the
 host's sender thread, with cancellation checks, never on an audio callback.
 The existing nonblocking live-input methods still report lost input and request

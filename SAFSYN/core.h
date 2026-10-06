@@ -212,6 +212,8 @@ private:
 		float env_inc = 0.0f;
 		float release_coefficient = 0.0f;
 		bool release_override = false;
+		// Released during its attack: the attack still runs to full level first.
+		bool finish_attack = false;
 		uint32_t hold_samples_left = 0;
 		float gain_l = 0.0f;
 		float gain_r = 0.0f;
@@ -265,7 +267,8 @@ private:
 		uint8_t channel) const noexcept;
 	void update_channel_filters(uint8_t channel) noexcept;
 	void update_channel_releases(uint8_t channel) noexcept;
-	void begin_release(Voice& voice, float seconds_override = -1.0f) noexcept;
+	void begin_release(Voice& voice, float seconds_override = -1.0f,
+		bool finish_attack = false) noexcept;
 	void begin_envelope(Voice& voice) noexcept;
 	float advance_envelope(Voice& voice) noexcept;
 	void update_channel_voice_gains(uint8_t channel) noexcept;

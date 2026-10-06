@@ -313,6 +313,8 @@ struct RenderCohort
 	float env_inc = 0.0f;
 	float release_coefficient = 0.0f;
 	bool release_override = false;
+	// Released during its attack: the attack still runs to full level first.
+	bool finish_attack = false;
 	uint32_t hold_samples_left = 0;
 	float gain_l = 0.0f;
 	float gain_r = 0.0f;
@@ -946,17 +948,23 @@ struct CohortEngineState
 		}
 	}
 
+	// A note-off during the attack lets the attack reach full level before the
+	// release starts, as BASSMIDI does. Otherwise a note shorter than its attack
+	// comes out quiet, and one released on its first frame is silent. Chokes and
+	// steals do not finish the attack.
 	bool begin_release(SynthEngine& owner, RenderCohort& cohort,
-		float seconds_override = -1.0f) noexcept
+		float seconds_override = -1.0f, bool finish_attack = false) noexcept
 	{
 		const float seconds = seconds_override >= 0.0f
 			? seconds_override : owner.release_seconds(*cohort.region, cohort.channel);
-		if (seconds <= 0.0f || cohort.env <= 0.0f)
+		const bool attacking = finish_attack && cohort.stage == CohortStage::Attack;
+		if (seconds <= 0.0f || (cohort.env <= 0.0f && !attacking))
 			return false;
 		cohort.stage = CohortStage::Release;
 		cohort.release_frame = owner.stats_.rendered_frames;
 		cohort.release_coefficient = owner.release_coefficient(seconds);
 		cohort.release_override = seconds_override >= 0.0f;
+		cohort.finish_attack = attacking;
 		return true;
 	}
 
@@ -1010,6 +1018,17 @@ struct CohortEngineState
 			cohort.env = cohort.region->sustain;
 			break;
 		case CohortStage::Release:
+			if (cohort.finish_attack)
+			{
+				// The same steps the attack would have taken, then the release.
+				cohort.env += cohort.env_inc;
+				if (cohort.env >= 1.0f)
+				{
+					cohort.env = 1.0f;
+					cohort.finish_attack = false;
+				}
+				break;
+			}
 			cohort.env *= cohort.release_coefficient;
 			if (cohort.env <= 1.0e-5f)
 			{
@@ -1063,7 +1082,7 @@ struct CohortEngineState
 			const StableHandle cached_release_target = source.release_target;
 			const bool cached_release_same_frame =
 				source.release_target_frame == owner.stats_.rendered_frames;
-			if (!begin_release(owner, released))
+			if (!begin_release(owner, released, -1.0f, true))
 			{
 				active_logical -= contribution.multiplicity;
 				if (!source_remains)
@@ -1658,6 +1677,8 @@ struct CohortEngineState
 				break;
 			case CohortStage::Release:
 			{
+				if (cohort.finish_attack)
+					return frame;
 				const float e0 = cohort.env * cohort.release_coefficient;
 				const float e1 = e0 * cohort.release_coefficient;
 				const float e2 = e1 * cohort.release_coefficient;
@@ -1780,7 +1801,7 @@ struct CohortEngineState
 			if (!(position >= 0.0 && position < end - 1.0 && next < end))
 				break;
 			if (cohort.stage == CohortStage::Off || (cohort.stage == CohortStage::Release &&
-				!(cohort.env * cohort.release_coefficient > 1.0e-5f)))
+				!cohort.finish_attack && !(cohort.env * cohort.release_coefficient > 1.0e-5f)))
 				break;
 			const float envelope = advance_envelope(owner, cohort);
 			const uint32_t index = static_cast<uint32_t>(position);

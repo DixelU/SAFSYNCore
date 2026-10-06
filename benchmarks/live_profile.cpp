@@ -8,7 +8,8 @@
 // --live runs the real BufferedSynth instead: a sender submits the events at
 // their wall-clock times, as a file player does, and a consumer reads audio at
 // the device rate. It reports what a listener would get: underruns and how far
-// the sender is pushed behind. --shed turns on overload note shedding.
+// the sender is pushed behind. --shed turns on overload note shedding. Events
+// carry their due times; --grid sets the live event grid (0: block start).
 
 #include "core.h"
 #include "playback.h"
@@ -73,6 +74,7 @@ struct Options
 	bool timeline = false;
 	bool live = false;
 	bool shed = false;
+	uint32_t grid = safsyn::PlaybackOptions{}.live_event_grid_frames;
 };
 
 uint32_t short_message(const safsyn::SmfEvent& event)
@@ -90,7 +92,7 @@ int usage()
 	std::cerr << "usage: safsyn-live-profile <bank.sf2|.sfz> <file.mid> [--threads 1,4,16]\n"
 		"       [--cohorts 4096] [--analytic] [--rate 48000] [--block 256]\n"
 		"       [--start seconds] [--duration seconds] [--timeline]\n"
-		"       [--live [--buffer 4096] [--shed]]   (--threads 0 selects the automatic count)\n";
+		"       [--live [--buffer 4096] [--shed] [--grid 1]]   (--threads 0 selects the automatic count)\n";
 	return 2;
 }
 
@@ -248,7 +250,7 @@ int play_live(const Options& options, std::shared_ptr<const safsyn::Soundfont> b
 	const uint64_t last_frame = first_frame +
 		static_cast<uint64_t>(options.duration_seconds * options.sample_rate);
 	std::cout << "threads,audio_s,underruns,underrun_ms,sender_late_ms,sender_blocked_ms,"
-		"overloaded_share,peak_render_load,events,shed_notes,peak_cohorts\n";
+		"overloaded_share,peak_render_load,events,shed_notes,peak_cohorts,late_events,margin_ms\n";
 	for (const size_t threads : options.threads)
 	{
 		safsyn::PlaybackOptions playback;
@@ -258,6 +260,7 @@ int play_live(const Options& options, std::shared_ptr<const safsyn::Soundfont> b
 		playback.maximum_cohorts = options.maximum_cohorts;
 		playback.render_threads = threads;
 		playback.shed_notes = options.shed;
+		playback.live_event_grid_frames = options.grid;
 		if (options.analytic)
 			playback.phase.mode = safsyn::PhaseMode::Analytic;
 		safsyn::BufferedSynth synth(bank, playback);
@@ -274,10 +277,11 @@ int play_live(const Options& options, std::shared_ptr<const safsyn::Soundfont> b
 
 		// A file sender keeps an event until the queue accepts it.
 		double blocked = 0.0;
-		auto submit = [&](const safsyn::SmfEvent& event) {
+		auto submit = [&](const safsyn::SmfEvent& event,
+			std::optional<Clock::time_point> due = {}) {
 			const auto began = Clock::now();
 			bool waited = false;
-			while (synth.try_enqueue_short_message(short_message(event), event.tick) ==
+			while (synth.try_enqueue_short_message(short_message(event), event.tick, due) ==
 				safsyn::MidiEnqueueResult::Full)
 			{
 				waited = true;
@@ -333,7 +337,7 @@ int play_live(const Options& options, std::shared_ptr<const safsyn::Soundfont> b
 					std::chrono::duration<double>(static_cast<double>(next.sample - first_frame) /
 						options.sample_rate));
 				wait_until(due);
-				submit(next.event);
+				submit(next.event, due);
 				latest = (std::max)(latest, std::chrono::duration<double>(Clock::now() - due).count());
 				++events;
 			}
@@ -351,7 +355,9 @@ int play_live(const Options& options, std::shared_ptr<const safsyn::Soundfont> b
 			<< ',' << latest * 1000.0 << ',' << blocked * 1000.0
 			<< ',' << (load_samples ? static_cast<double>(overloaded) / load_samples : 0.0)
 			<< ',' << peak_load << ',' << events
-			<< ',' << after.shed_notes - before.shed_notes << ',' << peak_cohorts << std::endl;
+			<< ',' << after.shed_notes - before.shed_notes << ',' << peak_cohorts
+			<< ',' << after.late_midi_events - before.late_midi_events
+			<< ',' << after.live_margin_ms << std::endl;
 	}
 	return 0;
 }
@@ -384,6 +390,7 @@ int main(int argc, char** argv)
 		else if (name == "--timeline") options.timeline = true;
 		else if (name == "--live") options.live = true;
 		else if (name == "--shed") options.shed = true;
+		else if (name == "--grid") options.grid = static_cast<uint32_t>(std::stoul(value()));
 		else return usage();
 	}
 	if (options.threads.empty() || !options.block_frames) return usage();

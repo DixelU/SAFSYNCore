@@ -100,7 +100,10 @@ the full SF2 modulator system, modulation envelopes, LFOs, or every generator.
 The 2026-09-22 Kestrel comparison intentionally changes the default gain and
 release response. Velocity, CC7/39, and CC11/43 use squared amplitude curves;
 release is exponential to a -100 dB envelope floor and CC72 uses Kestrel's
-asymmetric time mapping. SF2 initial attenuation uses 0.04 dB per generator unit,
+asymmetric time mapping. As in BASSMIDI, a note-off during the attack lets the
+attack reach full level before the release starts, so a note shorter than its
+attack (even one released on the frame it started) still sounds; exclusive-class
+cutoffs and voice stealing do not wait. SF2 initial attenuation uses 0.04 dB per generator unit,
 while sustain centibels and SFZ volume retain their existing units. Stereo sample
 center gain is unity per channel. CC71/74 and SF2 cutoff/resonance drive a
 normalized low-pass filter after the envelope and before channel gain, with

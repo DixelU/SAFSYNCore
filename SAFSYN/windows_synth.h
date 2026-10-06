@@ -49,8 +49,10 @@ public:
 	void request_stop() noexcept;
 	void stop() noexcept;
 	bool send_short_message(uint32_t message) noexcept;
+	// See BufferedSynth::try_enqueue_short_message for tick and due.
 	MidiEnqueueResult try_send_short_message(uint32_t message,
-		std::optional<uint64_t> tick = {}) noexcept;
+		std::optional<uint64_t> tick = {},
+		std::optional<MidiClock::time_point> due = {}) noexcept;
 	void panic() noexcept;
 	WindowsSynthStats stats() const;
 private:

@@ -56,6 +56,17 @@ struct EventHandle
 	EventHandle(const EventHandle&) = delete;
 	EventHandle& operator=(const EventHandle&) = delete;
 };
+// Sleeps and condition-variable timeouts default to the 15.6 ms system tick.
+// That would wake the producer, and any host thread pacing MIDI into this
+// synth, in 15.6 ms bursts. 1 ms is what MIDI drivers such as OmniMIDI use.
+struct TimerResolution
+{
+	bool raised = timeBeginPeriod(1) == TIMERR_NOERROR;
+	~TimerResolution() { if (raised) timeEndPeriod(1); }
+	TimerResolution() = default;
+	TimerResolution(const TimerResolution&) = delete;
+	TimerResolution& operator=(const TimerResolution&) = delete;
+};
 struct Mmcss
 {
 	DWORD index = 0;
@@ -303,6 +314,7 @@ struct WindowsSynth::Impl
 			if (cancelled.load()) { set_status(L"Stopped"); running.store(false); return; }
 			auto playback = std::make_shared<BufferedSynth>(bank, options.playback, midi);
 			{ std::lock_guard lock(mutex); synth = playback; }
+			TimerResolution timer_resolution;
 			ComApartment apartment;
 			ComPtr<IMMDeviceEnumerator> enumerator;
 			require(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator)), "WASAPI enumerator");
@@ -423,10 +435,10 @@ bool WindowsSynth::send_short_message(uint32_t message) noexcept
 	return impl_->synth && impl_->synth->enqueue_short_message(message);
 }
 MidiEnqueueResult WindowsSynth::try_send_short_message(uint32_t message,
-	std::optional<uint64_t> tick) noexcept
+	std::optional<uint64_t> tick, std::optional<MidiClock::time_point> due) noexcept
 {
 	std::lock_guard lock(impl_->mutex);
-	return impl_->synth ? impl_->synth->try_enqueue_short_message(message, tick)
+	return impl_->synth ? impl_->synth->try_enqueue_short_message(message, tick, due)
 		: MidiEnqueueResult::Unavailable;
 }
 void WindowsSynth::panic() noexcept

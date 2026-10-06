@@ -5,13 +5,17 @@
 #include "smf.h"
 
 #include <atomic>
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace safsyn
 {
 
 enum class MidiEnqueueResult { Queued, Full, Unavailable };
+// Clock for live event due times.
+using MidiClock = std::chrono::steady_clock;
 
 struct PlaybackOptions
 {
@@ -25,6 +29,12 @@ struct PlaybackOptions
 	// drop the quietest note-ons (and their note-offs) instead of falling
 	// behind. Off keeps every event and lets sustained overload delay playback.
 	bool shed_notes = false;
+	// Live input only. Each event plays at the frame matching its due time (or
+	// its arrival when none is given), after a fixed delay: the audio ring, the
+	// limiter lookahead, and a margin that adapts to late senders. Frames are
+	// rounded down to this grid, which coarsens towards the block size while
+	// rendering is busy. 0 applies queued events at the next block start.
+	uint32_t live_event_grid_frames = 1;
 	uint16_t initial_bank = 0;
 	uint8_t initial_program = 0;
 	uint32_t maximum_tail_seconds = 10;
@@ -46,6 +56,9 @@ struct PlaybackStats
 	uint64_t underruns = 0;
 	uint64_t rejected_midi_events = 0;
 	uint64_t shed_notes = 0; // Note-ons dropped by overload shedding.
+	uint64_t late_midi_events = 0; // Timed live events that arrived after their frame.
+	double live_margin_ms = 0.0; // Current adaptive part of the live event delay.
+	uint32_t live_grid_frames = 0; // Current live event grid; 0 before the first block.
 	uint64_t midi_recoveries = 0;
 	uint64_t safety_clamped_samples = 0;
 	size_t active_voices = 0;
@@ -75,12 +88,17 @@ public:
 	void start(); // Once only. Control thread; construction does not start work.
 	void request_stop() noexcept;
 	void stop() noexcept; // Joins the producer; never call from an audio callback.
+	// Live input timed by its arrival.
 	bool enqueue_short_message(uint32_t message) noexcept;
 	// For file senders that can retry: Full leaves voices, controllers, and
 	// queued events intact. The caller retains the message until Queued.
 	// Optional source tick affects phase grouping only, not dispatch scheduling.
+	// Optional due time is when the sender meant the event to happen; events
+	// keep their relative timing even when the sender wakes up late. Without
+	// one, the event is timed by its arrival.
 	MidiEnqueueResult try_enqueue_short_message(uint32_t message,
-		std::optional<uint64_t> tick = {}) noexcept;
+		std::optional<uint64_t> tick = {},
+		std::optional<MidiClock::time_point> due = {}) noexcept;
 	bool enqueue_master_volume(uint16_t value) noexcept;
 	// Invalidates queued live events and resets controllers/voices on producer.
 	void panic() noexcept;
