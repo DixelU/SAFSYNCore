@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <complex>
@@ -108,6 +109,75 @@ std::vector<double> dft_magnitudes(const std::vector<double>& input)
 		result[bin] = std::abs(value);
 	}
 	return result;
+}
+
+// The original, simple radix-2 transform is intentionally independent of the
+// production permutation/block/twiddle optimizations. Compare the complete
+// quadrature, including zeros and tails, so common serial/parallel drift is caught.
+void reference_fft(std::vector<std::complex<double>>& values, bool inverse)
+{
+	const size_t n = values.size();
+	for (size_t index = 1, reverse = 0; index < n; ++index)
+	{
+		size_t bit = n >> 1;
+		for (; reverse & bit; bit >>= 1) reverse ^= bit;
+		reverse ^= bit;
+		if (index < reverse) std::swap(values[index], values[reverse]);
+	}
+	for (size_t length = 2; length <= n; length *= 2)
+	{
+		const double angle = (inverse ? 2.0 : -2.0) * pi / static_cast<double>(length);
+		const std::complex<double> step(std::cos(angle), std::sin(angle));
+		for (size_t start = 0; start < n; start += length)
+		{
+			std::complex<double> factor(1.0, 0.0);
+			for (size_t offset = 0; offset < length / 2; ++offset)
+			{
+				const auto even = values[start + offset];
+				const auto odd = values[start + offset + length / 2] * factor;
+				values[start + offset] = even + odd;
+				values[start + offset + length / 2] = even - odd;
+				factor *= step;
+			}
+		}
+	}
+	if (inverse)
+		for (auto& value : values) value /= static_cast<double>(n);
+}
+
+void test_preparation_matches_reference_fft()
+{
+	for (const size_t frames : {size_t{32767}, size_t{32768}, size_t{32769}, size_t{65537}, size_t{131073}})
+	{
+		std::vector<int16_t> pcm(frames * 2);
+		for (size_t index = 0; index < pcm.size(); ++index)
+			pcm[index] = static_cast<int16_t>(static_cast<int32_t>((index * 1664525ULL) % 60001) - 30000);
+		auto bank = make_bank(pcm, 48000, 2);
+		safsyn::PhaseProcessor processor;
+		safsyn::PhaseSettings phase;
+		phase.mode = safsyn::PhaseMode::Analytic;
+		processor.configure(phase);
+		check(processor.prepare(bank.regions), "reference FFT fixture prepares");
+		const auto state = processor.assign(bank.regions.front(), 0, 17, 0, 60);
+		for (size_t channel = 0; channel < 2; ++channel)
+		{
+			size_t padded_size = 1;
+			while (padded_size < frames * 2) padded_size *= 2;
+			std::vector<std::complex<double>> analytic(padded_size);
+			for (size_t index = 0; index < frames; ++index)
+				analytic[index] = static_cast<double>(pcm[index * 2 + channel]) / 32768.0;
+			reference_fft(analytic, false);
+			for (size_t bin = 1; bin < padded_size / 2; ++bin) analytic[bin] *= 2.0;
+			for (size_t bin = padded_size / 2 + 1; bin < padded_size; ++bin) analytic[bin] = {};
+			reference_fft(analytic, true);
+			const float* quadrature = channel ? state.quadrature_right : state.quadrature_left;
+			bool exact = quadrature != nullptr;
+			for (size_t index = 0; exact && index < frames; ++index)
+				exact = std::bit_cast<uint32_t>(quadrature[index]) ==
+					std::bit_cast<uint32_t>(static_cast<float>(analytic[index].imag()));
+			check(exact, "large FFT quadratures exactly match the original reference arithmetic");
+		}
+	}
 }
 
 safsyn::PhaseSettings settings(safsyn::PhaseMode mode, uint32_t pool = 8,
@@ -702,6 +772,7 @@ void test_preparation_budget_and_cancellation()
 
 int main()
 {
+	test_preparation_matches_reference_fft();
 	test_analytic_unison_onsets();
 	test_analytic_source_ticks();
 	test_strength_zero_is_coherent();

@@ -1,0 +1,5 @@
+"fixture","revision","build","threads","repeat","prepare_ms","warm_ms","unique_samples","cache_bytes","quadrature_hash"
+"sDetrimental Concert Grand Piano.sf2","before","MSVC x64 precise","0","0","27900.699","0.046","87","1143619584","6509547379989056518"
+"sDetrimental Concert Grand Piano.sf2","before","MSVC x64 precise","0","1","28398.604","0.119","87","1143619584","6509547379989056518"
+"sDetrimental Concert Grand Piano.sf2","after","MSVC x64 precise","0","0","24608.151","0.047","87","1143619584","6509547379989056518"
+"sDetrimental Concert Grand Piano.sf2","after","MSVC x64 precise","0","1","25153.360","0.050","87","1143619584","6509547379989056518"

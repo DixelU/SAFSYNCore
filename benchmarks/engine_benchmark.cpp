@@ -144,12 +144,59 @@ int interval_matrix(int argc, char** argv)
 	}
 	return 0;
 }
+
+// Held notes and sustained notes share ownership, but note-off matching must
+// not revisit already released batches. Keep setup and checksum rendering out
+// of the timed section; both cases retain every sustained voice.
+int sustained_note_off_matrix(int argc, char** argv)
+{
+	const size_t repetitions = argc > 2 ? std::stoull(argv[2]) : 5;
+	if (!repetitions) return 1;
+	auto bank = make_bank();
+	std::cout << "case,batches,repetitions,median_ms,min_ms,max_ms,checksum,active_voices\n";
+	for (const bool interleaved : {false, true})
+		for (const uint32_t count : {1000u, 4000u, 16000u})
+		{
+			std::vector<double> times;
+			double checksum = 0;
+			size_t active = 0;
+			for (size_t trial = 0; trial <= repetitions; ++trial)
+			{
+				safsyn::SynthEngine engine(48000, 32);
+				engine.set_voice_model(safsyn::VoiceModel::Cohorts, 32);
+				engine.set_soundfont(&bank);
+				engine.control_change(0, 64, 127);
+				for (uint32_t i = 0; i < count; ++i) engine.note_on(0, 60, 100);
+				if (interleaved) engine.control_change(0, 123, 0);
+				const double elapsed = time_ms([&] {
+					for (uint32_t i = 0; i < count; ++i)
+					{
+						if (interleaved) engine.note_on(0, 60, 100);
+						engine.note_off_batch(0, 60, interleaved ? 2 : 1);
+					}
+				});
+				if (trial != 0) times.push_back(elapsed);
+				std::array<float, 512> audio{};
+				engine.render_audio(audio.data(), 256);
+				checksum = 0;
+				for (float sample : audio) checksum += sample;
+				active = engine.active_voice_count();
+			}
+			std::sort(times.begin(), times.end());
+			std::cout << (interleaved ? "interleaved" : "drain") << ',' << count << ',' << repetitions
+				<< ',' << std::fixed << std::setprecision(6) << times[times.size() / 2]
+				<< ',' << times.front() << ',' << times.back() << ',' << checksum << ',' << active << '\n';
+		}
+	return 0;
+}
 }
 
 int main(int argc, char** argv)
 {
 	if (argc > 1 && std::string_view(argv[1]) == "--matrix")
 		return interval_matrix(argc, argv);
+	if (argc > 1 && std::string_view(argv[1]) == "--sustain")
+		return sustained_note_off_matrix(argc, argv);
 	const uint64_t iterations = argc > 1 ? std::stoull(argv[1]) : 50000;
 	const size_t render_threads = argc > 2 ? static_cast<size_t>(std::stoull(argv[2])) : 12;
 	constexpr size_t capacity = 4096;

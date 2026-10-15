@@ -68,10 +68,51 @@ bool is_power_of_two(size_t value) noexcept
 	return value != 0 && (value & (value - 1)) == 0;
 }
 
-void radix2_fft(std::vector<Complex>& values, bool inverse, std::stop_token stop)
+void bit_reverse_permute(std::vector<Complex>& values, std::stop_token stop)
 {
-	check_cancel(stop);
 	const size_t n = values.size();
+	if (n >= 262144)
+	{
+		// Split the index into three high bits, a middle, and three low bits.
+		// Reversing it transposes an 8x8 tile while reversing each component.
+		// Both sides of every swap stay in eight short spans instead of revisiting
+		// distant cache lines for each individual sample in the ordinary pass.
+		constexpr size_t tile = 8;
+		size_t reversed[tile];
+		for (size_t index = 0; index < tile; ++index)
+		{
+			size_t value = index, reverse = 0;
+			for (unsigned bit = 0; bit < 3; ++bit)
+			{
+				reverse = reverse * 2 + (value & 1);
+				value >>= 1;
+			}
+			reversed[index] = reverse;
+		}
+		const size_t stride = n / tile;
+		const size_t middles = stride / tile;
+		for (size_t middle = 0, reverse = 0; middle < middles; ++middle)
+		{
+			check_cancel(stop, middle * tile * tile);
+			if (middle <= reverse)
+				for (size_t high = 0; high < tile; ++high)
+					for (size_t low = 0; low < tile; ++low)
+					{
+						const size_t first = high * stride + middle * tile + low;
+						const size_t second = reversed[low] * stride + reverse * tile + reversed[high];
+						if (middle != reverse || first < second)
+							std::swap(values[first], values[second]);
+					}
+			if (middle + 1 != middles)
+			{
+				size_t bit = middles >> 1;
+				for (; reverse & bit; bit >>= 1)
+					reverse ^= bit;
+				reverse ^= bit;
+			}
+		}
+		return;
+	}
 	for (size_t i = 1, j = 0; i < n; ++i)
 	{
 		check_cancel(stop, i);
@@ -82,6 +123,13 @@ void radix2_fft(std::vector<Complex>& values, bool inverse, std::stop_token stop
 		if (i < j)
 			std::swap(values[i], values[j]);
 	}
+}
+
+void radix2_fft(std::vector<Complex>& values, bool inverse, std::stop_token stop)
+{
+	check_cancel(stop);
+	const size_t n = values.size();
+	bit_reverse_permute(values, stop);
 	// Every group of a stage uses the same twiddle recurrence, so it is built
 	// once per stage. Repeated multiplication (not per-index cos/sin) is the
 	// reference arithmetic and keeps cached quadratures bit-identical.
@@ -99,13 +147,19 @@ void radix2_fft(std::vector<Complex>& values, bool inverse, std::stop_token stop
 		const size_t half = length / 2;
 		Complex* first = values.data() + start;
 		Complex* second = first + half;
-		for (size_t offset = 0; offset < half; ++offset)
+		// Keep cancellation outside the inner butterfly loop, but retain the
+		// original maximum interval between cancellation checks.
+		for (size_t chunk = 0; chunk < half; chunk += 16384)
 		{
-			check_cancel(stop, start + offset);
-			const Complex even = first[offset];
-			const Complex odd = second[offset] * twiddles[offset];
-			first[offset] = even + odd;
-			second[offset] = even - odd;
+			check_cancel(stop, start + chunk);
+			const size_t end = (std::min)(half, chunk + 16384);
+			for (size_t offset = chunk; offset < end; ++offset)
+			{
+				const Complex even = first[offset];
+				const Complex odd = second[offset] * twiddles[offset];
+				first[offset] = even + odd;
+				second[offset] = even - odd;
+			}
 		}
 	};
 	// Stages that fit in a cache-sized block run depth-first per block; each

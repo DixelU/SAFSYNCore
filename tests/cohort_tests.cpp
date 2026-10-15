@@ -272,6 +272,75 @@ void test_lifecycle_split_and_controls()
 		"individual note-offs split release cohorts from sustaining multiplicity");
 }
 
+void test_sustained_note_off_matching()
+{
+	for (const auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::Analytic})
+	{
+		auto bank = make_bank(2000, true, 0.0f, 0.012f);
+		safsyn::PhaseSettings phase;
+		phase.mode = mode;
+		safsyn::SynthEngine reference(2000, 1024), cohorts(2000, 4);
+		configure_pair(reference, cohorts, bank, phase);
+		auto both = [&](auto operation) { operation(reference); operation(cohorts); };
+		auto compare = [&](uint32_t frames) {
+			check(close_audio(render(reference, frames), render(cohorts, frames), 4e-4, 5e-5),
+				"held-note matching past sustained batches preserves audio and LIFO release order");
+			check(reference.active_voice_count() == cohorts.active_voice_count(),
+				"held-note matching preserves sustained and released voice counts");
+		};
+		both([](auto& engine) {
+			engine.control_change(0, 64, 127);
+			// Separate logical batches, with different gains to expose a wrong
+			// note-off match even when cohorts share one onset frame.
+			for (unsigned i = 0; i < 96; ++i)
+				engine.note_on(0, 60, static_cast<uint8_t>(40 + i % 80));
+			for (unsigned i = 0; i < 64; ++i) engine.note_off(0, 60);
+			engine.note_on(0, 60, 119);
+			engine.note_off_batch(0, 60, 9);
+			engine.note_on_batch(0, 62, 88, 7);
+			engine.note_off_batch(0, 62, 3);
+			engine.note_on(0, 62, 99);
+			engine.note_off_batch(0, 62, 2);
+			engine.note_off_batch(0, 62, 4);
+		});
+		compare(32);
+		both([](auto& engine) { engine.control_change(0, 64, 0); });
+		compare(80); // pedal-up prunes the released suffix
+		both([](auto& engine) {
+			// Recycle retired logical slots into another key, then release the
+			// older still-held note below those stale same-key handles.
+			for (unsigned i = 0; i < 40; ++i) engine.note_on(0, 67, 77);
+			engine.note_off_batch(0, 60, 24);
+			engine.note_off_batch(0, 67, 40);
+		});
+		compare(80);
+		both([](auto& engine) {
+			engine.control_change(0, 64, 127);
+			for (unsigned i = 0; i < 80; ++i) engine.note_on(0, 60, 70);
+			engine.control_change(0, 123, 0);
+			for (unsigned i = 0; i < 24; ++i)
+			{
+				engine.note_on(0, 60, 95);
+				engine.note_off_batch(0, 60, 2); // includes an unmatched note-off
+			}
+			engine.control_change(0, 64, 0);
+		});
+		compare(80);
+		both([](auto& engine) {
+			engine.control_change(0, 64, 127);
+			engine.note_on(0, 60, 72);
+			engine.note_off(0, 60);
+			engine.control_change(0, 120, 0);
+			engine.note_on(0, 60, 84);
+			engine.note_off(0, 60);
+			engine.control_change(0, 64, 0);
+		});
+		compare(80);
+		check(cohorts.active_voice_count() == 0,
+			"sustain, All Notes Off and All Sound Off leave no unmatched held voices");
+	}
+}
+
 // A note-off during the attack lets the attack finish before the release, as
 // BASSMIDI does. Live dispatch can deliver a short note's on and off on the
 // same frame, and such a note must still sound.
@@ -488,6 +557,28 @@ void test_linked_stereo_and_one_shot()
 	layered_actual.insert(layered_actual.end(), released_actual.begin(), released_actual.end());
 	check(close_audio(layered_expected, layered_actual),
 		"newer one-shot identities block older same-note LIFO releases until sample completion");
+
+	for (auto* engine : {&layered_reference, &layered_cohorts})
+	{
+		engine->reset();
+		engine->control_change(0, 64, 127);
+		engine->note_on(0, 60, 80); // older held note
+		engine->note_on(0, 60, 95);
+		engine->note_off(0, 60); // retained sustained gap
+		engine->note_on(0, 60, 120); // one-shot above the gap
+		engine->note_off_batch(0, 60, 3);
+	}
+	check(close_audio(render(layered_reference, 8), render(layered_cohorts, 8)),
+		"one-shot above a sustained gap still blocks the older held note");
+	for (auto* engine : {&layered_reference, &layered_cohorts})
+		engine->control_change(0, 64, 0);
+	check(close_audio(render(layered_reference, 280), render(layered_cohorts, 280)),
+		"pedal-up and one-shot completion preserve held-note matching across a sustained gap");
+	for (auto* engine : {&layered_reference, &layered_cohorts})
+		engine->note_off(0, 60);
+	check(close_audio(render(layered_reference, 40), render(layered_cohorts, 40)) &&
+		layered_cohorts.active_voice_count() == 0,
+		"a completed one-shot resumes the older held prefix after the sustained suffix retires");
 }
 
 void test_cross_run_merging_and_dynamic_growth()
@@ -1058,6 +1149,7 @@ int main()
 	test_coherent_and_phase_duplicates();
 	test_singleton_bit_exact_modes();
 	test_lifecycle_split_and_controls();
+	test_sustained_note_off_matching();
 	test_note_off_during_attack();
 	test_controller_contract_equivalence();
 	test_filtered_phase_splits();

@@ -569,3 +569,48 @@ Enable `SAFSYN_BUILD_BENCHMARKS` and run `safsyn-mastering-benchmark` to reprodu
 the cases. To compare against an older revision, compile this same benchmark
 source against that revision's `mastering.h` and `mastering.cpp`; no other
 synthesis source is needed.
+
+## Sustained-note matching (October 15, 2026)
+
+Under the sustain pedal, released logical batches remain owned by their key's
+stack until pedal-up. Each subsequent note-off previously scanned those released
+batches again to find the newest held note. Releasing N overlapping batches could
+therefore take quadratic time even when they shared a single render cohort.
+
+Each key now keeps the end of its remaining search range, and each new logical
+batch remembers the previous range. Consuming that batch restores the older
+boundary without revisiting sustained gaps. The existing ownership stack, LIFO
+matching, partial releases, one-shot barriers, and generation checks are retained.
+Pedal-up, All Notes Off, All Sound Off, and engine reset keep the boundaries valid.
+The extra storage is one `size_t` per key and per logical batch.
+
+Baseline: `09b8d15`. Host: Intel Core i5-13600K, MSVC x64 Release. The isolated
+benchmark is pinned to logical CPU 0; setup and checksum rendering are outside
+timing. Values below are medians of five repetitions after one warm-up. The
+interleaved case begins with sustained batches, then repeatedly adds a fresh note
+and sends two note-offs, including an unmatched one above the retained gap.
+
+| Case | Batches | Before (ms) | After (ms) |
+|---|---:|---:|---:|
+| Release sustained overlaps | 1,000 | 1.004 | 0.007 |
+| Release sustained overlaps | 4,000 | 17.100 | 0.030 |
+| Release sustained overlaps | 16,000 | 263.568 | 0.133 |
+| Fresh onsets above a sustained gap | 1,000 | 3.230 | 0.160 |
+| Fresh onsets above a sustained gap | 4,000 | 50.003 | 0.457 |
+| Fresh onsets above a sustained gap | 16,000 | 830.912 | 2.373 |
+
+All six audio sums and active-voice counts match. The behavioral regression also
+compares against the individual-voice engine with differing velocities, partial
+batches, recycled slots, both phase modes, pedal transitions, channel-mode
+messages, and a one-shot above a sustained gap.
+
+The real-bank Hypernova 103-111 s comparison remains effectively unchanged:
+median direct-mode dispatch is 4.780 -> 4.749 s, and total dispatch plus mixing
+is 7.852 -> 7.911 s. Both use six render threads, affinity `0x555`, 8,192 cohorts,
+48 kHz, and 256-frame blocks. All three passes dispatch 19,369,843 events and
+retain audio checksum `9031887426958721624`. This change fixes a specific sustain
+pattern; it does not remove the ordinary dense-file stealing/dispatch bottleneck.
+Raw values are in `sustain_dispatch_performance_2026-10-15.csv`.
+
+Run `safsyn-engine-benchmark --sustain 5` for the isolated cases. The real-file
+comparison uses the `safsyn-live-profile` command and affinity described above.

@@ -198,6 +198,9 @@ struct LogicalBatch
 	uint64_t held = 0;
 	uint64_t sustained = 0;
 	uint64_t onset_identity = 0;
+	// Stack entries only append or leave from the back. Restore this prefix
+	// after releasing a newer batch instead of revisiting its sustained gap.
+	size_t previous_search_end = 0;
 	bool one_shot_blocking = false;
 	bool one_shot_release_applied = false;
 	bool one_shot_release_pending = false;
@@ -353,6 +356,10 @@ struct CohortEngineState
 	std::vector<LogicalSlot> logical_batches;
 	std::vector<uint32_t> free_logical_batches;
 	std::array<std::vector<StableHandle>, 16 * 128> note_stacks;
+	// Sustained batches remain in note_stacks until pedal-up, but have no held
+	// notes for a later note-off to match. Remember the unsearched prefix so a
+	// burst of note-offs does not repeatedly scan that growing sustained suffix.
+	std::array<size_t, 16 * 128> note_search_ends{};
 	std::unordered_map<OnsetKey, StableHandle, OnsetKeyHash> onset_candidates;
 	uint64_t active_logical = 0;
 	size_t active_cohort_count = 0;
@@ -953,9 +960,14 @@ struct CohortEngineState
 		}
 		if (!links.empty())
 		{
+			const size_t index = note_index(channel, note);
+			batch.previous_search_end = (std::min)(note_search_ends[index], note_stacks[index].size());
 			const StableHandle logical = allocate_logical(std::move(batch), links);
 			if (logical.valid())
-				note_stacks[note_index(channel, note)].push_back(logical);
+			{
+				note_stacks[index].push_back(logical);
+				note_search_ends[index] = note_stacks[index].size();
+			}
 		}
 	}
 
@@ -1081,22 +1093,37 @@ struct CohortEngineState
 	{
 		if (channel >= 16 || note >= 128 || count == 0)
 			return;
-		auto& stack = note_stacks[note_index(channel, note)];
+		const size_t index = note_index(channel, note);
+		auto& stack = note_stacks[index];
+		auto& search_end = note_search_ends[index];
 		while (count != 0)
 		{
 			cleanup_stack(stack);
+			search_end = (std::min)(search_end, stack.size());
 			StableHandle selected;
 			LogicalSlot* logical = nullptr;
-			for (auto it = stack.rbegin(); it != stack.rend(); ++it)
+			while (search_end != 0)
 			{
-				refresh_one_shot_batch(*it);
-				auto* candidate = resolve_logical(*it);
+				const StableHandle handle = stack[search_end - 1];
+				auto* candidate = resolve_logical(handle);
+				if (candidate && candidate->batch.one_shot_blocking)
+				{
+					const size_t resume = candidate->batch.previous_search_end;
+					refresh_one_shot_batch(handle);
+					candidate = resolve_logical(handle);
+					if (!candidate)
+					{
+						search_end = resume;
+						continue;
+					}
+				}
 				if (candidate && candidate->batch.held != 0)
 				{
-					selected = *it;
+					selected = handle;
 					logical = candidate;
 					break;
 				}
+				search_end = candidate ? candidate->batch.previous_search_end : search_end - 1;
 			}
 			if (!logical)
 				break;
@@ -1121,6 +1148,8 @@ struct CohortEngineState
 			else
 				release_range(owner, batch, first_serial, released);
 			count -= released;
+			if (batch.held == 0)
+				search_end = batch.previous_search_end;
 			if (batch.held == 0 && batch.sustained == 0)
 				retire_logical(selected);
 			cleanup_stack(stack);
@@ -1187,6 +1216,7 @@ struct CohortEngineState
 			}
 			if (!owner.channels_[channel].sustain_pedal)
 				stack.clear();
+			note_search_ends[note_index(channel, static_cast<uint8_t>(note))] = 0;
 		}
 	}
 
@@ -1201,7 +1231,11 @@ struct CohortEngineState
 				logical_batches[index].batch.channel == channel)
 				retire_logical({index, logical_batches[index].generation});
 		for (uint16_t note = 0; note < 128; ++note)
-			note_stacks[note_index(channel, static_cast<uint8_t>(note))].clear();
+		{
+			const size_t index = note_index(channel, static_cast<uint8_t>(note));
+			note_stacks[index].clear();
+			note_search_ends[index] = 0;
+		}
 		for (auto it = onset_candidates.begin(); it != onset_candidates.end();)
 			if (it->first.channel == channel)
 				it = onset_candidates.erase(it);
@@ -1904,6 +1938,7 @@ struct CohortEngineState
 		free_logical_batches.clear();
 		for (auto& stack : note_stacks)
 			stack.clear();
+		note_search_ends.fill(0);
 		onset_candidates.clear();
 		region_matches.clear();
 		active_logical = 0;
