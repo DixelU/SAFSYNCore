@@ -5,7 +5,6 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
-#include <deque>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -179,7 +178,8 @@ struct BufferedSynth::Impl
 				uint32_t message;
 				bool master;
 			};
-			std::deque<PendingEvent> pending;
+			const size_t pending_limit = options.midi_queue_capacity * 8;
+			detail::PendingQueue<PendingEvent> pending(pending_limit);
 			const bool timed = options.live_event_grid_frames != 0;
 			// The producer can be ahead of the consumer by the whole ring plus
 			// the limiter lookahead, so that is the fixed part of the delay.
@@ -212,7 +212,6 @@ struct BufferedSynth::Impl
 			// Moves queued live events into `pending`, each placed on the stream.
 			// The pending bound turns a sender that outruns dispatch back into
 			// queue backpressure.
-			const size_t pending_limit = options.midi_queue_capacity * 8;
 			auto drain_live = [&] {
 				sync_generation();
 				if (timed && audio_clock_reports.load(std::memory_order_acquire) != 0)
@@ -424,7 +423,7 @@ struct BufferedSynth::Impl
 	{
 		if (midi || stopping.load() || finished.load()) return MidiEnqueueResult::Unavailable;
 		return events.push({generation.load(std::memory_order_acquire), message, master, tick,
-			due.value_or(MidiClock::now())})
+			due ? *due : MidiClock::now()})
 			? MidiEnqueueResult::Queued : MidiEnqueueResult::Full;
 	}
 	bool enqueue(uint32_t message, bool master) noexcept

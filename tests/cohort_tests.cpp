@@ -561,6 +561,54 @@ void test_safety_limit_stealing()
 		"explicit cohort ceiling steals deterministically and accounts logical multiplicity");
 }
 
+void test_steal_state_changes()
+{
+	// Multiplicities identify the victim without depending on sample rounding:
+	// A has one voice, B two, and every other candidate eight.
+	for (auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::Analytic})
+	for (size_t threads : {1u, 4u})
+	for (unsigned scenario = 0; scenario < 5; ++scenario)
+	{
+		auto bank = make_bank(1000);
+		auto prototype = bank.regions.front();
+		prototype.decay = 0; prototype.sustain = 1;
+		auto a = prototype, b = prototype, others = prototype, incoming = prototype;
+		a.lo_key = a.hi_key = 60;
+		b.lo_key = b.hi_key = 64; b.attenuation = 0.1f;
+		others.lo_key = 65; others.hi_key = 126;
+		incoming.lo_key = incoming.hi_key = 127;
+		if (scenario == 0) a.attack = 0.1f;
+		if (scenario == 1) { a.pan = -1.0f; b.attenuation = 0.6f; }
+		if (scenario == 2) b.attenuation = 0.6f;
+		if (scenario == 3) a.exclusive_class = incoming.exclusive_class = 7;
+		bank.regions = {a, b, others, incoming};
+		safsyn::SynthEngine engine(1000, 32);
+		engine.set_voice_model(safsyn::VoiceModel::Cohorts, 32);
+		engine.set_render_threads(threads);
+		engine.set_soundfont(&bank);
+		safsyn::PhaseSettings phase; phase.mode = mode;
+		engine.set_phase_settings(phase);
+		engine.prepare_playback(256);
+		engine.note_on(0, 60, 100);
+		engine.note_on_batch(0, 64, 100, 2);
+		for (uint8_t note = 65; note < 95; ++note) engine.note_on_batch(0, note, 100, 8);
+		uint64_t expected = 0;
+		switch (scenario)
+		{
+		case 0: render(engine, 256); expected = 2; break; // A has finished its attack.
+		case 1: engine.control_change(0, 10, 127); expected = 1; break; // Panning changes maximum gain.
+		case 2: engine.note_on_batch(0, 60, 100, 7); expected = 2; break; // Same-onset merge makes A louder.
+		case 3: expected = 1; break; // Incoming exclusive-class note chokes A before choosing a victim.
+		case 4: engine.set_master_volume(0); expected = 8; break; // Tied zero levels prefer the newest.
+		}
+		engine.note_on(0, 127, 100);
+		check(engine.stats().cohort_capacity_steals == 1 && engine.stats().stolen_voices == expected,
+			"stealing observes rendered envelopes, gain changes, merges, chokes and master volume");
+		if (scenario == 0 && threads > 1)
+			check(engine.stats().parallel_render_calls != 0, "steal envelope fixture exercises worker handoff");
+	}
+}
+
 // Three banks of three programs with overlapping key and velocity layers, plus
 // a reversed stress view whose levels differ from the preset view.
 safsyn::Soundfont make_layered_bank()
@@ -1017,6 +1065,7 @@ int main()
 	test_cross_run_merging_and_dynamic_growth();
 	test_block_and_seed_determinism();
 	test_safety_limit_stealing();
+	test_steal_state_changes();
 	test_parallel_cohort_render();
 	test_parallel_cohort_render(true);
 	test_coherent_vector_boundaries();

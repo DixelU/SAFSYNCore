@@ -405,3 +405,112 @@ Set `SAFSYN_DISABLE_AVX2=1` in the process environment to reproduce the baseline
 SIMD path on an AVX2-capable machine. This diagnostic override is read when an
 engine is created; it does not disable denormal protection. No new playback UI
 or persisted settings are required.
+
+## Live event dispatch and queue staging (October 15, 2026)
+
+The MIDI handoff queue is not the only serial work in live playback. On this
+machine, Hypernova's 103-111 second passage spent 6.377 s applying events and
+2.313 s mixing with 18 render threads: 73% of the measured producer work was
+dispatch. A temporary sampled function profile located roughly 40% of dispatch
+time in voice-stealing searches. This explains why additional mixer threads
+leave CPU capacity unused while dense MIDI still overloads playback. A full
+audio ring also deliberately stops render-ahead work.
+
+The retained changes are limited to two existing parts of the pipeline:
+
+- Stealing now walks compact candidate records containing its list link,
+  multiplicity, envelope, gain and tie-break fields. The owner refreshes a
+  candidate's envelope once after each render, only when it is actually probed.
+  Render workers do no extra bookkeeping. Merges, releases, chokes and gain
+  changes update their affected fields. The original probe count, traversal,
+  channel reserves, comparison arithmetic and victim selection are preserved.
+  Each record is 48 bytes on this host (384 KiB for 8,192 cohorts).
+- Pending live events use a growing, reusable contiguous ring with the same
+  capacity limit and FIFO behavior. The MPSC queue uses a mask for power-of-two
+  capacities and retains the division fallback for arbitrary capacities.
+  Explicitly timestamped messages avoid an unnecessary steady-clock read.
+
+No dispatch partitioning, new worker pool, settings, event thinning or timing
+policy changes are introduced. Hash/allocation experiments that did not show a
+clear benefit were discarded, as was a stricter queue-drain budget that delayed
+the sender under overload.
+
+### Measurements
+
+Host: Intel Core i5-13600K, Windows, MSVC 19.51, x64 Release. Baseline SYNCore:
+`065964c`. The real-bank comparison uses the supplied
+`sDetrimental Concert Grand Piano.sf2`, Hypernova at 103-111 s, 48 kHz,
+256-frame blocks and 8,192 cohorts. Six mixer threads are pinned to the same
+six logical CPUs (`0x555`); each row reports the median of three passes.
+Parsing, preparation and optional audio checksums are outside the timed stages.
+Each pass dispatches 19,369,843 events. Raw repetitions are retained alongside
+this document in `event_dispatch_performance_2026-10-15.csv`.
+
+| Mode | Dispatch before (s) | Dispatch after (s) | Total before (s) | Total after (s) |
+|---|---:|---:|---:|---:|
+| Direct | 5.532 | 4.698 | 8.647 | 7.757 |
+| Analytic | 5.505 | 4.936 | 9.164 | 8.531 |
+
+Dispatch improves by 15% in direct mode and 10% in analytic mode; total
+dispatch-plus-mixing time improves by 10% and 7%. Each total is the median of
+the per-pass sums. All before/after audio checksums match, in every repetition
+of both modes. This is a dense passage with heavy voice stealing, not a claim
+about all songs or machines. Dispatch remains serial and still accounts for
+about 58-61% of the measured work after these changes.
+
+A separate wall-clock replay used 18 render threads, all 20 logical CPUs,
+analytic mode and a 4,800-frame ring, with shedding disabled. In this single
+before/after comparison, underrun silence fell from 3,107.0 to 1,333.7 ms
+(483 to 202 gaps). Both runs submitted 19,377,408 events with zero queue-capacity
+wait, zero late MIDI events and zero shed notes. Raw values are in
+`event_delivery_performance_2026-10-15.csv`. This extreme passage still overloads
+playback; these variable wall-clock results are not a guarantee of glitch-free
+delivery.
+
+The isolated staging benchmark processes four million events, including initial
+growth, and reports the median of seven timed passes after one warm-up:
+
+| Pending depth | MSVC deque (ms) | Pending ring (ms) |
+|---:|---:|---:|
+| 64 | 9.876 | 9.306 |
+| 4,096 | 11.208 | 11.461 |
+| 262,144 | 56.220 | 14.450 |
+
+The large queue is about 3.9x faster in this isolated test; small queues are
+roughly unchanged. All checksums match. These are container timings, not an
+overall playback speedup.
+
+The x86 staging benchmark measured 45.819 -> 21.904 ms at depth 262,144.
+Its small-depth rows were 15.241 -> 16.422 ms (64) and
+19.079 -> 19.878 ms (4,096), so the storage change chiefly benefits dense bursts.
+
+### Validation and reproduction
+
+All nine SYNCore suites pass on x64 and x86, including forced baseline SIMD and
+the unchanged coherent WAV hash. Added tests cover candidate selection after
+worker-rendered attacks, panning, onset merges, exclusive-class chokes and master
+volume changes; both direct and analytic modes are exercised. Concurrent queue
+tests cover power-of-two and arbitrary capacities, and pending-ring tests compare
+wraparound, growth, clear, saturation and FIFO order against a reference deque.
+All six SAFC integration suites pass, and both native ImGui applications build.
+Both passes of the 45-case mixer matrix also retain their checksums. Mixer-only
+timings varied between runs; this change makes no general mixer speed claim.
+Muted two-second analytic WASAPI smoke tests pass on x64 and x86 with zero
+underruns, missing frames, rejected MIDI or empty device buffers. Those device
+checks use the small built-in instrument, not the dense real-file workload.
+
+```powershell
+cmake -S SYNCore -B build/syncore-performance -DSAFSYN_BUILD_BENCHMARKS=ON
+cmake --build build/syncore-performance --config Release
+ctest --test-dir build/syncore-performance -C Release --output-on-failure
+build/syncore-performance/Release/safsyn-live-profile <bank.sf2> <file.mid> --threads 6,6,6 --cohorts 8192 --start 103 --duration 8 --checksum
+build/syncore-performance/Release/safsyn-live-profile <bank.sf2> <file.mid> --threads 6,6,6 --cohorts 8192 --start 103 --duration 8 --checksum --analytic
+build/syncore-performance/Release/safsyn-live-profile <bank.sf2> <file.mid> --threads 18 --cohorts 8192 --start 103 --duration 8 --analytic --live --buffer 4800
+build/syncore-performance/Release/safsyn-queue-benchmark
+```
+
+Apply the affinity mask externally when reproducing the six-thread measurements.
+The live delivery test uses all 20 logical CPUs; its simulated sender and audio
+consumer spin/yield, so restricting them to the same six CPUs as the mixer would
+create additional contention. Headless delivery results do not establish WASAPI
+latency or eliminate sustained overload in every MIDI passage.

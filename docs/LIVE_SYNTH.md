@@ -177,8 +177,10 @@ block-start dispatch was 6 dB louder in error than in signal.
   `Hypernova.mid` at 95-125 s underran for 17.3 s against 17.7 s.
   `PlaybackStats::live_grid_frames` reports the current grid. 0 restores
   block-start dispatch.
-- Live events are moved from the queue into the producer's own pending list
-  at every block, so a long delay does not fill the queue. The list is bounded
+- Live events are moved from the queue into the producer's own pending ring
+  at every block, so a long delay does not fill the queue. The ring grows and
+  reuses contiguous storage, avoiding one allocation per event slot on MSVC.
+  It is bounded
   at eight times the queue capacity; beyond that the queue reports `Full` again.
   At most 65,536 events are dispatched per block. Extreme bursts beyond that
   play from the next block on.

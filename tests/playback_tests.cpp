@@ -1,5 +1,6 @@
 #include "playback.h"
 #include "playback_queue.h"
+#include <deque>
 
 #include <array>
 #include <atomic>
@@ -76,9 +77,9 @@ std::vector<float> collect(safsyn::BufferedSynth& synth)
 	check(synth.stats().error.empty(), "playback error");
 	return output;
 }
-void queue_test()
+void queue_test(size_t capacity)
 {
-	safsyn::detail::MidiQueue<uint64_t> queue(127);
+	safsyn::detail::MidiQueue<uint64_t> queue(capacity);
 	constexpr size_t producers = 4, count = 25000;
 	std::array<std::thread, producers> writers;
 	for (size_t p = 0; p < producers; ++p) writers[p] = std::thread([&, p] {
@@ -98,6 +99,41 @@ void queue_test()
 	for (auto& writer : writers) writer.join();
 	check(correct, "concurrent MIDI producers lost, duplicated, or reordered events");
 	uint64_t item = 0; check(!queue.pop(item), "queue should be empty");
+}
+void pending_queue_test()
+{
+	for (size_t capacity : {size_t{0}, size_t{1}, size_t{17}, size_t{127}, size_t{4096}})
+	{
+		safsyn::detail::PendingQueue<uint64_t> queue(capacity);
+		std::deque<uint64_t> expected;
+		uint32_t random = 42;
+		for (uint64_t event = 0; event < 100000; ++event)
+		{
+			random = random * 1664525u + 1013904223u;
+			if (event % 8191 == 8190)
+			{
+				queue.clear(); expected.clear();
+			}
+			else if (random % 3 != 0 || expected.empty())
+			{
+				const bool room = expected.size() < capacity;
+				check(queue.push_back(event) == room, "pending queue capacity changed");
+				if (room) expected.push_back(event);
+			}
+			else
+			{
+				check(queue.front() == expected.front(), "pending queue reordered an event");
+				queue.pop_front(); expected.pop_front();
+			}
+			check(queue.size() == expected.size() && queue.empty() == expected.empty(),
+				"pending queue wrap/growth/clear changed its size");
+		}
+		while (!expected.empty())
+		{
+			check(queue.front() == expected.front(), "pending queue tail changed");
+			queue.pop_front(); expected.pop_front();
+		}
+	}
 }
 void ring_test()
 {
@@ -571,7 +607,8 @@ int main()
 {
 	try
 	{
-		queue_test(); ring_test(); file_timing_test(); parallel_test(); live_recovery_test(); lifecycle_and_limiter_test();
+		for (size_t capacity : {2, 3, 127, 128, 262144}) queue_test(capacity);
+		pending_queue_test(); ring_test(); file_timing_test(); parallel_test(); live_recovery_test(); lifecycle_and_limiter_test();
 		file_sender_backpressure_test(); phase_preparation_test();
 		note_gate_test(); shedding_test();
 		analytic_tick_queue_test();

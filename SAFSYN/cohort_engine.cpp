@@ -164,10 +164,23 @@ struct CohortSlot
 	RenderCohort cohort;
 	uint32_t generation = 1;
 	uint32_t channel_previous = invalid_index;
-	uint32_t channel_next = invalid_index;
 	uint32_t note_previous = invalid_index;
 	uint32_t note_next = invalid_index;
 	bool occupied = false;
+};
+
+// A steal probes up to 32 voices. Keep its linked list and comparison fields
+// together instead of walking full sample/filter/phase states for every probe.
+struct StealInfo
+{
+	uint64_t multiplicity = 0;
+	uint64_t oldest_serial = 0;
+	uint64_t envelope_frame = 0;
+	double gain = 0.0;
+	float env = 0.0f;
+	uint32_t next = invalid_index;
+	CohortStage stage = CohortStage::Off;
+	uint8_t channel = 0, note = 0;
 };
 
 struct LogicalRegionLink
@@ -336,6 +349,7 @@ struct CohortEngineState
 
 	std::vector<CohortSlot> cohorts;
 	std::vector<uint32_t> free_cohorts;
+	std::vector<StealInfo> steal_info;
 	std::vector<LogicalSlot> logical_batches;
 	std::vector<uint32_t> free_logical_batches;
 	std::array<std::vector<StableHandle>, 16 * 128> note_stacks;
@@ -402,11 +416,12 @@ struct CohortEngineState
 	void link_cohort(uint32_t index) noexcept
 	{
 		auto& slot = cohorts[index];
+		auto& next = steal_info[index].next;
 		const uint8_t channel = slot.cohort.channel;
 		slot.channel_previous = invalid_index;
-		slot.channel_next = channel_heads[channel];
-		if (slot.channel_next != invalid_index)
-			cohorts[slot.channel_next].channel_previous = index;
+		next = channel_heads[channel];
+		if (next != invalid_index)
+			cohorts[next].channel_previous = index;
 		channel_heads[channel] = index;
 		++active_cohorts_by_channel[channel];
 
@@ -421,16 +436,16 @@ struct CohortEngineState
 	void unlink_cohort(uint32_t index) noexcept
 	{
 		auto& slot = cohorts[index];
+		auto& next = steal_info[index].next;
 		const uint8_t channel = slot.cohort.channel;
 		if (slot.channel_previous == invalid_index)
-			channel_heads[channel] = slot.channel_next;
+			channel_heads[channel] = next;
 		else
-			cohorts[slot.channel_previous].channel_next = slot.channel_next;
-		if (slot.channel_next != invalid_index)
-			cohorts[slot.channel_next].channel_previous = slot.channel_previous;
+			steal_info[slot.channel_previous].next = next;
+		if (next != invalid_index)
+			cohorts[next].channel_previous = slot.channel_previous;
 		if (steal_cursors[channel] == index)
-			steal_cursors[channel] = slot.channel_next != invalid_index
-				? slot.channel_next : channel_heads[channel];
+			steal_cursors[channel] = next != invalid_index ? next : channel_heads[channel];
 		--active_cohorts_by_channel[channel];
 
 		const size_t key = note_index(channel, slot.cohort.note);
@@ -441,7 +456,7 @@ struct CohortEngineState
 		if (slot.note_next != invalid_index)
 			cohorts[slot.note_next].note_previous = slot.note_previous;
 		slot.channel_previous = invalid_index;
-		slot.channel_next = invalid_index;
+		next = invalid_index;
 		slot.note_previous = invalid_index;
 		slot.note_next = invalid_index;
 	}
@@ -470,19 +485,18 @@ struct CohortEngineState
 	StealCandidate steal_candidate(SynthEngine& owner, uint8_t request_channel,
 		uint8_t request_note) noexcept
 	{
-		auto estimated_level = [&](const RenderCohort& cohort) {
+		auto estimated_level = [&](const StealInfo& cohort) {
 			const auto& channel = owner.channels_[cohort.channel];
-			const double gain = (std::max)(std::abs(cohort.gain_l), std::abs(cohort.gain_r));
 			return static_cast<double>(cohort.env) * channel.volume * channel.expression *
-				owner.master_volume_ * gain * cohort.phase.multiplicity;
+				owner.master_volume_ * cohort.gain * cohort.multiplicity;
 		};
 		// Each probed cohort's level is estimated once and kept with the leaders.
 		auto prefer = [&](uint32_t selected, double candidate_level, uint32_t challenger,
 			double current_level) {
 			if (selected == invalid_index)
 				return true;
-			const auto& current = cohorts[challenger].cohort;
-			const auto& candidate = cohorts[selected].cohort;
+			const auto& current = steal_info[challenger];
+			const auto& candidate = steal_info[selected];
 			const bool current_releasing = current.stage == CohortStage::Release;
 			const bool candidate_releasing = candidate.stage == CohortStage::Release;
 			return (current_releasing && !candidate_releasing) ||
@@ -541,7 +555,15 @@ struct CohortEngineState
 		double best_different_key_level = 0.0;
 		for (size_t offset = 0; offset < probe_count; ++offset)
 		{
-			const auto& cohort = cohorts[index].cohort;
+			auto& cohort = steal_info[index];
+			// Refresh once after mixing, on the first probe of this voice. This
+			// keeps ordinary renders free of maintenance when no stealing occurs.
+			if (cohort.envelope_frame != owner.stats_.rendered_frames)
+			{
+				cohort.env = cohorts[index].cohort.env;
+				cohort.stage = cohorts[index].cohort.stage;
+				cohort.envelope_frame = owner.stats_.rendered_frames;
+			}
 			const double level = estimated_level(cohort);
 			if (prefer(best, best_level, index, level))
 			{
@@ -555,8 +577,7 @@ struct CohortEngineState
 				best_different_key = index;
 				best_different_key_level = level;
 			}
-			index = cohorts[index].channel_next != invalid_index
-				? cohorts[index].channel_next : head;
+			index = cohort.next != invalid_index ? cohort.next : head;
 		}
 		steal_cursors[victim_channel] = index;
 		owner.stats_.steal_candidate_visits += probe_count;
@@ -623,10 +644,15 @@ struct CohortEngineState
 			if (cohorts.size() >= invalid_index)
 				return {};
 			index = static_cast<uint32_t>(cohorts.size());
+			if (steal_info.size() <= index) steal_info.resize(size_t{index} + 1);
 			cohorts.push_back({});
 		}
 		auto& slot = cohorts[index];
 		slot.cohort = std::move(cohort);
+		const auto& voice = slot.cohort;
+		steal_info[index] = {voice.phase.multiplicity, voice.oldest_serial, owner.stats_.rendered_frames,
+			(std::max)(std::abs(voice.gain_l), std::abs(voice.gain_r)), voice.env,
+			invalid_index, voice.stage, voice.channel, voice.note};
 		slot.occupied = true;
 		link_cohort(index);
 		++active_cohort_count;
@@ -768,6 +794,7 @@ struct CohortEngineState
 			released.release_target = {};
 			released.release_target_frame = 0;
 			source.phase.subtract(contribution);
+			steal_info[link.cohort.index].multiplicity = source.phase.multiplicity;
 			const bool source_remains = source.phase.multiplicity != 0;
 			const StableHandle cached_release_target = source.release_target;
 			const bool cached_release_same_frame =
@@ -788,6 +815,7 @@ struct CohortEngineState
 			if (target_slot && target_slot->cohort.stage == CohortStage::Release)
 			{
 				target_slot->cohort.phase.add(contribution);
+				steal_info[cached_release_target.index].multiplicity = target_slot->cohort.phase.multiplicity;
 				owner.stats_.maximum_cohort_multiplicity = (std::max)(
 					owner.stats_.maximum_cohort_multiplicity,
 					target_slot->cohort.phase.multiplicity);
@@ -875,6 +903,7 @@ struct CohortEngineState
 					candidate_slot->cohort.birth_frame == owner.stats_.rendered_frames)
 				{
 					candidate_slot->cohort.phase.add(aggregate);
+					steal_info[candidate->second.index].multiplicity = candidate_slot->cohort.phase.multiplicity;
 					active_logical += count;
 					handle = candidate->second;
 					owner.stats_.logical_voices_merged += count;
@@ -1041,6 +1070,8 @@ struct CohortEngineState
 					continue;
 				if (!begin_release(owner, slot.cohort, 0.005f))
 					retire_cohort(owner, index, true);
+				else
+					steal_info[index].stage = slot.cohort.stage;
 			}
 		}
 		start_batch(owner, channel, note, velocity, count, matches, has_one_shot);
@@ -1181,18 +1212,19 @@ struct CohortEngineState
 	void update_channel_gains(SynthEngine& owner, uint8_t channel) noexcept
 	{
 		for (uint32_t index = channel_heads[channel]; index != invalid_index;
-			index = cohorts[index].channel_next)
+			index = steal_info[index].next)
 		{
 			auto& cohort = cohorts[index].cohort;
 			owner.compute_gains(*cohort.region, channel, cohort.velocity,
 				cohort.gain_l, cohort.gain_r);
+			steal_info[index].gain = (std::max)(std::abs(cohort.gain_l), std::abs(cohort.gain_r));
 		}
 	}
 
 	void update_channel_filters(SynthEngine& owner, uint8_t channel) noexcept
 	{
 		for (uint32_t index = channel_heads[channel]; index != invalid_index;
-			index = cohorts[index].channel_next)
+			index = steal_info[index].next)
 		{
 			auto& cohort = cohorts[index].cohort;
 			if (cohort.filter.set(owner.filter_coefficients(*cohort.region, channel)))
@@ -1203,7 +1235,7 @@ struct CohortEngineState
 	void update_channel_releases(SynthEngine& owner, uint8_t channel) noexcept
 	{
 		for (uint32_t index = channel_heads[channel]; index != invalid_index;
-			index = cohorts[index].channel_next)
+			index = steal_info[index].next)
 		{
 			auto& cohort = cohorts[index].cohort;
 			if (cohort.stage == CohortStage::Release && !cohort.release_override)
@@ -1863,6 +1895,7 @@ struct CohortEngineState
 	void clear() noexcept
 	{
 		cohorts.clear();
+		steal_info.clear();
 		free_cohorts.clear();
 		channel_heads.fill(invalid_index);
 		steal_cursors.fill(invalid_index);
@@ -1906,6 +1939,7 @@ void CohortEngine::reserve_playback(uint32_t maximum_block_frames, size_t region
 	// Reserve, do not resize: unused slots must not affect iteration/stealing order.
 	const size_t capacity = state.maximum_cohorts;
 	state.cohorts.reserve(capacity);
+	state.steal_info.reserve(capacity);
 	state.free_cohorts.reserve(capacity);
 	state.logical_batches.reserve(capacity);
 	state.free_logical_batches.reserve(capacity);

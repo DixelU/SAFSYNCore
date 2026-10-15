@@ -19,6 +19,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <bit>
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
@@ -72,6 +73,7 @@ struct Options
 	double start_seconds = 0.0;
 	double duration_seconds = 30.0;
 	bool timeline = false;
+	bool checksum = false;
 	bool live = false;
 	bool shed = false;
 	uint32_t grid = safsyn::PlaybackOptions{}.live_event_grid_frames;
@@ -91,7 +93,7 @@ int usage()
 {
 	std::cerr << "usage: safsyn-live-profile <bank.sf2|.sfz> <file.mid> [--threads 1,4,16]\n"
 		"       [--cohorts 4096] [--analytic] [--rate 48000] [--block 256]\n"
-		"       [--start seconds] [--duration seconds] [--timeline]\n"
+		"       [--start seconds] [--duration seconds] [--timeline] [--checksum]\n"
 		"       [--live [--buffer 4096] [--shed] [--grid 1]]   (--threads 0 selects the automatic count)\n";
 	return 2;
 }
@@ -132,7 +134,9 @@ int profile_blocks(const Options& options, const safsyn::Soundfont& bank,
 
 	std::cout << "threads,audio_s,dispatch_s,render_s,realtime_factor,dispatch_share,"
 		"busy_cores,late_blocks,blocks,worst_block_ms,events,peak_block_events,"
-		"peak_cohorts,parallel_calls\n";
+		"peak_cohorts,parallel_calls";
+	if (options.checksum) std::cout << ",audio_checksum";
+	std::cout << '\n';
 	for (const size_t threads : options.threads)
 	{
 		engine.reset();
@@ -153,6 +157,7 @@ int profile_blocks(const Options& options, const safsyn::Soundfont& bank,
 		}
 
 		Totals totals;
+		uint64_t checksum = 14695981039346656037ull;
 		double second_dispatch = 0.0, second_render = 0.0;
 		uint64_t second_events = 0, second_mark = first_frame;
 		const uint64_t parallel_before = engine.stats().parallel_render_calls;
@@ -195,6 +200,11 @@ int profile_blocks(const Options& options, const safsyn::Soundfont& bank,
 			const auto render_started = Clock::now();
 			engine.render_audio(block.data(), options.block_frames);
 			const double render_time = seconds_since(render_started);
+			// Hash outside the measured dispatch/mix stages. This checks exact
+			// audio across dispatch changes with the same thread/block settings.
+			if (options.checksum)
+				for (float sample : block)
+					checksum = (checksum ^ std::bit_cast<uint32_t>(sample)) * 1099511628211ull;
 
 			totals.dispatch += dispatch_time;
 			totals.render += render_time;
@@ -230,7 +240,9 @@ int profile_blocks(const Options& options, const safsyn::Soundfont& bank,
 			<< ',' << totals.late_blocks << ',' << totals.blocks
 			<< ',' << totals.worst_block * 1000.0 << ',' << totals.events
 			<< ',' << totals.peak_events << ',' << totals.peak_cohorts
-			<< ',' << totals.parallel_calls << std::endl;
+			<< ',' << totals.parallel_calls;
+		if (options.checksum) std::cout << ',' << checksum;
+		std::cout << std::endl;
 	}
 	return 0;
 }
@@ -388,6 +400,7 @@ int main(int argc, char** argv)
 		else if (name == "--start") options.start_seconds = std::stod(value());
 		else if (name == "--duration") options.duration_seconds = std::stod(value());
 		else if (name == "--timeline") options.timeline = true;
+		else if (name == "--checksum") options.checksum = true;
 		else if (name == "--live") options.live = true;
 		else if (name == "--shed") options.shed = true;
 		else if (name == "--grid") options.grid = static_cast<uint32_t>(std::stoul(value()));

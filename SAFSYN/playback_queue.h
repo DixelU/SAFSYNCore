@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #ifdef _MSC_VER
@@ -23,11 +24,17 @@ template<class T> class MidiQueue
 	struct Cell { std::atomic<uint64_t> sequence{0}; T value{}; };
 	std::unique_ptr<Cell[]> cells_;
 	size_t capacity_;
+	size_t mask_; // Zero selects the arbitrary-capacity fallback.
 	alignas(64) std::atomic<uint64_t> write_{0};
 	alignas(64) uint64_t read_ = 0;
+	size_t index(uint64_t position) const noexcept
+	{
+		return mask_ ? static_cast<size_t>(position) & mask_
+			: static_cast<size_t>(position % capacity_);
+	}
 public:
 	explicit MidiQueue(size_t capacity) : cells_(std::make_unique<Cell[]>(capacity)),
-		capacity_(capacity)
+		capacity_(capacity), mask_((capacity & (capacity - 1)) == 0 ? capacity - 1 : 0)
 	{
 		if (capacity < 2) throw std::invalid_argument("MIDI queue capacity must be >= 2");
 		for (size_t i = 0; i < capacity; ++i) cells_[i].sequence.store(i);
@@ -37,7 +44,7 @@ public:
 		uint64_t position = write_.load(std::memory_order_relaxed);
 		for (;;)
 		{
-			auto& cell = cells_[position % capacity_];
+			auto& cell = cells_[index(position)];
 			const uint64_t sequence = cell.sequence.load(std::memory_order_acquire);
 			if (sequence == position)
 			{
@@ -55,13 +62,54 @@ public:
 	}
 	bool pop(T& value) noexcept
 	{
-		auto& cell = cells_[read_ % capacity_];
+		auto& cell = cells_[index(read_)];
 		if (cell.sequence.load(std::memory_order_acquire) != read_ + 1) return false;
 		value = cell.value;
 		cell.sequence.store(read_ + capacity_, std::memory_order_release);
 		++read_;
 		return true;
 	}
+};
+
+// Single-owner staging for timed MIDI events. Storage grows up to the existing
+// pending-event limit and is reused across bursts, without per-event nodes.
+template<class T> class PendingQueue
+{
+	static_assert(std::is_trivially_copyable_v<T>);
+	std::vector<T> values_;
+	size_t limit_, first_ = 0, count_ = 0;
+
+	void grow()
+	{
+		std::vector<T> next((std::min)(limit_, (std::max)(size_t{16}, values_.size() * 2)));
+		const size_t first_count = (std::min)(count_, values_.size() - first_);
+		if (first_count) std::copy_n(values_.data() + first_, first_count, next.data());
+		if (count_ > first_count)
+			std::copy_n(values_.data(), count_ - first_count, next.data() + first_count);
+		values_.swap(next);
+		first_ = 0;
+	}
+public:
+	explicit PendingQueue(size_t limit) : limit_(limit) {}
+	bool empty() const noexcept { return count_ == 0; }
+	size_t size() const noexcept { return count_; }
+	const T& front() const noexcept { return values_[first_]; }
+	bool push_back(const T& value)
+	{
+		if (count_ == limit_) return false;
+		if (count_ == values_.size()) grow();
+		size_t end = first_ + count_;
+		if (end >= values_.size()) end -= values_.size();
+		values_[end] = value;
+		++count_;
+		return true;
+	}
+	void pop_front() noexcept
+	{
+		if (++first_ == values_.size()) first_ = 0;
+		--count_;
+	}
+	void clear() noexcept { first_ = count_ = 0; }
 };
 
 // Stereo frame ring. Read/write are exclusively owned by consumer/producer.
