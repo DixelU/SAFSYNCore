@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <utility>
 #include <vector>
 
@@ -49,17 +48,25 @@ private:
 	{
 		float left = 0.0f;
 		float right = 0.0f;
-		double peak = 0.0;
 		uint64_t index = 0;
 	};
 
 	void push_frame(float left, float right, std::vector<float>& output);
 	void emit_oldest(std::vector<float>& output);
+	void emit_frame(const Frame& frame, double peak, std::vector<float>& output);
+	size_t ring_index(size_t first, size_t offset) const noexcept;
 
 	MasteringSettings settings_;
 	MasteringStats stats_;
-	std::deque<Frame> pending_;
-	std::deque<std::pair<uint64_t, double>> maximums_;
+	// Each window holds at most lookahead + 1 frames, including the new input.
+	// Round storage to a power of two for inexpensive wrapping on x86 too.
+	std::vector<Frame> pending_;
+	std::vector<std::pair<uint64_t, double>> maximums_;
+	size_t ring_mask_ = 0;
+	size_t pending_first_ = 0;
+	size_t pending_count_ = 0;
+	size_t maximums_first_ = 0;
+	size_t maximums_count_ = 0;
 	double ceiling_ = 1.0;
 	double limiter_gain_ = 1.0;
 	double release_coefficient_ = 0.0;

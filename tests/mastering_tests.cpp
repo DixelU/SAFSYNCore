@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
 namespace
@@ -39,7 +40,7 @@ std::vector<float> process(const std::vector<float>& input,
 
 void test_identity_and_gain()
 {
-	const std::vector<float> input = {0.25f, -0.5f, 1.0f, -0.125f, -0.75f, 0.75f};
+	const std::vector<float> input = {0.25f, -0.5f, 1.0f, -0.125f, -0.75f, 0.75f, 0.0f, -0.0f};
 	check(process(input, {}, 2) == input,
 		"inactive mastering processor is bit-identical");
 	safsyn::MasteringSettings gain;
@@ -49,6 +50,7 @@ void test_identity_and_gain()
 	for (size_t index = 0; index < input.size() && half; ++index)
 		half = std::abs(output[index] - input[index] * 0.5f) < 1e-7f;
 	check(half, "output gain is applied before optional limiting");
+	check(!std::signbit(output[6]) && std::signbit(output[7]), "gain preserves signed zero");
 }
 
 void test_lookahead_limiter()
@@ -94,6 +96,110 @@ void test_settings_validation()
 	settings.limiter_ceiling_db = 1.0;
 	check(!safsyn::mastering_settings_valid(settings), "positive limiter ceilings are rejected");
 }
+
+void test_window_reference()
+{
+	// Scan the full future window independently of the streaming peak queue.
+	// Ramps fill the queue, ties collapse it, and bursts exercise wrapped tails.
+	std::vector<float> input(10019 * 2);
+	uint32_t random = 42;
+	for (size_t frame = 0; frame < input.size() / 2; ++frame)
+	{
+		random = random * 1664525u + 1013904223u;
+		float sample = static_cast<float>(random >> 8) / 8388608.0f - 1.0f;
+		if (frame < 6000)
+			sample = static_cast<float>(6000 - frame) / 1000.0f;
+		else if (frame < 7000)
+			sample = 0.75f;
+		input[frame * 2] = sample;
+		input[frame * 2 + 1] = -sample * 0.5f;
+	}
+	for (uint32_t sample_rate : {1000u, 48000u})
+	for (double lookahead_ms : {0.0, 0.1, 5.0, 100.0})
+	for (size_t frames : {size_t{0}, size_t{1}, size_t{17}, input.size() / 2})
+	{
+		safsyn::MasteringSettings settings;
+		settings.output_gain_db = 3.0;
+		settings.limiter_enabled = true;
+		settings.limiter_lookahead_ms = lookahead_ms;
+		settings.limiter_release_ms = 20.0;
+		const size_t lookahead = static_cast<size_t>(std::llround(lookahead_ms * sample_rate / 1000.0));
+		const double gain = std::pow(10.0, settings.output_gain_db / 20.0);
+		const double ceiling = std::pow(10.0, settings.limiter_ceiling_db / 20.0);
+		const double release = std::exp(-1.0 / (settings.limiter_release_ms * sample_rate / 1000.0));
+		std::vector<float> expected(input.begin(), input.begin() + frames * 2);
+		for (float& sample : expected)
+			sample = static_cast<float>(static_cast<double>(sample) * gain);
+		std::vector<double> peaks(frames);
+		for (size_t frame = 0; frame < frames; ++frame)
+			peaks[frame] = (std::max)(std::abs(static_cast<double>(expected[frame * 2])),
+				std::abs(static_cast<double>(expected[frame * 2 + 1])));
+		double current_gain = 1.0;
+		double minimum_gain = 1.0;
+		uint64_t limited_frames = 0;
+		for (size_t frame = 0; frame < frames; ++frame)
+		{
+			const size_t end = (std::min)(frames, frame + lookahead + 1);
+			const double peak = *std::max_element(peaks.begin() + frame, peaks.begin() + end);
+			const double desired = peak > ceiling ? ceiling / peak : 1.0;
+			current_gain = desired < current_gain ? desired :
+				desired + release * (current_gain - desired);
+			current_gain = (std::min)(current_gain, desired);
+			minimum_gain = (std::min)(minimum_gain, current_gain);
+			limited_frames += current_gain < 1.0 - 1e-12;
+			for (size_t channel = 0; channel < 2; ++channel)
+				expected[frame * 2 + channel] = static_cast<float>(
+					static_cast<double>(expected[frame * 2 + channel]) * current_gain);
+		}
+		for (uint32_t block : {1u, 13u, 256u, 4096u})
+		{
+			safsyn::StereoMasteringProcessor processor(sample_rate, settings);
+			std::vector<float> output;
+			for (size_t cursor = 0; cursor < frames;)
+			{
+				const uint32_t count = static_cast<uint32_t>((std::min)(frames - cursor, size_t{block}));
+				processor.process(input.data() + cursor * 2, count, output);
+				cursor += count;
+				check(output.size() == (cursor > lookahead ? cursor - lookahead : 0) * 2,
+					"streaming output retains exactly the lookahead tail");
+			}
+			processor.finish(output);
+			processor.finish(output);
+			check(output == expected, "window output and repeated finish match the independent reference");
+			check(processor.stats().lookahead_frames == lookahead &&
+				processor.stats().output_gain_linear == gain &&
+				processor.stats().limited_frames == limited_frames &&
+				processor.stats().minimum_limiter_gain == minimum_gain &&
+				processor.stats().maximum_gain_reduction_db ==
+					(minimum_gain >= 1.0 ? 0.0 : -20.0 * std::log10(minimum_gain)),
+				"limiter statistics match the independent reference");
+			bool rejected = false;
+			try { processor.process(nullptr, 0, output); }
+			catch (const std::logic_error&) { rejected = true; }
+			check(rejected, "processing after finish is rejected");
+		}
+	}
+}
+
+void test_replacement()
+{
+	safsyn::MasteringSettings settings;
+	settings.limiter_enabled = true;
+	settings.limiter_lookahead_ms = 10.0;
+	safsyn::StereoMasteringProcessor processor(1000, settings);
+	std::vector<float> output;
+	const std::vector<float> previous(1000 * 2, 4.0f);
+	processor.process(previous.data(), 1000, output);
+	check(processor.stats().limited_frames != 0, "replacement fixture has buffered and limited audio");
+	processor = safsyn::StereoMasteringProcessor(1000, settings);
+	output.clear();
+	const std::vector<float> current = {0.25f, -0.5f, 0.75f, 0.25f};
+	processor.process(current.data(), 2, output);
+	processor.finish(output);
+	check(output == current && processor.stats().limited_frames == 0 &&
+		processor.stats().minimum_limiter_gain == 1.0,
+		"replacement discards old ring contents and limiter state during seek recovery");
+}
 }
 
 int main()
@@ -101,6 +207,8 @@ int main()
 	test_identity_and_gain();
 	test_lookahead_limiter();
 	test_settings_validation();
+	test_window_reference();
+	test_replacement();
 	if (failures != 0)
 	{
 		std::cerr << failures << " mastering test(s) failed\n";

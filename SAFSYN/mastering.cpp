@@ -1,6 +1,7 @@
 #include "mastering.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <stdexcept>
 
@@ -33,6 +34,15 @@ StereoMasteringProcessor::StereoMasteringProcessor(uint32_t sample_rate,
 		const double release_frames = settings.limiter_release_ms * sample_rate / 1000.0;
 		release_coefficient_ = std::exp(-1.0 / release_frames);
 	}
+	const size_t capacity = std::bit_ceil(static_cast<size_t>(stats_.lookahead_frames) + 1);
+	ring_mask_ = capacity - 1;
+	pending_.resize(capacity);
+	maximums_.resize(capacity);
+}
+
+size_t StereoMasteringProcessor::ring_index(size_t first, size_t offset) const noexcept
+{
+	return (first + offset) & ring_mask_;
 }
 
 void StereoMasteringProcessor::push_frame(float left, float right,
@@ -45,21 +55,43 @@ void StereoMasteringProcessor::push_frame(float left, float right,
 	const double peak = (std::max)(std::abs(static_cast<double>(gained_left)),
 		std::abs(static_cast<double>(gained_right)));
 	const uint64_t index = next_index_++;
-	pending_.push_back({gained_left, gained_right, peak, index});
-	while (!maximums_.empty() && maximums_.back().second <= peak)
-		maximums_.pop_back();
-	maximums_.push_back({index, peak});
-	if (pending_.size() > stats_.lookahead_frames)
+	if (stats_.lookahead_frames == 0)
+	{
+		emit_frame({gained_left, gained_right, index}, peak, output);
+		return;
+	}
+	pending_[ring_index(pending_first_, pending_count_)] = {gained_left, gained_right, index};
+	++pending_count_;
+	while (maximums_count_ != 0 &&
+		maximums_[ring_index(maximums_first_, maximums_count_ - 1)].second <= peak)
+		--maximums_count_;
+	maximums_[ring_index(maximums_first_, maximums_count_)] = {index, peak};
+	++maximums_count_;
+	if (pending_count_ > stats_.lookahead_frames)
 		emit_oldest(output);
 }
 
 void StereoMasteringProcessor::emit_oldest(std::vector<float>& output)
 {
-	if (pending_.empty())
+	if (pending_count_ == 0)
 		return;
+	const Frame frame = pending_[pending_first_];
+	emit_frame(frame, maximums_[maximums_first_].second, output);
+	pending_first_ = ring_index(pending_first_, 1);
+	--pending_count_;
+	if (maximums_count_ != 0 && maximums_[maximums_first_].first == frame.index)
+	{
+		maximums_first_ = ring_index(maximums_first_, 1);
+		--maximums_count_;
+	}
+}
+
+void StereoMasteringProcessor::emit_frame(const Frame& frame, double peak,
+	std::vector<float>& output)
+{
 	double desired_gain = 1.0;
-	if (settings_.limiter_enabled && !maximums_.empty() && maximums_.front().second > ceiling_)
-		desired_gain = ceiling_ / maximums_.front().second;
+	if (settings_.limiter_enabled && peak > ceiling_)
+		desired_gain = ceiling_ / peak;
 	if (desired_gain < limiter_gain_)
 		limiter_gain_ = desired_gain;
 	else if (settings_.limiter_enabled)
@@ -67,15 +99,11 @@ void StereoMasteringProcessor::emit_oldest(std::vector<float>& output)
 			release_coefficient_ * (limiter_gain_ - desired_gain);
 	limiter_gain_ = (std::min)(limiter_gain_, desired_gain);
 
-	const Frame frame = pending_.front();
 	output.push_back(static_cast<float>(static_cast<double>(frame.left) * limiter_gain_));
 	output.push_back(static_cast<float>(static_cast<double>(frame.right) * limiter_gain_));
 	stats_.minimum_limiter_gain = (std::min)(stats_.minimum_limiter_gain, limiter_gain_);
 	if (limiter_gain_ < 1.0 - 1e-12)
 		++stats_.limited_frames;
-	pending_.pop_front();
-	if (!maximums_.empty() && maximums_.front().first == frame.index)
-		maximums_.pop_front();
 }
 
 void StereoMasteringProcessor::process(const float* interleaved_stereo, uint32_t frames,
@@ -94,7 +122,7 @@ void StereoMasteringProcessor::finish(std::vector<float>& output)
 {
 	if (finished_)
 		return;
-	while (!pending_.empty())
+	while (pending_count_ != 0)
 		emit_oldest(output);
 	finished_ = true;
 	stats_.maximum_gain_reduction_db = stats_.minimum_limiter_gain >= 1.0 ? 0.0 :

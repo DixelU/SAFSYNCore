@@ -514,3 +514,58 @@ The live delivery test uses all 20 logical CPUs; its simulated sender and audio
 consumer spin/yield, so restricting them to the same six CPUs as the mixer would
 create additional contention. Headless delivery results do not establish WASAPI
 latency or eliminate sustained overload in every MIDI passage.
+
+## Mastering windows (October 15, 2026)
+
+The remaining two production deques in SYNCore were the stereo lookahead
+buffer and monotonic peak window in `StereoMasteringProcessor`. Both are
+updated for every sample frame, after either direct or analytic mixing. They
+now use vectors allocated once, rounded up to a power of two for masked
+wraparound. The actual lookahead and peak-expiry rules are unchanged. A
+zero-lookahead path emits the current frame directly through the same gain
+calculation; it also covers inactive and gain-only processing.
+
+This removes window growth from processing without a shared container library,
+extra threads or changed limiter arithmetic. At 48 kHz and 5 ms lookahead,
+each vector holds 256 entries: 8 KiB for both windows combined. Output-vector
+capacity remains the caller's responsibility, as before.
+
+### Measurement
+
+Baseline: `3a94abc`. Host: Intel Core i5-13600K, Windows, MSVC 19.51. Standalone
+before/after builds use `/O2 /EHsc /std:c++20 /MD`, pinned to logical CPU 0.
+Each case processes 960,000 stereo frames (20 seconds at 48 kHz) in 256-frame
+blocks and finishes the tail. Construction, output reservation and checksums
+are outside timing. Each pass has one warm-up and seven timed repetitions;
+the table gives the median of three interleaved before/after passes.
+
+| Case | x64 before (ms) | x64 after (ms) | x86 before (ms) | x86 after (ms) |
+|---|---:|---:|---:|---:|
+| Random peaks, 5 ms limiter | 17.777 | 15.065 | 20.491 | 15.898 |
+| Equal peaks, 5 ms limiter | 8.900 | 6.920 | 9.420 | 8.204 |
+| Random peaks, inactive | 7.617 | 4.172 | 8.898 | 4.940 |
+| Random peaks, gain only | 7.445 | 4.103 | 8.273 | 4.625 |
+
+Across random, descending and equal peaks, delayed limiting takes 13-29% less
+time; the zero-window cases take 33-53% less. All 30 architecture/case pairs
+improve in these measurements. All before/after audio checksums, limited-frame
+counts and minimum gains match. Raw pass medians are in
+`mastering_queue_performance_2026-10-15.csv`.
+
+These percentages apply to mastering only. It already costs milliseconds per
+20 seconds of audio, so this is a small reduction in whole-player CPU work and
+does not remove the serial MIDI-dispatch bottleneck from the previous section.
+
+The expanded mastering regression scans each complete lookahead window as an
+independent reference. It covers zero/fractional/maximum lookahead, full and
+wrapped windows, peak ties, short streams, varied block sizes, exact limiter
+statistics, signed zero, repeated finish and seek-style processor replacement.
+All nine Release CTest suites pass on both x64 and x86. The application also
+passes its six focused integration suites and muted two-second WASAPI checks
+(x64 direct and x86 analytic, built-in instrument, zero underruns). The latter
+are integration checks, not dense real-file throughput measurements.
+
+Enable `SAFSYN_BUILD_BENCHMARKS` and run `safsyn-mastering-benchmark` to reproduce
+the cases. To compare against an older revision, compile this same benchmark
+source against that revision's `mastering.h` and `mastering.cpp`; no other
+synthesis source is needed.
