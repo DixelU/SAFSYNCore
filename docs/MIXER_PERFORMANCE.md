@@ -614,3 +614,59 @@ Raw values are in `sustain_dispatch_performance_2026-10-15.csv`.
 
 Run `safsyn-engine-benchmark --sustain 5` for the isolated cases. The real-file
 comparison uses the `safsyn-live-profile` command and affinity described above.
+
+## Analytic bank preparation (October 15, 2026)
+
+The supplied `sDetrimental Concert Grand Piano.sf2` contains 1,740 regions but
+only 87 unique stereo samples for phase preparation. All use 4,194,304-point
+FFTs, with no periodic-loop transforms: 174 forward and 174 inverse transforms
+in total. Loading the bank takes about 0.4-1.2 s in these local runs; the much
+larger startup cost is constructing the analytic cache.
+
+A diagnostic pass summing elapsed FFT-stage times across preparation workers
+attributed about 39% to bit reversal, 59% to butterflies, and 2% to twiddle-table
+construction. Large transforms now perform bit reversal in 8-by-8 tiles to
+reuse nearby cache lines. Small transforms keep the original permutation.
+Butterfly cancellation checks move outside runs of at most 16,384 butterflies,
+preserving their bounded polling interval and the original arithmetic.
+No extra heap storage, persistent cache, FFT dependency, or worker is added.
+
+On the same i5-13600K, MSVC x64 Release, automatic preparation still uses eight
+workers. Two quiet whole-bank passes against baseline `09b8d15` gave:
+
+| Measurement | Before | After |
+|---|---:|---:|
+| Cold analytic preparation, pass 1 | 27.901 s | 24.608 s |
+| Cold analytic preparation, pass 2 | 28.399 s | 25.153 s |
+| Mean | 28.150 s | 24.881 s |
+| Analytic PCM cache | 1,143,619,584 bytes | 1,143,619,584 bytes |
+
+This is an 11.6% reduction in preparation time, not an instant-loading solution.
+"Cold" means a new analytic cache; it does not mean a cold operating-system file
+cache. Repeating preparation on the same processor took 0.046-0.119 ms. Loading,
+hashing, and warm-cache checks are outside the cold timer. Raw repetitions are in
+`preparation_performance_2026-10-15.csv`.
+
+Every unique quadrature float and each region's selected rotation/scales are
+hashed outside timing. All four real-bank passes retain checksum
+`6509547379989056518`. Synthetic fixtures additionally cover unlooped samples,
+power-of-two loops, odd/even Bluestein loops, mono, and stereo. A permanent test
+uses the original FFT as an independent reference and compares all quadrature
+bits across the tiled threshold and both even and odd middle-index widths.
+Existing budget, cancellation, partial-cache resume, and serial/parallel tests
+continue to apply.
+
+With `SAFSYN_BUILD_BENCHMARKS=ON`, reproduce using:
+
+```text
+safsyn-preparation-benchmark <bank.sf2> 0 2
+safsyn-preparation-benchmark --synthetic 1 3
+safsyn-preparation-benchmark --synthetic-large 0 3
+```
+
+The first argument after the bank is the preparation thread count (zero selects
+automatic); the second is repetitions. The application still prepares the full
+bank so later notes and program changes do not trigger FFT work on the playback
+thread. Source PCM and temporary FFT storage are additional to the 1.065 GiB
+analytic cache. Ordinary matching Stop/Restart retains that cache in SAFC, while
+changing output preferences still creates a new output session and repeats it.
