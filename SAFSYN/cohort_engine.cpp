@@ -1,12 +1,16 @@
 #include "cohort_engine.h"
 
 #include "core.h"
+#include "cohort_mixer.h"
+#include "cpu_features.h"
+#include "scoped_denormals.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <thread>
@@ -14,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-#if defined(_M_X64) || defined(__SSE2__)
+#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #include <immintrin.h>
 #endif
 
@@ -22,7 +26,13 @@ namespace safsyn
 {
 namespace
 {
-constexpr uint32_t invalid_index = (std::numeric_limits<uint32_t>::max)();
+using detail::invalid_index;
+using detail::StableHandle;
+using detail::PhaseAggregate;
+using detail::CohortStage;
+using detail::RenderCohort;
+using detail::VectorSource;
+using detail::advance_envelope;
 
 // Briefly wait in userspace for dense event intervals, then park idle workers.
 // Acquire observes the job payload (or the completed audio) published by release.
@@ -32,7 +42,7 @@ uint64_t wait_for_change(std::atomic<uint64_t>& value, uint64_t previous) noexce
 	{
 		const uint64_t current = value.load(std::memory_order_acquire);
 		if (current != previous) return current;
-#if defined(_M_X64) || defined(__SSE2__)
+#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 		_mm_pause();
 #endif
 	}
@@ -53,7 +63,7 @@ float pcm_to_float(int16_t sample) noexcept
 void add_mix_buffer(float* destination, const float* source, size_t samples) noexcept
 {
 	size_t index = 0;
-#if defined(_M_X64) || defined(__SSE2__)
+#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 	for (; index + 4 <= samples; index += 4)
 	{
 		const __m128 accumulated = _mm_loadu_ps(destination + index);
@@ -64,14 +74,6 @@ void add_mix_buffer(float* destination, const float* source, size_t samples) noe
 	for (; index < samples; ++index)
 		destination[index] += source[index];
 }
-
-struct StableHandle
-{
-	uint32_t index = invalid_index;
-	uint32_t generation = 0;
-
-	bool valid() const noexcept { return index != invalid_index; }
-};
 
 struct OnsetKey
 {
@@ -95,249 +97,7 @@ struct OnsetKeyHash
 	}
 };
 
-struct PhaseAggregate
-{
-	uint64_t multiplicity = 0;
-	uint64_t coherent_count = 0;
-	uint64_t transformed_count = 0;
-	double cosine_left = 0.0;
-	double sine_left = 0.0;
-	double cosine_right = 0.0;
-	double sine_right = 0.0;
-	const float* quadrature_left = nullptr;
-	const float* quadrature_right = nullptr;
-	uint32_t attack_hold_frames = 0;
-	uint32_t attack_fade_frames = 0;
-	PhaseVoiceState singleton;
-	bool singleton_valid = false;
-	// Filter linear basis signals, not the weighted sum. A note-off can then
-	// split any phase contribution without guessing its individual history.
-	detail::StereoFilterState original_filter;
-	detail::StereoFilterState protected_filter;
-	detail::StereoFilterState changed_filter;
-	detail::StereoFilterState quadrature_filter;
-
-	// Without a protected attack every blend is exactly one: the protected basis
-	// only ever filters zeros and the changed basis equals the original one.
-	// Attack settings are engine-wide, so a cohort never switches between forms.
-	bool attack_window() const noexcept
-	{
-		return attack_hold_frames != 0 || attack_fade_frames != 0;
-	}
-
-	uint32_t protected_frames() const noexcept
-	{
-		return attack_hold_frames + attack_fade_frames;
-	}
-
-	void clear_filter_history() noexcept
-	{
-		original_filter = {};
-		protected_filter = {};
-		changed_filter = {};
-		quadrature_filter = {};
-	}
-
-	void inherit_filter_history(const PhaseAggregate& source) noexcept
-	{
-		original_filter = source.original_filter;
-		protected_filter = source.protected_filter;
-		changed_filter = source.changed_filter;
-		quadrature_filter = source.quadrature_filter;
-	}
-
-	std::array<float, 2> filtered_sample(const std::array<float, 2>& original0,
-		const std::array<float, 2>& original1, uint32_t index0, uint32_t index1,
-		float fraction, float envelope, const detail::FilterRamp& filter) noexcept
-	{
-		const bool window = attack_window();
-		auto blend_at = [&](uint32_t index) {
-			if (index < attack_hold_frames)
-				return 0.0f;
-			if (attack_fade_frames == 0 || index >= protected_frames())
-				return 1.0f;
-			const float u = static_cast<float>(index - attack_hold_frames) / attack_fade_frames;
-			return u * u * (3.0f - 2.0f * u);
-		};
-		const float blend0 = window ? blend_at(index0) : 1.0f;
-		const float blend1 = window ? blend_at(index1) : 1.0f;
-		auto interpolate = [&](float a, float b) { return (a + (b - a) * fraction) * envelope; };
-		std::array<float, 2> output{};
-		for (size_t channel = 0; channel < 2; ++channel)
-		{
-			const float a = original0[channel];
-			const float b = original1[channel];
-			const float original = original_filter.process(interpolate(a, b), channel, filter);
-			double result = static_cast<double>(original) * coherent_count;
-			if (transformed_count != 0)
-			{
-				float changed = original;
-				if (window)
-				{
-					const float protected_sample = protected_filter.process(
-						interpolate(a * (1.0f - blend0), b * (1.0f - blend1)), channel, filter);
-					changed = changed_filter.process(
-						interpolate(a * blend0, b * blend1), channel, filter);
-					result += static_cast<double>(protected_sample) * transformed_count;
-				}
-				if (quadrature_left)
-				{
-					const auto* quadrature = channel == 0 ? quadrature_left : quadrature_right;
-					const float shifted = quadrature_filter.process(interpolate(
-						quadrature[index0] * blend0, quadrature[index1] * blend1), channel, filter);
-					result += static_cast<double>(changed) * (channel == 0 ? cosine_left : cosine_right) -
-						static_cast<double>(shifted) * (channel == 0 ? sine_left : sine_right);
-				}
-			}
-			output[channel] = static_cast<float>(result);
-		}
-		return output;
-	}
-
-	void add(const PhaseVoiceState& state, uint64_t count = 1)
-	{
-		const uint64_t previous_multiplicity = multiplicity;
-		multiplicity += count;
-		if (previous_multiplicity == 0 && count == 1)
-		{
-			singleton = state;
-			singleton_valid = true;
-		}
-		else
-			singleton_valid = false;
-		if (state.kind == PhaseVoiceState::Kind::Coherent)
-		{
-			coherent_count += count;
-			return;
-		}
-		transformed_count += count;
-		attack_hold_frames = state.attack_hold_frames;
-		attack_fade_frames = state.attack_fade_frames;
-		quadrature_left = state.quadrature_left;
-		quadrature_right = state.quadrature_right;
-		cosine_left += static_cast<double>(state.cosine) * state.scale_left * count;
-		sine_left += static_cast<double>(state.sine) * state.scale_left * count;
-		cosine_right += static_cast<double>(state.cosine) * state.scale_right * count;
-		sine_right += static_cast<double>(state.sine) * state.scale_right * count;
-	}
-
-	void add(const PhaseAggregate& other)
-	{
-		const uint64_t previous_multiplicity = multiplicity;
-		multiplicity += other.multiplicity;
-		if (previous_multiplicity == 0 && other.multiplicity == 1 && other.singleton_valid)
-		{
-			singleton = other.singleton;
-			singleton_valid = true;
-		}
-		else if (other.multiplicity != 0)
-			singleton_valid = false;
-		coherent_count += other.coherent_count;
-		transformed_count += other.transformed_count;
-		cosine_left += other.cosine_left;
-		sine_left += other.sine_left;
-		cosine_right += other.cosine_right;
-		sine_right += other.sine_right;
-		if (other.quadrature_left)
-		{
-			quadrature_left = other.quadrature_left;
-			quadrature_right = other.quadrature_right;
-		}
-		if (other.transformed_count != 0)
-		{
-			attack_hold_frames = other.attack_hold_frames;
-			attack_fade_frames = other.attack_fade_frames;
-		}
-	}
-
-	void subtract(const PhaseAggregate& other) noexcept
-	{
-		multiplicity -= other.multiplicity;
-		coherent_count -= other.coherent_count;
-		transformed_count -= other.transformed_count;
-		cosine_left -= other.cosine_left;
-		sine_left -= other.sine_left;
-		cosine_right -= other.cosine_right;
-		sine_right -= other.sine_right;
-		if (multiplicity != 1)
-			singleton_valid = false;
-	}
-
-	// The scalar reference for SIMD kernels; they must reproduce it exactly.
-	float sample(float original, uint32_t index, bool right) const noexcept
-	{
-		if (multiplicity == 1 && singleton_valid)
-			return singleton.apply(original, index, right);
-		double changed = 0.0;
-		if (quadrature_left)
-		{
-			const float* quadrature = right ? quadrature_right : quadrature_left;
-			const double cosine = right ? cosine_right : cosine_left;
-			const double sine = right ? sine_right : sine_left;
-			changed = static_cast<double>(original) * cosine -
-				static_cast<double>(quadrature[index]) * sine;
-		}
-		const double coherent = static_cast<double>(original) * coherent_count;
-		if (transformed_count == 0)
-			return static_cast<float>(coherent);
-		const double original_transformed = static_cast<double>(original) * transformed_count;
-		double transformed = changed;
-		if (index < attack_hold_frames)
-			transformed = original_transformed;
-		else if (attack_fade_frames != 0 &&
-			index < attack_hold_frames + attack_fade_frames)
-		{
-			const double u = static_cast<double>(index - attack_hold_frames) /
-				attack_fade_frames;
-			const double blend = u * u * (3.0 - 2.0 * u);
-			transformed = original_transformed + (changed - original_transformed) * blend;
-		}
-		return static_cast<float>(coherent + transformed);
-	}
-};
-
-enum class CohortStage : uint8_t { Off, Attack, Hold, Decay, Sustain, Release };
-
-struct RenderCohort
-{
-	const SampleRegion* region = nullptr;
-	size_t region_id = 0;
-	uint8_t note = 0;
-	uint8_t velocity = 0;
-	uint8_t channel = 0;
-	double pos = 0.0;
-	double base_inc = 0.0;
-	bool loop_dir_fwd = true;
-	CohortStage stage = CohortStage::Off;
-	float env = 0.0f;
-	float env_inc = 0.0f;
-	float release_coefficient = 0.0f;
-	bool release_override = false;
-	// Released during its attack: the attack still runs to full level first.
-	bool finish_attack = false;
-	uint32_t hold_samples_left = 0;
-	float gain_l = 0.0f;
-	float gain_r = 0.0f;
-	uint64_t birth_frame = 0;
-	uint64_t release_frame = 0;
-	uint64_t oldest_serial = 0;
-	StableHandle release_target;
-	uint64_t release_target_frame = 0;
-	PhaseAggregate phase;
-	detail::FilterRamp filter;
-};
-
-#if defined(_M_X64) || defined(__SSE2__)
-// How a vectorized cohort turns its source sample into a mixed sample. Each
-// form evaluates exactly the scalar arithmetic it replaces, lane by lane.
-enum class VectorSource : uint8_t
-{
-	Coherent,       // one coherent voice: the PCM sample itself
-	CoherentSum,    // float(x * coherent_count)
-	AnalyticSingle, // PhaseVoiceState::apply after the protected attack
-	AnalyticSum,    // PhaseAggregate::sample after the protected attack
-};
-
+#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 __m128i load_low_64(const void* source) noexcept
 {
 	return _mm_loadl_epi64(static_cast<const __m128i*>(source));
@@ -481,6 +241,8 @@ struct RegionMatchCache
 
 struct CohortEngineState
 {
+	// Read the diagnostic override once, before any render workers are started.
+	const bool use_avx2 = detail::avx2_available() && !std::getenv("SAFSYN_DISABLE_AVX2");
 	// Retirements found while rendering a slot range, applied later by the owner.
 	struct RetiredList
 	{
@@ -966,78 +728,6 @@ struct CohortEngineState
 		cohort.release_override = seconds_override >= 0.0f;
 		cohort.finish_attack = attacking;
 		return true;
-	}
-
-	static float advance_envelope(SynthEngine& owner, RenderCohort& cohort) noexcept
-	{
-		switch (cohort.stage)
-		{
-		case CohortStage::Off:
-			return 0.0f;
-		case CohortStage::Attack:
-			cohort.env += cohort.env_inc;
-			if (cohort.env >= 1.0f)
-			{
-				cohort.env = 1.0f;
-				if (cohort.hold_samples_left > 0)
-					cohort.stage = CohortStage::Hold;
-				else if (cohort.region->decay > 0.0f && cohort.region->sustain < 1.0f)
-				{
-					cohort.stage = CohortStage::Decay;
-					cohort.env_inc = (cohort.region->sustain - 1.0f) /
-						(cohort.region->decay * owner.sample_rate_);
-				}
-				else
-					cohort.stage = CohortStage::Sustain;
-			}
-			break;
-		case CohortStage::Hold:
-			if (cohort.hold_samples_left > 0)
-				--cohort.hold_samples_left;
-			if (cohort.hold_samples_left == 0)
-			{
-				if (cohort.region->decay > 0.0f && cohort.region->sustain < 1.0f)
-				{
-					cohort.stage = CohortStage::Decay;
-					cohort.env_inc = (cohort.region->sustain - 1.0f) /
-						(cohort.region->decay * owner.sample_rate_);
-				}
-				else
-					cohort.stage = CohortStage::Sustain;
-			}
-			break;
-		case CohortStage::Decay:
-			cohort.env += cohort.env_inc;
-			if (cohort.env <= cohort.region->sustain)
-			{
-				cohort.stage = CohortStage::Sustain;
-				cohort.env = cohort.region->sustain;
-			}
-			break;
-		case CohortStage::Sustain:
-			cohort.env = cohort.region->sustain;
-			break;
-		case CohortStage::Release:
-			if (cohort.finish_attack)
-			{
-				// The same steps the attack would have taken, then the release.
-				cohort.env += cohort.env_inc;
-				if (cohort.env >= 1.0f)
-				{
-					cohort.env = 1.0f;
-					cohort.finish_attack = false;
-				}
-				break;
-			}
-			cohort.env *= cohort.release_coefficient;
-			if (cohort.env <= 1.0e-5f)
-			{
-				cohort.stage = CohortStage::Off;
-				return 0.0f;
-			}
-			break;
-		}
-		return cohort.env;
 	}
 
 	PhaseAggregate make_phase_aggregate(SynthEngine& owner, const SampleRegion& region,
@@ -1573,6 +1263,7 @@ struct CohortEngineState
 	// Runs on the owner and on every claimed worker until the cursor runs out.
 	void render_chunks(ParallelRenderState& state) noexcept
 	{
+		const detail::ScopedNoDenormals no_denormals;
 		const size_t samples = static_cast<size_t>(state.frames) * 2;
 		for (;;)
 		{
@@ -1598,7 +1289,7 @@ struct CohortEngineState
 		}
 	}
 
-#if defined(_M_X64) || defined(__SSE2__)
+#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 	using VectorKernel = uint32_t (*)(SynthEngine&, RenderCohort&, float*, uint32_t,
 		double, bool, float) noexcept;
 
@@ -1694,10 +1385,10 @@ struct CohortEngineState
 			default:
 			{
 				// Attack, hold, and decay can only advance towards sustain.
-				const float e0 = advance_envelope(owner, cohort);
-				const float e1 = advance_envelope(owner, cohort);
-				const float e2 = advance_envelope(owner, cohort);
-				const float e3 = advance_envelope(owner, cohort);
+				const float e0 = advance_envelope(owner.sample_rate_, cohort);
+				const float e1 = advance_envelope(owner.sample_rate_, cohort);
+				const float e2 = advance_envelope(owner.sample_rate_, cohort);
+				const float e3 = advance_envelope(owner.sample_rate_, cohort);
 				envelope = _mm_setr_ps(e0, e1, e2, e3);
 				break;
 			}
@@ -1803,7 +1494,7 @@ struct CohortEngineState
 			if (cohort.stage == CohortStage::Off || (cohort.stage == CohortStage::Release &&
 				!cohort.finish_attack && !(cohort.env * cohort.release_coefficient > 1.0e-5f)))
 				break;
-			const float envelope = advance_envelope(owner, cohort);
+			const float envelope = advance_envelope(owner.sample_rate_, cohort);
 			const uint32_t index = static_cast<uint32_t>(position);
 			const float fraction = static_cast<float>(position - index);
 
@@ -1876,8 +1567,13 @@ struct CohortEngineState
 	}
 
 	template<VectorSource Source>
-	static VectorKernel layout_kernel(const SampleRegion& region) noexcept
+	VectorKernel layout_kernel(const SampleRegion& region, uint32_t frames) const noexcept
 	{
+		// Double-precision group sums benefit from wider vectors. Single voices
+		// and tiny event intervals are faster with the existing four-frame path.
+		if constexpr (Source == VectorSource::CoherentSum || Source == VectorSource::AnalyticSum)
+			if (use_avx2 && frames >= 16)
+				return detail::avx2_kernel(Source, region);
 		if (region.channels != 2)
 			return &render_vector_frames<Source, false, false>;
 		if (region.pcm_right)
@@ -1897,7 +1593,7 @@ struct CohortEngineState
 
 	// start receives the first position at which the kernel can run (the end of
 	// a protected attack). Null means this cohort always uses the general kernel.
-	static VectorKernel select_vector_kernel(const RenderCohort& cohort, double& start) noexcept
+	VectorKernel select_vector_kernel(const RenderCohort& cohort, double& start, uint32_t frames) const noexcept
 	{
 		const auto& region = *cohort.region;
 		if (!cohort.loop_dir_fwd || region.loop_mode == LoopMode::PingPong)
@@ -1914,8 +1610,8 @@ struct CohortEngineState
 		if (cohort.filter.remaining != 0)
 			return nullptr;
 		if (phase.transformed_count == 0)
-			return phase.coherent_count == 1 ? layout_kernel<VectorSource::Coherent>(region)
-				: layout_kernel<VectorSource::CoherentSum>(region);
+			return phase.coherent_count == 1 ? layout_kernel<VectorSource::Coherent>(region, frames)
+				: layout_kernel<VectorSource::CoherentSum>(region, frames);
 		if (phase.multiplicity == 1 && phase.singleton_valid)
 		{
 			const auto& single = phase.singleton;
@@ -1923,12 +1619,12 @@ struct CohortEngineState
 				!single.quadrature_left || !single.quadrature_right)
 				return nullptr;
 			start = single.protected_frames();
-			return layout_kernel<VectorSource::AnalyticSingle>(region);
+			return layout_kernel<VectorSource::AnalyticSingle>(region, frames);
 		}
 		if (!phase.quadrature_left || !phase.quadrature_right)
 			return nullptr;
 		start = phase.protected_frames();
-		return layout_kernel<VectorSource::AnalyticSum>(region);
+		return layout_kernel<VectorSource::AnalyticSum>(region, frames);
 	}
 #endif
 
@@ -1973,15 +1669,15 @@ struct CohortEngineState
 			const double coherent_count = static_cast<double>(cohort.phase.coherent_count);
 			// Ping-pong playback, protected attacks, and loop/sample boundaries
 			// use the general kernel.
-#if defined(_M_X64) || defined(__SSE2__)
+#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 			VectorKernel vector_kernel = nullptr;
 			double vector_start = 0.0;
 			if constexpr (Vectorize)
-				vector_kernel = select_vector_kernel(cohort, vector_start);
+				vector_kernel = select_vector_kernel(cohort, vector_start, frames);
 #endif
 			for (uint32_t frame = 0; frame < frames && slot.occupied; ++frame)
 			{
-#if defined(_M_X64) || defined(__SSE2__)
+#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 				if (vector_kernel && frames - frame >= 4 && cohort.pos >= vector_start)
 				{
 					const float channel_amplitude = channel.volume * channel.expression * owner.master_volume_;
@@ -1995,7 +1691,7 @@ struct CohortEngineState
 					retire();
 					break;
 				}
-				const float envelope = advance_envelope(owner, cohort);
+				const float envelope = advance_envelope(owner.sample_rate_, cohort);
 				if (cohort.stage == CohortStage::Off)
 				{
 					retire();

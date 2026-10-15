@@ -1,10 +1,13 @@
 #include "core.h"
+#include "cpu_features.h"
+#include "scoped_denormals.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -711,7 +714,7 @@ void test_coherent_vector_boundaries()
 	for (int layout = 0; layout < 3; ++layout)
 	for (auto loop : {safsyn::LoopMode::None, safsyn::LoopMode::Forward,
 		safsyn::LoopMode::Sustain, safsyn::LoopMode::PingPong})
-	for (uint32_t block : {4u, 5u, 9u, 64u})
+	for (uint32_t block : {4u, 5u, 7u, 8u, 9u, 15u, 16u, 17u, 31u, 64u})
 	{
 		auto bank = layout == 2 ? make_linked_stereo_bank(4000) : make_bank(4000, layout == 1);
 		auto& region = bank.regions[0];
@@ -764,7 +767,7 @@ void test_phase_vector_boundaries()
 		safsyn::LoopMode::Sustain, safsyn::LoopMode::PingPong})
 	for (const bool filtered : {false, true})
 	for (const float attack_ms : {0.0f, 3.0f})
-	for (uint32_t block : {4u, 9u, 64u})
+	for (uint32_t block : {4u, 7u, 8u, 9u, 15u, 16u, 17u, 31u, 64u})
 	{
 		auto bank = layout == 2 ? make_linked_stereo_bank(4000) : make_bank(4000, layout == 1);
 		auto& region = bank.regions[0];
@@ -883,6 +886,84 @@ void test_worker_handoff_lifecycle()
 	repeat.set_render_threads(1);
 }
 
+void test_wide_group_runs()
+{
+	for (int layout = 0; layout < 3; ++layout)
+	for (auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::Analytic})
+	for (uint32_t block : {16u, 17u, 31u, 65u, 256u})
+	{
+		auto bank = layout == 2 ? make_linked_stereo_bank(4000) : make_bank(4000, layout == 1);
+		auto& region = bank.regions[0];
+		region.attack = 0.003f; region.hold = 0.002f; region.decay = 0.01f;
+		region.sustain = 0.71f; region.release = 0.1f; region.fine_tune = 19;
+		safsyn::SynthEngine scalar(4000, 16), vectorized(4000, 16);
+		for (auto* engine : {&scalar, &vectorized})
+		{
+			engine->set_voice_model(safsyn::VoiceModel::Cohorts, 16);
+			engine->set_soundfont(&bank);
+			safsyn::PhaseSettings phase; phase.mode = mode;
+			engine->set_phase_settings(phase);
+			engine->note_on_batch(0, 60, 91, 257);
+		}
+		for (unsigned segment = 0; segment < 4; ++segment)
+		{
+			for (auto* engine : {&scalar, &vectorized})
+			{
+				if (segment == 1) engine->note_off_batch(0, 60, 31);
+				if (segment == 2) engine->set_pitch_bend(0, 10001);
+				if (segment == 3) engine->control_change(0, 123, 0);
+			}
+			check(render(scalar, 1031, 1) == render(vectorized, 1031, block),
+				"wide group kernels preserve exact envelopes, phase splits, wrapping and odd tails");
+			check(scalar.active_voice_count() == vectorized.active_voice_count(),
+				"wide group kernels preserve retirement timing");
+		}
+	}
+}
+
+void test_filter_silence_and_float_environment()
+{
+#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+	const unsigned saved = _mm_getcsr();
+	// Start without FTZ/DAZ even if the test runner enabled them. Workers must
+	// establish their own scope, and rendering must restore this caller state.
+	const unsigned caller = saved & ~0x8040u;
+	for (size_t threads : {1u, 4u})
+	for (auto model : {safsyn::VoiceModel::Individual, safsyn::VoiceModel::Cohorts})
+	{
+		auto bank = make_bank(48000);
+		auto& pcm = bank.sfz_pcm[0];
+		pcm.assign(8192, 0); pcm[0] = 16000;
+		auto& region = bank.regions[0];
+		region.pcm = pcm.data(); region.pcm_len = static_cast<uint32_t>(pcm.size());
+		region.loop_mode = safsyn::LoopMode::None;
+		region.attack = 0; region.decay = 0; region.sustain = 1;
+		region.filter_cutoff_cents = 8000;
+		safsyn::SynthEngine engine(48000, 64);
+		engine.set_voice_model(model, 64);
+		engine.set_render_threads(threads);
+		engine.set_soundfont(&bank);
+		for (uint8_t i = 0; i < 64; ++i)
+		{
+			engine.control_change(0, 1, i);
+			engine.note_on(0, 60, 100);
+		}
+		_mm_setcsr(caller);
+		const auto audio = render(engine, 4096, 256);
+		check(_mm_getcsr() == caller, "mixing restores the caller's floating-point control and status");
+		check(std::any_of(audio.begin(), audio.begin() + 256, [](float x) { return x != 0.0f; }),
+			"denormal fixture starts with an audible impulse");
+		check(std::all_of(audio.end() - 512, audio.end(), [](float x) { return x == 0.0f; }),
+			"silent recursive filter tails settle to zero on owner and worker threads");
+		check(std::none_of(audio.begin(), audio.end(), [](float x) { return std::fpclassify(x) == FP_SUBNORMAL; }),
+			"mixing does not emit subnormal samples");
+		if (model == safsyn::VoiceModel::Cohorts && threads > 1)
+			check(engine.stats().parallel_render_calls > 0, "silent-tail regression exercises render workers");
+	}
+	_mm_setcsr(saved);
+#endif
+}
+
 // More mixer threads than most machines have processors: workers that wake
 // after the chunks have run out are withdrawn, and which thread mixed which
 // chunk must still not reach the audio.
@@ -940,6 +1021,8 @@ int main()
 	test_parallel_cohort_render(true);
 	test_coherent_vector_boundaries();
 	test_phase_vector_boundaries();
+	test_wide_group_runs();
+	test_filter_silence_and_float_environment();
 	test_worker_handoff_lifecycle();
 	test_oversubscribed_handoff();
 	test_prepared_region_index();
@@ -949,6 +1032,8 @@ int main()
 		std::cerr << failures << " cohort test(s) failed\n";
 		return 1;
 	}
-	std::cout << "All logical-voice cohort tests passed\n";
+	std::cout << "All logical-voice cohort tests passed (AVX2 groups: "
+		<< (safsyn::detail::avx2_available() && !std::getenv("SAFSYN_DISABLE_AVX2") ? "enabled" : "disabled")
+		<< ")\n";
 	return 0;
 }

@@ -306,3 +306,102 @@ The sustained-cohort measurements do not represent event dispatch,
 release-heavy passages, phase-cache bandwidth, or sparse pools. Check thread
 policy and dispatch changes with `safsyn-live-profile` on a real bank and file,
 and audio delivery with WASAPI.
+
+## Runtime AVX2 and silent filter tails (October 15, 2026)
+
+The largest observed playback cost was subnormal arithmetic in recursive filter
+tails. Mixing now enables FTZ/DAZ on the calling thread and on each participating
+render worker, with a small scope that restores the caller's floating-point
+control and status afterward. This applies to individual voices and cohorts,
+in both coherent and analytic mode. Subnormal values (below roughly 1.18e-38
+in float) become zero; this deliberately changes otherwise inaudible filter
+tails. No voices, events, filters, or phase processing are skipped.
+
+Unfiltered grouped cohorts also have an eight-frame AVX2 kernel. It preserves
+the sequential double position updates, float envelope updates, double group
+sums, interpolation order, and accumulation order. It supports mono,
+interleaved stereo, and linked planar stereo. Sample/loop boundaries and ending
+releases remain with the baseline renderer. Single voices, filtered voices,
+protected attacks, ping-pong loops, and intervals below 16 frames keep their
+existing SSE2/general paths. Benchmarks did not justify using AVX2 everywhere:
+hardware gathers and several single-voice variants were slower and were removed.
+
+`cohort_mixer.h` holds the shared internal state and envelope helper;
+`cohort_mixer_avx2.cpp` contains the optional kernel. The existing persistent
+worker pool, chunk layout, and deterministic reduction order are retained.
+The shared envelope helper has internal linkage so a Debug build cannot link
+an AVX2-compiled copy into a baseline call site.
+
+Only the AVX2 translation unit is compiled with `/arch:AVX2` (or `-mavx2`),
+with floating-point contraction and link-time optimization disabled for that
+file. Runtime detection checks processor support and OS XMM/YMM-state support.
+Both native SAFC Visual Studio projects include the new source; their two
+baseline mixer sources use precise floating point to match the wide kernel.
+The dispatch also works in MSVC x86 builds with SSE2 enabled. AVX-512 was not
+added: this test machine cannot validate it, and the measured gains did not
+justify another kernel. See Microsoft's [instruction-set build options](https://learn.microsoft.com/en-us/cpp/build/reference/arch-x64)
+and [CPUID intrinsics](https://learn.microsoft.com/en-us/cpp/intrinsics/cpuid-cpuidex).
+
+### Measurements
+
+Host: Intel Core i5-13600K, Windows x64, MSVC 19.51.36260, Release. Baseline:
+SYNCore `95c5447`. These are local measurements, not full-song or WASAPI latency
+claims. Real-file runs used `sDetrimental Concert Grand Piano.sf2` (867,563,444
+bytes), 48 kHz, 256-frame blocks, 4,096 cohorts, four threads, and the first
+30 seconds of each MIDI. Parsing and analytic preparation are outside the
+reported mixer time.
+
+| File | Mode | Before mixing (s) | After mixing (s) | Speedup |
+|---|---|---:|---:|---:|
+| Hypernova | Coherent, fixed CPUs, median of 3 | 2.414 | 1.544 | 1.56x |
+| Hypernova | Analytic | 14.362 | 5.189 | 2.77x |
+| The Nuker 3 - F3 | Coherent | 109.925 | 16.656 | 6.60x |
+| The Nuker 3 - F3 | Analytic | 104.186 | 21.007 | 4.96x |
+
+Hypernova's short coherent case was sensitive to hybrid-CPU scheduling. An
+initial unrestricted run measured 2.210 s before and 2.597 s after. Three
+alternating runs on the same four logical CPUs (affinity mask `0x55`) measured
+2.261-2.718 s before and 1.507-1.550 s after; the table reports their medians.
+The other rows are representative single unrestricted runs. The event counts
+and peak cohort counts matched for every before/after comparison.
+
+The existing matrix benchmark, pinned to one logical CPU with 15 timed passes
+and 4,096 sustained cohorts, measured 1,024-frame intervals at 9.243 -> 7.449 ms
+for coherent groups (1.24x), and 11.798 -> 10.897 ms for analytic groups (1.08x).
+All 45 before/after checksums matched. Unchanged single-voice paths ranged from
+about 2% faster to 6% slower in this run. The full matrix, including those rows,
+is in `mixer_performance_2026-10-15.csv`; the real-file results and fixed-CPU
+repetitions are in `playback_performance_2026-10-15.csv`.
+
+A separate headless `BufferedSynth` playback of the first 30 seconds of The
+Nuker in analytic mode, automatic 18 render threads and a 4,800-frame buffer,
+processed 2,371,525 events with **zero underruns, zero late MIDI events, zero
+shed notes, and zero sender capacity-wait time**. This exercises the producer,
+MIDI queue, adaptive event grid, worker pool, and audio ring at wall-clock speed.
+It uses a simulated consumer, not an actual WASAPI device.
+
+### Validation and reproduction
+
+All nine Release CTest suites passed on x64, including the forced SSE2 fallback
+and unchanged coherent WAV SHA-256. The x86 suites also passed; its wall-clock
+playback-spacing test first failed during concurrent application builds, then
+passed when run alone. New fixtures compare grouped coherent/analytic output
+against one-frame rendering across layouts, envelope transitions, phase splits,
+loop boundaries, and 16/17/31/65/256-frame blocks. Silent-filter tests exercise
+both voice models and owner/worker threads and verify floating-point-state
+restoration. Both native x64 application frontends and the CMake application
+built successfully; SAFC's embedded-playback lifecycle regression passed.
+
+```powershell
+cmake -S SYNCore -B build/syncore-performance -DSAFSYN_BUILD_BENCHMARKS=ON
+cmake --build build/syncore-performance --config Release
+ctest --test-dir build/syncore-performance -C Release --output-on-failure
+build/syncore-performance/Release/safsyn-engine-benchmark --matrix 1 15 4096
+build/syncore-performance/Release/safsyn-live-profile <bank.sf2> <file.mid> --threads 4 --duration 30 --analytic
+build/syncore-performance/Release/safsyn-live-profile <bank.sf2> <file.mid> --threads 0 --duration 30 --analytic --live --buffer 4800
+```
+
+Set `SAFSYN_DISABLE_AVX2=1` in the process environment to reproduce the baseline
+SIMD path on an AVX2-capable machine. This diagnostic override is read when an
+engine is created; it does not disable denormal protection. No new playback UI
+or persisted settings are required.

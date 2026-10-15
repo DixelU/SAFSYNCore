@@ -1,4 +1,5 @@
 #include "core.h"
+#include "scoped_denormals.h"
 #include "cohort_engine.h"
 
 #include <algorithm>
@@ -913,6 +914,7 @@ void SynthEngine::render_audio(float* out, uint32_t frames) noexcept
 {
 	if (!out || frames == 0)
 		return;
+	const detail::ScopedNoDenormals no_denormals;
 	if (voice_model_ == VoiceModel::Cohorts)
 	{
 		if (cohort_engine_)

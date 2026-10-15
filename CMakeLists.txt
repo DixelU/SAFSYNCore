@@ -8,6 +8,7 @@ option(SAFSYN_BUILD_BENCHMARKS "Build deterministic engine microbenchmarks" OFF)
 add_library(safsyn STATIC
 	SAFSYN/core.cpp
 	SAFSYN/cohort_engine.cpp
+	SAFSYN/cohort_mixer_avx2.cpp
 	SAFSYN/engine.cpp
 	SAFSYN/mastering.cpp
 	SAFSYN/phase.cpp
@@ -41,6 +42,20 @@ target_include_directories(safsyn PRIVATE "${SAFSYN_UTILITY_INCLUDE}")
 target_compile_features(safsyn PUBLIC cxx_std_20)
 target_compile_features(safsyn PRIVATE cxx_std_23)
 set_target_properties(safsyn PROPERTIES CXX_EXTENSIONS OFF)
+
+# Only this translation unit may contain AVX2 instructions. The dispatcher and
+# the rest of the application retain the baseline CPU requirement, including
+# in builds that enable link-time optimization globally.
+if((MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "^(X86|x64)$") OR
+	(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86|x86|i.86)$"))
+	if(MSVC)
+		set_source_files_properties(SAFSYN/cohort_mixer_avx2.cpp PROPERTIES
+			COMPILE_OPTIONS "/arch:AVX2;/fp:precise;/GL-")
+	else()
+		set_source_files_properties(SAFSYN/cohort_mixer_avx2.cpp PROPERTIES
+			COMPILE_OPTIONS "-mavx2;-ffp-contract=off;-fno-lto")
+	endif()
+endif()
 
 if(MSVC)
 	target_compile_options(safsyn PRIVATE /W4 /permissive- /EHsc)
@@ -125,6 +140,9 @@ if(SAFSYN_BUILD_TESTS)
 	endif()
 	add_test(NAME safsyn-cohorts COMMAND safsyn-cohort-tests)
 	set_tests_properties(safsyn-cohorts PROPERTIES TIMEOUT 60)
+	add_test(NAME safsyn-cohorts-baseline COMMAND safsyn-cohort-tests)
+	set_tests_properties(safsyn-cohorts-baseline PROPERTIES TIMEOUT 60
+		ENVIRONMENT "SAFSYN_DISABLE_AVX2=1")
 	add_executable(safsyn-mastering-tests tests/mastering_tests.cpp)
 	target_link_libraries(safsyn-mastering-tests PRIVATE SAFSYN::safsyn)
 	target_compile_features(safsyn-mastering-tests PRIVATE cxx_std_20)

@@ -150,6 +150,13 @@ cohorts, single or grouped and in every envelope stage, use exact SSE2 kernels
 where available; filtered cohorts vectorize their filter bases per frame. See
 `docs/MIXER_PERFORMANCE.md` for kernel coverage, measurements, and limits.
 
+Grouped coherent and analytic cohorts additionally select an AVX2 kernel at
+runtime on supported CPUs and operating systems. Other cases retain the SSE2
+or scalar path. Mixer threads flush inaudible subnormal filter tails to zero
+and restore the caller's floating-point environment after rendering; this
+avoids severe slowdowns on long, quiet tails. Both changes apply to embedded
+playback and offline rendering, with no additional settings.
+
 Run an opt-in phase experiment with the same scripted events:
 
 ```text
