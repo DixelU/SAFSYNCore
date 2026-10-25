@@ -32,7 +32,8 @@ public:
 	void release_sustained(SynthEngine& owner, uint8_t channel) noexcept;
 	void all_notes_off(SynthEngine& owner, uint8_t channel) noexcept;
 	void all_sound_off(SynthEngine& owner, uint8_t channel) noexcept;
-	void update_channel_gains(SynthEngine& owner, uint8_t channel) noexcept;
+	void update_channel_gains(SynthEngine& owner, uint8_t channel, float previous_amplitude,
+		bool pan_changed) noexcept;
 	void update_channel_filters(SynthEngine& owner, uint8_t channel) noexcept;
 	void update_channel_releases(SynthEngine& owner, uint8_t channel) noexcept;
 	void invalidate_onset_merges(uint8_t channel) noexcept;

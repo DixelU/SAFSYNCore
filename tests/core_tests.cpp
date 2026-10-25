@@ -285,6 +285,15 @@ safsyn::Soundfont make_constant_bank(uint32_t sample_rate = 1000)
 	return bank;
 }
 
+// Pan and volume changes on a sounding voice glide over 4 ms: four frames at 1 kHz.
+constexpr uint32_t gain_ramp_frames = 4;
+
+void finish_gain_ramp(safsyn::SynthEngine& engine)
+{
+	std::array<float, gain_ramp_frames * 2> audio{};
+	engine.render_audio(audio.data(), gain_ramp_frames);
+}
+
 bool any_nonzero(const std::vector<float>& audio)
 {
 	return std::any_of(audio.begin(), audio.end(), [](float sample) { return sample != 0.0f; });
@@ -439,6 +448,7 @@ void test_controller_contract()
 		engine.render_audio(baseline.data(), 1);
 		engine.control_change(0, 7, 64);
 		engine.control_change(0, 39, 127);
+		finish_gain_ramp(engine);
 		engine.render_audio(changed.data(), 1);
 		const double expected_volume_ratio = std::pow((8319.0 / 16383.0) / (100.0 / 127.0), 2.0);
 		check(std::abs(changed[0] / baseline[0] - expected_volume_ratio) < 1e-5,
@@ -446,11 +456,13 @@ void test_controller_contract()
 		const float volume_only = changed[0];
 		engine.control_change(0, 11, 64);
 		engine.control_change(0, 43, 127);
+		finish_gain_ramp(engine);
 		engine.render_audio(changed.data(), 1);
 		check(std::abs(changed[0] / volume_only - std::pow(8319.0 / 16383.0, 2.0)) < 1e-5,
 			"CC11/43 form a 14-bit expression pair on an already-active voice");
 		engine.control_change(0, 10, 127);
 		engine.control_change(0, 42, 127);
+		finish_gain_ramp(engine);
 		engine.render_audio(changed.data(), 1);
 		check(std::abs(changed[0]) < std::abs(changed[1]) * 1e-5f,
 			"CC10/42 apply full-resolution pan to active voices");
@@ -462,14 +474,17 @@ void test_controller_contract()
 		std::array<float, 2> before{}, after{};
 		engine.render_audio(before.data(), 1);
 		engine.set_master_volume(8192);
+		finish_gain_ramp(engine);
 		engine.render_audio(after.data(), 1);
 		check(std::abs(after[0] / before[0] - 8192.0 / 16383.0) < 1e-5,
 			"universal 14-bit master volume affects active voices");
 		engine.control_change(0, 7, 0);
+		finish_gain_ramp(engine);
 		engine.render_audio(after.data(), 1);
 		check(after[0] == 0.0f && after[1] == 0.0f,
 			"zero channel volume silences an active voice");
 		engine.control_change(0, 121, 0);
+		finish_gain_ramp(engine);
 		engine.render_audio(after.data(), 1);
 		check(after[0] != 0.0f || after[1] != 0.0f,
 			"CC121 restores the controller defaults without stopping held notes");
@@ -570,6 +585,7 @@ void test_controller_amplitude_curves()
 		engine.control_change(0, 7, 127);
 		engine.note_on(0, 60, 127);
 		auto sample = [&] {
+			finish_gain_ramp(engine);
 			std::array<float, 2> audio{};
 			engine.render_audio(audio.data(), 1);
 			return audio[0];
@@ -692,6 +708,70 @@ void test_stereo_center_gain()
 		check(std::abs(stereo_left[0] - 0.70710678f) < 1e-6f && stereo_left[1] == 0.0f,
 			"stereo pan endpoints preserve the normalized constant-power law");
 	}
+}
+
+// Fast pan automation used to step a held note's gains on every CC, a click
+// train at the controller rate. Changes now glide linearly over 4 ms, while
+// notes started after a change begin at the new gains.
+void test_controller_gain_ramps()
+{
+	constexpr uint32_t rate = 48000;
+	constexpr uint32_t ramp = 192;
+	constexpr uint32_t tail = 8;
+	struct Change { uint8_t controller; uint8_t value; };
+	constexpr std::array<Change, 4> changes{{{10, 127}, {7, 30}, {11, 100}, {10, 20}}};
+	auto bank = make_constant_bank(rate);
+	std::vector<float> glides[2];
+	for (const auto model : {safsyn::VoiceModel::Individual, safsyn::VoiceModel::Cohorts})
+	{
+		auto& glide = glides[model == safsyn::VoiceModel::Cohorts];
+		safsyn::SynthEngine engine(rate, 8);
+		engine.set_soundfont(&bank);
+		engine.set_voice_model(model);
+		engine.note_on(0, 60, 127);
+		std::array<float, 2> steady{};
+		engine.render_audio(steady.data(), 1);
+		for (size_t applied = 1; applied <= changes.size(); ++applied)
+		{
+			const auto& change = changes[applied - 1];
+			engine.control_change(0, change.controller, change.value);
+			std::vector<float> audio(static_cast<size_t>(ramp + tail) * 2);
+			engine.render_audio(audio.data(), ramp + tail);
+			glide.insert(glide.end(), audio.begin(), audio.end());
+
+			safsyn::SynthEngine fresh(rate, 8);
+			fresh.set_soundfont(&bank);
+			fresh.set_voice_model(model);
+			for (size_t index = 0; index < applied; ++index)
+				fresh.control_change(0, changes[index].controller, changes[index].value);
+			fresh.note_on(0, 60, 127);
+			std::array<float, tail * 2> settled{};
+			fresh.render_audio(settled.data(), tail);
+
+			for (size_t channel = 0; channel < 2; ++channel)
+			{
+				const float start = steady[channel];
+				const float end = settled[channel];
+				const float largest_step = std::abs(end - start) / ramp * 1.001f + 1e-9f;
+				bool bounded = std::abs(audio[channel] - start) <= 1e-6f;
+				for (uint32_t frame = 1; frame < ramp + tail; ++frame)
+					bounded &= std::abs(audio[frame * 2 + channel] -
+						audio[(frame - 1) * 2 + channel]) <= largest_step;
+				check(bounded,
+					"a pan or volume change on a held note starts at its old gain without a step");
+				check(std::abs(audio[(ramp / 2) * 2 + channel] - (start + end) * 0.5f) <=
+					std::abs(end - start) * 0.01f,
+					"a pan or volume change glides linearly over 4 ms");
+				bool landed = true;
+				for (uint32_t frame = 0; frame < tail; ++frame)
+					landed &= audio[(ramp + frame) * 2 + channel] == settled[frame * 2 + channel];
+				check(landed,
+					"a finished glide lands exactly on the gain a new note would start with");
+				steady[channel] = end;
+			}
+		}
+	}
+	check(glides[0] == glides[1], "individual voices and cohorts glide identically");
 }
 
 void test_rpn_pitch_bend_sensitivity()
@@ -1125,6 +1205,7 @@ int main(int argc, char** argv)
 	test_controller_amplitude_curves();
 	test_lowpass_controllers();
 	test_stereo_center_gain();
+	test_controller_gain_ramps();
 	test_controller_contract();
 	test_rpn_pitch_bend_sensitivity();
 	test_determinism_and_block_invariance();

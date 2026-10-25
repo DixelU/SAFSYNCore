@@ -1243,15 +1243,24 @@ struct CohortEngineState
 				++it;
 	}
 
-	void update_channel_gains(SynthEngine& owner, uint8_t channel) noexcept
+	void update_channel_gains(SynthEngine& owner, uint8_t channel, float previous_amplitude,
+		bool pan_changed) noexcept
 	{
+		const float amplitude = owner.channel_amplitude(channel);
+		const uint32_t frames = owner.gain_ramp_frames();
 		for (uint32_t index = channel_heads[channel]; index != invalid_index;
 			index = steal_info[index].next)
 		{
 			auto& cohort = cohorts[index].cohort;
-			owner.compute_gains(*cohort.region, channel, cohort.velocity,
-				cohort.gain_l, cohort.gain_r);
-			steal_info[index].gain = (std::max)(std::abs(cohort.gain_l), std::abs(cohort.gain_r));
+			const std::array<float, 2> from{cohort.gain_l * previous_amplitude,
+				cohort.gain_r * previous_amplitude};
+			if (pan_changed)
+			{
+				owner.compute_gains(*cohort.region, channel, cohort.velocity,
+					cohort.gain_l, cohort.gain_r);
+				steal_info[index].gain = (std::max)(std::abs(cohort.gain_l), std::abs(cohort.gain_r));
+			}
+			cohort.gain_ramp.set(from, {cohort.gain_l * amplitude, cohort.gain_r * amplitude}, frames);
 		}
 	}
 
@@ -1422,6 +1431,9 @@ struct CohortEngineState
 			const uint32_t i3 = static_cast<uint32_t>(p3);
 			if constexpr (analytic)
 				if (i0 < protect) break;
+			// A gain ramp that ends inside these frames finishes on the scalar path.
+			auto& gain_ramp = cohort.gain_ramp;
+			if (gain_ramp.active() && gain_ramp.remaining < 4) break;
 
 			// Envelope values in per-frame order. A release that would end inside
 			// these frames stays scalar so the cohort retires on its exact frame.
@@ -1503,8 +1515,25 @@ struct CohortEngineState
 				sample_r = interpolate(
 					source(first_r, _mm_castsi128_ps(quadrature_first_r), true),
 					source(second_r, _mm_castsi128_ps(quadrature_second_r), true), fraction);
-			const __m128 left = _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(sample_l, envelope), gain_l), amp);
-			const __m128 right = _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(sample_r, envelope), gain_r), amp);
+			__m128 left, right;
+			if (gain_ramp.active())
+			{
+				alignas(16) float ramp_l[4];
+				alignas(16) float ramp_r[4];
+				for (size_t lane = 0; lane < 4; ++lane)
+				{
+					ramp_l[lane] = gain_ramp.current[0];
+					ramp_r[lane] = gain_ramp.current[1];
+					gain_ramp.advance();
+				}
+				left = _mm_mul_ps(_mm_mul_ps(sample_l, envelope), _mm_load_ps(ramp_l));
+				right = _mm_mul_ps(_mm_mul_ps(sample_r, envelope), _mm_load_ps(ramp_r));
+			}
+			else
+			{
+				left = _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(sample_l, envelope), gain_l), amp);
+				right = _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(sample_r, envelope), gain_r), amp);
+			}
 			float* destination = out + static_cast<size_t>(frame) * 2;
 			_mm_storeu_ps(destination, _mm_add_ps(_mm_loadu_ps(destination),
 				_mm_unpacklo_ps(left, right)));
@@ -1600,7 +1629,15 @@ struct CohortEngineState
 			if constexpr (Analytic)
 				result = _mm_add_pd(result, _mm_sub_pd(_mm_mul_pd(original, cosine),
 					_mm_mul_pd(_mm_cvtps_pd(_mm_movehl_ps(filtered, filtered)), sine)));
-			const __m128 mixed = _mm_mul_ps(_mm_mul_ps(_mm_cvtpd_ps(result), gain), amp);
+			__m128 mixed = _mm_cvtpd_ps(result);
+			if (cohort.gain_ramp.active())
+			{
+				mixed = _mm_mul_ps(mixed, _mm_setr_ps(cohort.gain_ramp.current[0],
+					cohort.gain_ramp.current[1], 0.0f, 0.0f));
+				cohort.gain_ramp.advance();
+			}
+			else
+				mixed = _mm_mul_ps(_mm_mul_ps(mixed, gain), amp);
 			float* destination = out + static_cast<size_t>(frame) * 2;
 			_mm_storel_epi64(reinterpret_cast<__m128i*>(destination), _mm_castps_si128(
 				_mm_add_ps(_mm_castsi128_ps(load_low_64(destination)), mixed)));
@@ -1633,12 +1670,14 @@ struct CohortEngineState
 	}
 
 	template<VectorSource Source>
-	VectorKernel layout_kernel(const SampleRegion& region, uint32_t frames) const noexcept
+	VectorKernel layout_kernel(const SampleRegion& region, uint32_t frames,
+		bool gain_ramp) const noexcept
 	{
 		// Double-precision group sums benefit from wider vectors. Single voices
 		// and tiny event intervals are faster with the existing four-frame path.
+		// Only the four-frame path mixes gain ramps; it is the baseline-ISA one.
 		if constexpr (Source == VectorSource::CoherentSum || Source == VectorSource::AnalyticSum)
-			if (use_avx2 && frames >= 16)
+			if (use_avx2 && frames >= 16 && !gain_ramp)
 				return detail::avx2_kernel(Source, region);
 		if (region.channels != 2)
 			return &render_vector_frames<Source, false, false>;
@@ -1664,6 +1703,7 @@ struct CohortEngineState
 		const auto& region = *cohort.region;
 		if (!cohort.loop_dir_fwd || region.loop_mode == LoopMode::PingPong)
 			return nullptr;
+		const bool ramp = cohort.gain_ramp.active();
 		const auto& phase = cohort.phase;
 		if (cohort.filter.active())
 		{
@@ -1676,8 +1716,8 @@ struct CohortEngineState
 		if (cohort.filter.remaining != 0)
 			return nullptr;
 		if (phase.transformed_count == 0)
-			return phase.coherent_count == 1 ? layout_kernel<VectorSource::Coherent>(region, frames)
-				: layout_kernel<VectorSource::CoherentSum>(region, frames);
+			return phase.coherent_count == 1 ? layout_kernel<VectorSource::Coherent>(region, frames, ramp)
+				: layout_kernel<VectorSource::CoherentSum>(region, frames, ramp);
 		if (phase.multiplicity == 1 && phase.singleton_valid)
 		{
 			const auto& single = phase.singleton;
@@ -1685,12 +1725,12 @@ struct CohortEngineState
 				!single.quadrature_left || !single.quadrature_right)
 				return nullptr;
 			start = single.protected_frames();
-			return layout_kernel<VectorSource::AnalyticSingle>(region, frames);
+			return layout_kernel<VectorSource::AnalyticSingle>(region, frames, ramp);
 		}
 		if (!phase.quadrature_left || !phase.quadrature_right)
 			return nullptr;
 		start = phase.protected_frames();
-		return layout_kernel<VectorSource::AnalyticSum>(region, frames);
+		return layout_kernel<VectorSource::AnalyticSum>(region, frames, ramp);
 	}
 #endif
 
@@ -1812,9 +1852,18 @@ struct CohortEngineState
 					filtered_r = sample_r * envelope;
 				}
 				cohort.filter.advance();
-				const float amplitude = channel.volume * channel.expression * owner.master_volume_;
-				out[static_cast<size_t>(frame) * 2] += filtered_l * cohort.gain_l * amplitude;
-				out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * cohort.gain_r * amplitude;
+				if (cohort.gain_ramp.active())
+				{
+					out[static_cast<size_t>(frame) * 2] += filtered_l * cohort.gain_ramp.current[0];
+					out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * cohort.gain_ramp.current[1];
+					cohort.gain_ramp.advance();
+				}
+				else
+				{
+					const float amplitude = channel.volume * channel.expression * owner.master_volume_;
+					out[static_cast<size_t>(frame) * 2] += filtered_l * cohort.gain_l * amplitude;
+					out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * cohort.gain_r * amplitude;
+				}
 
 				cohort.pos += cohort.loop_dir_fwd ? increment : -increment;
 				if (valid_loop && (region.loop_mode == LoopMode::Forward ||
@@ -2045,10 +2094,11 @@ void CohortEngine::all_sound_off(SynthEngine& owner, uint8_t channel) noexcept
 	catch (...) {}
 }
 
-void CohortEngine::update_channel_gains(SynthEngine& owner, uint8_t channel) noexcept
+void CohortEngine::update_channel_gains(SynthEngine& owner, uint8_t channel,
+	float previous_amplitude, bool pan_changed) noexcept
 {
 	if (state_)
-		state_->update_channel_gains(owner, channel);
+		state_->update_channel_gains(owner, channel, previous_amplitude, pan_changed);
 }
 
 void CohortEngine::update_channel_filters(SynthEngine& owner, uint8_t channel) noexcept

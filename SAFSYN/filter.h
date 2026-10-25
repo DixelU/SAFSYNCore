@@ -76,6 +76,52 @@ struct FilterRamp
 	}
 };
 
+// Pan and volume changes glide a sounding voice's left/right output gains
+// linearly, as BASSMIDI does over about 4 ms; a stepped gain tears the
+// waveform and fast automation turns into a click train. Idle ramps leave the
+// voice on its steady gain * amplitude formula.
+struct GainRamp
+{
+	std::array<float, 2> current{};
+	std::array<float, 2> target{};
+	std::array<float, 2> step{};
+	uint32_t remaining = 0;
+
+	bool active() const noexcept { return remaining != 0; }
+
+	// from is the steady output gain, used only when no ramp is running.
+	void set(std::array<float, 2> from, std::array<float, 2> to, uint32_t frames) noexcept
+	{
+		if (active() ? to == target : from == to)
+			return;
+		if (frames == 0)
+		{
+			remaining = 0;
+			return;
+		}
+		if (!active())
+			current = from;
+		target = to;
+		const float inverse_frames = 1.0f / static_cast<float>(frames);
+		step = {(target[0] - current[0]) * inverse_frames,
+			(target[1] - current[1]) * inverse_frames};
+		remaining = frames;
+	}
+
+	void advance() noexcept
+	{
+		if (remaining == 0)
+			return;
+		if (--remaining == 0)
+		{
+			current = target;
+			return;
+		}
+		current[0] += step[0];
+		current[1] += step[1];
+	}
+};
+
 struct StereoFilterState
 {
 	std::array<float, 2> z1{};

@@ -582,17 +582,31 @@ void SynthEngine::note_off_batch(uint8_t channel, uint8_t note, uint64_t count) 
 		note_off(channel, note);
 }
 
-void SynthEngine::update_channel_voice_gains(uint8_t channel) noexcept
+uint32_t SynthEngine::gain_ramp_frames() const noexcept
+{
+	return static_cast<uint32_t>(std::lround(sample_rate_ * 0.004));
+}
+
+void SynthEngine::update_channel_voice_gains(uint8_t channel, float previous_amplitude,
+	bool pan_changed) noexcept
 {
 	if (voice_model_ == VoiceModel::Cohorts)
 	{
 		if (cohort_engine_)
-			cohort_engine_->update_channel_gains(*this, channel);
+			cohort_engine_->update_channel_gains(*this, channel, previous_amplitude, pan_changed);
 		return;
 	}
+	const float amplitude = channel_amplitude(channel);
+	const uint32_t frames = gain_ramp_frames();
 	for (auto& voice : voices_)
 		if (voice.active() && voice.channel == channel)
-			compute_gains(*voice.region, channel, voice.velocity, voice.gain_l, voice.gain_r);
+		{
+			const std::array<float, 2> from{voice.gain_l * previous_amplitude,
+				voice.gain_r * previous_amplitude};
+			if (pan_changed)
+				compute_gains(*voice.region, channel, voice.velocity, voice.gain_l, voice.gain_r);
+			voice.gain_ramp.set(from, {voice.gain_l * amplitude, voice.gain_r * amplitude}, frames);
+		}
 }
 
 void SynthEngine::set_render_threads(size_t threads) noexcept
@@ -659,6 +673,8 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 	if (voice_model_ == VoiceModel::Cohorts && cohort_engine_)
 		cohort_engine_->invalidate_onset_merges(channel);
 	auto& state = channels_[channel];
+	const float previous_amplitude = channel_amplitude(channel);
+	const float previous_pan = state.pan;
 	state.controllers[controller] = value;
 	switch (controller)
 	{
@@ -673,9 +689,8 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 		const int pan14 = (state.controllers[10] << 7) | state.controllers[42];
 		state.pan = pan14 < 8192 ? (pan14 - 8192) / 8192.0f :
 			(pan14 - 8192) / 8191.0f;
-	}
-		update_channel_voice_gains(channel);
 		break;
+	}
 	case 11:
 		state.controllers[43] = 0;
 		state.expression = controller_amplitude(state.controllers[11], 0);
@@ -690,9 +705,8 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 		const int pan14 = (state.controllers[10] << 7) | state.controllers[42];
 		state.pan = pan14 < 8192 ? (pan14 - 8192) / 8192.0f :
 			(pan14 - 8192) / 8191.0f;
-	}
-		update_channel_voice_gains(channel);
 		break;
+	}
 	case 43:
 		state.expression = controller_amplitude(state.controllers[11], state.controllers[43]);
 		break;
@@ -767,7 +781,6 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 					if (voice.active() && voice.channel == channel && voice.note_off_pending)
 						begin_release(voice, -1.0f, true);
 		}
-		update_channel_voice_gains(channel);
 		update_channel_filters(channel);
 		update_channel_releases(channel);
 		break;
@@ -782,6 +795,9 @@ void SynthEngine::control_change(uint8_t channel, uint8_t controller, uint8_t va
 	default:
 		break;
 	}
+	const bool pan_changed = state.pan != previous_pan;
+	if (pan_changed || channel_amplitude(channel) != previous_amplitude)
+		update_channel_voice_gains(channel, previous_amplitude, pan_changed);
 }
 
 uint8_t SynthEngine::controller_value(uint8_t channel, uint8_t controller) const noexcept
@@ -792,9 +808,15 @@ uint8_t SynthEngine::controller_value(uint8_t channel, uint8_t controller) const
 void SynthEngine::set_master_volume(uint16_t value14) noexcept
 {
 	value14 = (std::min)(value14, uint16_t{16383});
+	std::array<float, 16> previous_amplitudes{};
+	for (uint8_t channel = 0; channel < 16; ++channel)
+		previous_amplitudes[channel] = channel_amplitude(channel);
 	master_volume_ = static_cast<float>(value14) / 16383.0f;
 	if (voice_model_ == VoiceModel::Cohorts && cohort_engine_)
 		cohort_engine_->invalidate_all_onset_merges();
+	for (uint8_t channel = 0; channel < 16; ++channel)
+		if (channel_amplitude(channel) != previous_amplitudes[channel])
+			update_channel_voice_gains(channel, previous_amplitudes[channel], false);
 }
 
 void SynthEngine::program_change(uint8_t channel, uint8_t program) noexcept
@@ -989,9 +1011,18 @@ void SynthEngine::render_audio(float* out, uint32_t frames) noexcept
 				filtered_r = voice.filter_state.process(filtered_r, 1, voice.filter);
 			}
 			voice.filter.advance();
-			const float amplitude = channel.volume * channel.expression * master_volume_;
-			out[static_cast<size_t>(frame) * 2] += filtered_l * voice.gain_l * amplitude;
-			out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * voice.gain_r * amplitude;
+			if (voice.gain_ramp.active())
+			{
+				out[static_cast<size_t>(frame) * 2] += filtered_l * voice.gain_ramp.current[0];
+				out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * voice.gain_ramp.current[1];
+				voice.gain_ramp.advance();
+			}
+			else
+			{
+				const float amplitude = channel.volume * channel.expression * master_volume_;
+				out[static_cast<size_t>(frame) * 2] += filtered_l * voice.gain_l * amplitude;
+				out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * voice.gain_r * amplitude;
+			}
 
 			voice.pos += voice.loop_dir_fwd ? increment : -increment;
 			if (valid_loop && (region.loop_mode == LoopMode::Forward ||

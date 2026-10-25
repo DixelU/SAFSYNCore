@@ -881,7 +881,12 @@ void test_coherent_vector_boundaries()
 		{
 			if (segment == 1)
 				for (auto* engine : {&reference, &singles, &vectorized})
+				{
 					engine->set_pitch_bend(0, 10201);
+					// Gain ramps run scalar and hand back to SIMD mid-block.
+					engine->control_change(0, 10, 30);
+					engine->control_change(0, 7, 120);
+				}
 			if (segment == 2)
 				for (auto* engine : {&reference, &singles, &vectorized})
 					engine->control_change(0, 123, 0);
@@ -947,9 +952,18 @@ void test_phase_vector_boundaries()
 		{
 			for (auto* engine : {&reference, &singles, &vectorized})
 			{
-				if (segment == 1) engine->set_pitch_bend(0, 10201);
+				if (segment == 1)
+				{
+					engine->set_pitch_bend(0, 10201);
+					engine->control_change(0, 10, 30); // Gain ramps hand back to SIMD.
+					engine->control_change(0, 7, 120);
+				}
 				if (segment == 2) engine->note_off_batch(0, 70, 2); // Split the group.
-				if (segment == 3) engine->control_change(0, 74, filtered ? 40 : 90);
+				if (segment == 3)
+				{
+					engine->control_change(0, 74, filtered ? 40 : 90);
+					engine->set_master_volume(9000);
+				}
 				if (segment == 4)
 				{
 					engine->control_change(0, 74, 127); // Filtered cohorts ramp to bypass.

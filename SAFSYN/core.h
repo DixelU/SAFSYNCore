@@ -217,6 +217,7 @@ private:
 		uint32_t hold_samples_left = 0;
 		float gain_l = 0.0f;
 		float gain_r = 0.0f;
+		detail::GainRamp gain_ramp;
 		bool note_off_pending = false;
 		uint64_t serial = 0;
 		PhaseVoiceState phase;
@@ -271,7 +272,15 @@ private:
 		bool finish_attack = false) noexcept;
 	void begin_envelope(Voice& voice) noexcept;
 	float advance_envelope(Voice& voice) noexcept;
-	void update_channel_voice_gains(uint8_t channel) noexcept;
+	float channel_amplitude(uint8_t channel) const noexcept
+	{
+		return channels_[channel].volume * channels_[channel].expression * master_volume_;
+	}
+	uint32_t gain_ramp_frames() const noexcept;
+	// Sounding voices ramp from previous_amplitude and their old pan gains to
+	// the channel's current values. Pan gains are recomputed only if pan moved.
+	void update_channel_voice_gains(uint8_t channel, float previous_amplitude,
+		bool pan_changed) noexcept;
 	void update_channel_pitch_bend(uint8_t channel) noexcept;
 	void all_notes_off(uint8_t channel) noexcept;
 	void all_sound_off(uint8_t channel) noexcept;

@@ -239,6 +239,7 @@ struct RenderCohort
 	uint32_t hold_samples_left = 0;
 	float gain_l = 0.0f;
 	float gain_r = 0.0f;
+	detail::GainRamp gain_ramp;
 	uint64_t birth_frame = 0;
 	uint64_t release_frame = 0;
 	uint64_t oldest_serial = 0;
