@@ -350,7 +350,7 @@ struct BufferedSynth::Impl
 						for (uint8_t ch = 0; ch < 16; ++ch)
 						{ engine.control_change(ch, 64, 0); engine.control_change(ch, 123, 0); }
 					}
-					if (tail && (cursor >= tail_end || engine.active_voice_count() == 0)) break;
+					if (tail && (cursor >= tail_end || !engine.has_active_audio())) break;
 					uint32_t count = options.block_frames - frames;
 					if (has_event) count = static_cast<uint32_t>((std::min)(uint64_t{count}, next.sample - cursor));
 					if (!pending.empty() && grid_frame(pending.front().frame) > cursor)
@@ -402,7 +402,7 @@ struct BufferedSynth::Impl
 				}
 				publish(current);
 				if (!output.empty() && !push_audio(output.data(), static_cast<uint32_t>(output.size() / 2))) break;
-				if (tail && (cursor >= tail_end || engine.active_voice_count() == 0))
+				if (tail && (cursor >= tail_end || !engine.has_active_audio()))
 				{
 					output.clear(); mastering.finish(output); sanitize();
 					if (!output.empty()) push_audio(output.data(), static_cast<uint32_t>(output.size() / 2));

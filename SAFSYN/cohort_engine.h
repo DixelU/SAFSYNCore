@@ -22,7 +22,7 @@ public:
 
 	void configure(SynthEngine& owner, size_t maximum_cohorts) noexcept;
 	void set_render_threads(size_t threads) noexcept;
-	void reserve_playback(uint32_t maximum_block_frames, size_t region_count);
+	void reserve_playback(SynthEngine& owner, uint32_t maximum_block_frames, size_t region_count);
 	size_t render_threads() const noexcept;
 	void clear(SynthEngine& owner) noexcept;
 	void note_on_batch(SynthEngine& owner, uint8_t channel, uint8_t note,
@@ -43,6 +43,7 @@ public:
 
 	size_t active_logical_voices() const noexcept;
 	size_t active_cohorts() const noexcept;
+	[[nodiscard]] auto has_active_audio() const noexcept -> bool;
 
 private:
 	std::unique_ptr<CohortEngineState> state_;

@@ -404,7 +404,7 @@ bool render_timed_midi_pcm(uint64_t duration_frames,
 			}
 			if (options.drain_tail)
 			{
-				while (cursor < target && engine.active_voice_count() != 0)
+				while (cursor < target && engine.has_active_audio())
 				{
 					if (!render_to(cursor + 1))
 					{
@@ -417,7 +417,7 @@ bool render_timed_midi_pcm(uint64_t duration_frames,
 					}
 				}
 				result.tail_ceiling_reached =
-					engine.active_voice_count() != 0 && cursor == target;
+					engine.has_active_audio() && cursor == target;
 			}
 			else if (!render_to(target))
 			{

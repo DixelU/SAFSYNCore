@@ -195,6 +195,12 @@ Use direct file mode for the most reliable black MIDI scheduling.
 - Default physical cohort ceiling: 4096. The existing deterministic stealing
   policy applies and is reported. Zero/unbounded is intentionally rejected for
   this host. More threads cannot make arbitrary polyphony affordable.
+- A capacity steal renders the victim's 8 ms release into a fixed-size channel
+  audio buffer before reusing its slot. Overlapping tails sum in that buffer
+  without another voice limit. They retain the victim's gain, phase and filter
+  history; subsequent controllers cannot step them. All Sound Off and reset
+  clear tails too, and file playback drains them before stopping. Voices stolen
+  before their first rendered frame have no tail.
 - GUI render-ahead buffer: 100 ms; console default: 4096 frames (85.3 ms at
   48 kHz). Total live latency also includes the limiter lookahead (5 ms), the
   live timing margin (one block, more after late events), the device buffer,

@@ -90,6 +90,14 @@ size_t SynthEngine::active_cohort_count() const noexcept
 		? cohort_engine_->active_cohorts() : active_voice_count();
 }
 
+auto SynthEngine::has_active_audio() const noexcept -> bool
+{
+	if (this->voice_model_ == VoiceModel::Cohorts)
+		return this->cohort_engine_ && this->cohort_engine_->has_active_audio();
+
+	return this->active_voice_count() != 0;
+}
+
 void SynthEngine::set_soundfont(const Soundfont* soundfont) noexcept
 {
 	silence_all();
@@ -124,7 +132,7 @@ bool SynthEngine::prepare_playback(uint32_t maximum_block_frames, const PhasePre
 		soundfont_->stress_regions : soundfont_->regions;
 	if (!phase_processor_.prepare(regions, options)) return false;
 	if (voice_model_ == VoiceModel::Cohorts && cohort_engine_)
-		cohort_engine_->reserve_playback(maximum_block_frames, regions.size());
+		cohort_engine_->reserve_playback(*this, maximum_block_frames, regions.size());
 	return !options.stop.stop_requested();
 }
 

@@ -724,6 +724,37 @@ void test_tail_drain(const std::filesystem::path& directory)
 		"tail drain reports an explicit maximum-tail ceiling");
 }
 
+void test_stolen_tail_drain()
+{
+	for (uint32_t block : {1u, 37u})
+	{
+		auto bank = make_bank(1000);
+		bank.regions[0].lo_key = bank.regions[0].hi_key = 60;
+		auto silent = bank.regions[0];
+		silent.lo_key = silent.hi_key = 64;
+		silent.attenuation = 0.0f;
+		silent.release = 0.0f;
+		bank.regions.push_back(silent);
+		TimedEventSource source{{
+			{0, safsyn::TimedMidiEventKind::ShortMessage, 0x00643c90, 0},
+			{16, safsyn::TimedMidiEventKind::ShortMessage, 0x00644090, 0},
+			{16, safsyn::TimedMidiEventKind::ShortMessage, 0x00004080, 0}}};
+		safsyn::SmfRenderOptions options;
+		options.sample_rate = 1000;
+		options.maximum_cohorts = 1;
+		options.drain_tail = true;
+		options.maximum_tail_frames = 100;
+		options.block_frames = block;
+		PcmCapture pcm;
+		safsyn::SmfRenderResult result;
+		check(safsyn::render_timed_midi_pcm(17, bank, next_timed_event, &source,
+			options, result, capture_pcm, &pcm) && result.tail_frames_written > 0 &&
+			result.active_voices_at_end == 0 && !result.tail_ceiling_reached &&
+			result.engine.cohort_capacity_steals == 1,
+			"PCM rendering drains stolen audio after the last logical note ends");
+	}
+}
+
 void test_render_progress_and_cancellation(const std::filesystem::path& directory)
 {
 	safsyn::SmfFile file;
@@ -830,6 +861,7 @@ int main(int argc, char** argv)
 	test_analytic_ticks_before_frame_quantization();
 	test_cohort_histogram_and_mass_dispatch(directory);
 	test_tail_drain(directory);
+	test_stolen_tail_drain();
 	test_render_progress_and_cancellation(directory);
 	if (failures != 0)
 	{

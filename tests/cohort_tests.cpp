@@ -611,6 +611,29 @@ void test_cross_run_merging_and_dynamic_growth()
 		"offline cohorts grow beyond the constructor reserve without implicit stealing");
 }
 
+void test_onset_controller_changes()
+{
+	for (auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::Analytic})
+	for (uint8_t controller : {7, 39, 10, 42, 11, 43})
+	{
+		auto bank = make_bank(48000);
+		safsyn::SynthEngine reference(48000, 16), cohorts(48000, 16);
+		cohorts.set_voice_model(safsyn::VoiceModel::Cohorts, 16);
+		for (auto *engine : {&reference, &cohorts})
+		{
+			engine->set_soundfont(&bank);
+			safsyn::PhaseSettings phase;
+			phase.mode = mode;
+			engine->set_phase_settings(phase);
+			engine->note_on(0, 60, 100);
+			engine->control_change(0, controller, 20);
+			engine->note_on(0, 60, 100);
+		}
+		check(close_audio(render(reference, 256), render(cohorts, 256), 1e-6, 1e-6),
+			"same-frame notes across gain controllers retain their distinct gain histories");
+	}
+}
+
 void test_block_and_seed_determinism()
 {
 	auto bank = make_bank(3200, true);
@@ -650,6 +673,119 @@ void test_safety_limit_stealing()
 		first.stats().stolen_voices == 8 && first.active_cohort_count() == 1 &&
 		first.active_voice_count() == 5,
 		"explicit cohort ceiling steals deterministically and accounts logical multiplicity");
+}
+
+void test_stolen_tails()
+{
+	for (unsigned action = 0; action < 3; ++action)
+	{
+		auto bank = make_bank(48000);
+		std::fill(bank.sfz_pcm[0].begin(), bank.sfz_pcm[0].end(), int16_t{16384});
+		bank.regions[0].decay = 0.0f;
+		bank.regions[0].sustain = 1.0f;
+		bank.regions[0].lo_key = bank.regions[0].hi_key = 60;
+		auto silent = bank.regions[0];
+		silent.lo_key = silent.hi_key = 64;
+		silent.attenuation = 0.0f;
+		silent.release = 0.0f;
+		bank.regions.push_back(silent);
+		safsyn::SynthEngine engine(48000, 1);
+		engine.set_voice_model(safsyn::VoiceModel::Cohorts, 1);
+		engine.set_soundfont(&bank);
+		engine.note_on(0, 60, 127);
+		auto before = render(engine, 64);
+		engine.note_on(0, 64, 127);
+		if (action == 0) engine.control_change(0, 120, 0);
+		if (action == 1)
+		{
+			engine.control_change(0, 7, 0);
+			engine.note_off(0, 64);
+			check(engine.active_voice_count() == 0 && engine.active_cohort_count() == 0 && engine.has_active_audio(),
+				"audio draining includes stolen tails after the last logical voice ends");
+		}
+		if (action == 2) engine.reset();
+		auto after = render(engine, 1024, 17);
+		if (action == 1)
+		{
+			check(std::abs(after[0] - before.back()) < before.back() * 0.04f && after[0] > 0.0f,
+				"stealing fades an audible victim without a cut or a channel-volume jump");
+			check(!engine.has_active_audio(), "stolen tails drain completely");
+			check(std::all_of(after.end() - 64, after.end(), [](float value) -> bool { return value == 0.0f; }),
+				"stolen tails finish and reclaim their slots");
+		}
+		else
+			check(engine.active_voice_count() == 0 &&
+				std::all_of(after.begin(), after.end(), [](float value) -> bool { return value == 0.0f; }),
+				"all-sound-off and reset silence stolen tails as well as counted voices");
+	}
+}
+
+void test_overlapping_stolen_tails()
+{
+	auto bank = make_bank(48000);
+	std::fill(bank.sfz_pcm[0].begin(), bank.sfz_pcm[0].end(), int16_t{16384});
+	bank.regions[0].lo_key = bank.regions[0].hi_key = 60;
+	bank.regions[0].decay = 0.0f;
+	bank.regions[0].sustain = 1.0f;
+	auto silent = bank.regions[0];
+	bank.sfz_pcm.emplace_back(257, 0);
+	silent.pcm = bank.sfz_pcm[1].data();
+	silent.lo_key = silent.hi_key = 64;
+	bank.regions.push_back(silent);
+	safsyn::SynthEngine engine(48000, 512);
+	engine.set_voice_model(safsyn::VoiceModel::Cohorts, 512);
+	engine.set_soundfont(&bank);
+	for (unsigned note = 0; note < 512; ++note)
+	{
+		engine.control_change(0, 1, static_cast<uint8_t>(note & 127));
+		engine.note_on(0, 60, 40);
+	}
+	auto before = render(engine, 64);
+	for (unsigned note = 0; note < 512; ++note)
+	{
+		engine.control_change(0, 1, static_cast<uint8_t>(note & 127));
+		engine.note_on(0, 64, 127);
+	}
+	auto after = render(engine, 1024, 17);
+	check(engine.stats().cohort_capacity_steals == 512 &&
+		std::abs(after[0] - before.back()) < before.back() * 0.04f,
+		"all 512 overlapping stolen releases remain audible without a secondary tail limit");
+	check(std::all_of(after.end() - 64, after.end(), [](float value) -> bool { return value == 0.0f; }),
+		"overlapping release audio drains without repeating after the buffer wraps");
+}
+
+void test_parallel_stolen_tails()
+{
+	for (auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::Analytic})
+	{
+		auto bank = make_bank(4000, true);
+		safsyn::SynthEngine scalar(4000, 128), parallel(4000, 128);
+		for (auto *engine : {&scalar, &parallel})
+		{
+			engine->set_voice_model(safsyn::VoiceModel::Cohorts, 128);
+			engine->set_soundfont(&bank);
+			safsyn::PhaseSettings phase;
+			phase.mode = mode;
+			engine->set_phase_settings(phase);
+			for (uint8_t note = 0; note < 128; ++note) engine->note_on(0, note, 80);
+			render(*engine, 256);
+			for (uint8_t note = 0; note < 128; ++note)
+			{
+				engine->control_change(0, 1, note);
+				engine->note_on(0, 60, 127);
+			}
+			engine->control_change(0, 7, 20);
+		}
+		parallel.set_render_threads(4);
+		check(close_audio(render(scalar, 256), render(parallel, 256)) &&
+			parallel.stats().parallel_render_calls != 0 &&
+			parallel.stats().cohort_capacity_steals == scalar.stats().cohort_capacity_steals &&
+			parallel.active_voice_count() == scalar.active_voice_count(),
+			"stolen tails render and retire identically on the owner and worker threads");
+		for (auto *engine : {&scalar, &parallel}) engine->control_change(0, 120, 0);
+		check(!scalar.has_active_audio() && !parallel.has_active_audio(),
+			"parallel tail retirement leaves consistent channel lists");
+	}
 }
 
 void test_steal_state_changes()
@@ -1169,8 +1305,12 @@ int main()
 	test_filtered_phase_splits();
 	test_linked_stereo_and_one_shot();
 	test_cross_run_merging_and_dynamic_growth();
+	test_onset_controller_changes();
 	test_block_and_seed_determinism();
 	test_safety_limit_stealing();
+	test_stolen_tails();
+	test_overlapping_stolen_tails();
+	test_parallel_stolen_tails();
 	test_steal_state_changes();
 	test_parallel_cohort_render();
 	test_parallel_cohort_render(true);

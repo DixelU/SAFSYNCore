@@ -34,6 +34,8 @@ using detail::RenderCohort;
 using detail::VectorSource;
 using detail::advance_envelope;
 
+constexpr double steal_fade_seconds = 0.008;
+
 // Briefly wait in userspace for dense event intervals, then park idle workers.
 // Acquire observes the job payload (or the completed audio) published by release.
 uint64_t wait_for_change(std::atomic<uint64_t>& value, uint64_t previous) noexcept
@@ -368,6 +370,14 @@ struct CohortEngineState
 	std::array<uint32_t, 16> steal_cursors{};
 	std::array<uint32_t, 16 * 128> note_heads{};
 	size_t maximum_cohorts = 0;
+	struct StealFade
+	{
+		std::vector<float> audio;
+		uint32_t remaining = 0;
+	};
+	std::array<StealFade, 16> steal_fades;
+	std::vector<float> steal_scratch;
+	size_t steal_cursor = 0;
 	std::unique_ptr<ParallelRenderState> parallel_render;
 	std::vector<RegionMatch> matching_regions_scratch;
 	RegionMatchCache region_matches;
@@ -473,14 +483,80 @@ struct CohortEngineState
 		auto& slot = cohorts[index];
 		if (!slot.occupied)
 			return;
+
 		if (logical_ends)
 			active_logical -= slot.cohort.phase.multiplicity;
 		unlink_cohort(index);
+		--active_cohort_count;
 		slot.occupied = false;
 		slot.cohort = {};
 		free_cohorts.push_back(index);
-		--active_cohort_count;
 		(void)owner;
+	}
+
+	void reserve_steal_fades(const SynthEngine& owner)
+	{
+		auto samples = static_cast<size_t>((std::max)(1L,
+			std::lround(owner.sample_rate_ * steal_fade_seconds))) * 2;
+		if (steal_scratch.size() == samples)
+			return;
+
+		steal_scratch.resize(samples);
+		for (auto& fade : steal_fades) fade.audio.resize(samples);
+	}
+
+	// Render a victim's short release before reusing its slot. Overlapping tails
+	// add into fixed-size channel buffers, without retaining logical voices or
+	// imposing another polyphony limit. Later controllers cannot step this audio.
+	void fade_out_stolen(SynthEngine& owner, uint32_t index)
+	{
+		auto& cohort = cohorts[index].cohort;
+		if (cohort.birth_frame == owner.stats_.rendered_frames)
+		{
+			retire_cohort(owner, index, true);
+			return;
+		}
+
+		reserve_steal_fades(owner);
+		if (!begin_release(owner, cohort, static_cast<float>(steal_fade_seconds), false))
+		{
+			retire_cohort(owner, index, true);
+			return;
+		}
+
+		auto& fade = steal_fades[cohort.channel];
+		auto frames = static_cast<uint32_t>(steal_scratch.size() / 2);
+		std::fill(steal_scratch.begin(), steal_scratch.end(), 0.0f);
+		render_range(owner, steal_scratch.data(), frames, index, index + 1, nullptr);
+		retire_cohort(owner, index, true);
+		for (uint32_t frame = 0; frame < frames; ++frame)
+		{
+			auto offset = (steal_cursor + frame) % frames * 2;
+			fade.audio[offset] += steal_scratch[frame * 2];
+			fade.audio[offset + 1] += steal_scratch[frame * 2 + 1];
+		}
+		fade.remaining = frames;
+	}
+
+	void render_steal_fades(float* out, uint32_t frames) noexcept
+	{
+		if (steal_scratch.empty())
+			return;
+
+		auto capacity = steal_scratch.size() / 2;
+		for (auto& fade : steal_fades)
+		{
+			auto count = (std::min)(frames, fade.remaining);
+			for (uint32_t frame = 0; frame < count; ++frame)
+			{
+				auto offset = (steal_cursor + frame) % capacity * 2;
+				out[frame * 2] += fade.audio[offset];
+				out[frame * 2 + 1] += fade.audio[offset + 1];
+				fade.audio[offset] = fade.audio[offset + 1] = 0.0f;
+			}
+			fade.remaining -= count;
+		}
+		steal_cursor = (steal_cursor + frames) % capacity;
 	}
 
 	struct StealCandidate
@@ -634,7 +710,7 @@ struct CohortEngineState
 					++owner.stats_.global_fallback_steals;
 					break;
 				}
-				retire_cohort(owner, victim.index, true);
+				fade_out_stolen(owner, victim.index);
 			}
 		}
 		uint32_t index = invalid_index;
@@ -1226,6 +1302,8 @@ struct CohortEngineState
 			return;
 		while (channel_heads[channel] != invalid_index)
 			retire_cohort(owner, channel_heads[channel], true);
+		std::fill(steal_fades[channel].audio.begin(), steal_fades[channel].audio.end(), 0.0f);
+		steal_fades[channel].remaining = 0;
 		for (uint32_t index = 0; index < logical_batches.size(); ++index)
 			if (logical_batches[index].occupied &&
 				logical_batches[index].batch.channel == channel)
@@ -1766,6 +1844,7 @@ struct CohortEngineState
 			const SampleRegion& region = *cohort.region;
 			const auto& channel = owner.channels_[cohort.channel];
 			const double increment = cohort.base_inc * channel.pitch_bend_ratio;
+			auto amplitude = channel.volume * channel.expression * owner.master_volume_;
 			const bool looping = region.loop_mode == LoopMode::Forward ||
 				region.loop_mode == LoopMode::PingPong ||
 				(region.loop_mode == LoopMode::Sustain && cohort.stage != CohortStage::Release);
@@ -1786,9 +1865,8 @@ struct CohortEngineState
 #if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 				if (vector_kernel && frames - frame >= 4 && cohort.pos >= vector_start)
 				{
-					const float channel_amplitude = channel.volume * channel.expression * owner.master_volume_;
 					frame += vector_kernel(owner, cohort, out + static_cast<size_t>(frame) * 2,
-						frames - frame, increment, valid_loop, channel_amplitude);
+						frames - frame, increment, valid_loop, amplitude);
 					if (frame == frames) break;
 				}
 #endif
@@ -1860,7 +1938,6 @@ struct CohortEngineState
 				}
 				else
 				{
-					const float amplitude = channel.volume * channel.expression * owner.master_volume_;
 					out[static_cast<size_t>(frame) * 2] += filtered_l * cohort.gain_l * amplitude;
 					out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * cohort.gain_r * amplitude;
 				}
@@ -1972,11 +2049,18 @@ struct CohortEngineState
 			std::fill(out, out + static_cast<size_t>(frames) * 2, 0.0f);
 			render_range(owner, out, frames, 0, static_cast<uint32_t>(cohorts.size()), nullptr);
 		}
+		render_steal_fades(out, frames);
 		owner.stats_.rendered_frames += frames;
 	}
 
 	void clear() noexcept
 	{
+		for (auto& fade : steal_fades)
+		{
+			std::fill(fade.audio.begin(), fade.audio.end(), 0.0f);
+			fade.remaining = 0;
+		}
+		steal_cursor = 0;
 		cohorts.clear();
 		steal_info.clear();
 		free_cohorts.clear();
@@ -2016,12 +2100,13 @@ void CohortEngine::set_render_threads(size_t threads) noexcept
 		state_->set_render_threads(threads);
 }
 
-void CohortEngine::reserve_playback(uint32_t maximum_block_frames, size_t region_count)
+void CohortEngine::reserve_playback(SynthEngine& owner, uint32_t maximum_block_frames, size_t region_count)
 {
 	if (!state_) return;
 	auto& state = *state_;
 	// Reserve, do not resize: unused slots must not affect iteration/stealing order.
 	const size_t capacity = state.maximum_cohorts;
+	if (capacity != 0) state.reserve_steal_fades(owner);
 	state.cohorts.reserve(capacity);
 	state.steal_info.reserve(capacity);
 	state.free_cohorts.reserve(capacity);
@@ -2144,6 +2229,13 @@ size_t CohortEngine::active_logical_voices() const noexcept
 size_t CohortEngine::active_cohorts() const noexcept
 {
 	return state_ ? state_->active_cohort_count : 0;
+}
+
+auto CohortEngine::has_active_audio() const noexcept -> bool
+{
+	return this->state_ && (this->state_->active_cohort_count != 0 ||
+		std::any_of(this->state_->steal_fades.begin(), this->state_->steal_fades.end(),
+			[](const auto& fade) -> bool { return fade.remaining != 0; }));
 }
 
 } // namespace safsyn

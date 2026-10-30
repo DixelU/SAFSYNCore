@@ -774,6 +774,50 @@ void test_controller_gain_ramps()
 	check(glides[0] == glides[1], "individual voices and cohorts glide identically");
 }
 
+void test_rapid_gain_changes()
+{
+	for (auto model : {safsyn::VoiceModel::Individual, safsyn::VoiceModel::Cohorts})
+	for (uint32_t block : {1u, 17u, 64u})
+	{
+		auto bank = make_constant_bank(48000);
+		safsyn::SynthEngine engine(48000, 8);
+		engine.set_soundfont(&bank);
+		engine.set_voice_model(model);
+		engine.note_on(0, 60, 127);
+		std::array<float, 128> audio{};
+		engine.render_audio(audio.data(), 64);
+		auto previous = std::array{audio[126], audio[127]};
+		auto bounded = true;
+		for (uint32_t event = 0; event < 100; ++event)
+		{
+			engine.control_change(0, 10, event % 2 ? 0 : 127);
+			engine.control_change(0, 42, event % 2 ? 0 : 127);
+			engine.control_change(0, 7, event % 3 ? 127 : 30);
+			engine.control_change(0, 11, event % 5 ? 100 : 127);
+			engine.set_master_volume(event % 7 ? 16383 : 0);
+			engine.render_audio(audio.data(), block);
+			for (uint32_t frame = 0; frame < block; ++frame)
+				for (size_t channel = 0; channel < 2; ++channel)
+				{
+					auto value = audio[frame * 2 + channel];
+					bounded &= std::isfinite(value) && std::abs(value - previous[channel]) <= 0.5f / 192 + 1e-6f;
+					previous[channel] = value;
+				}
+		}
+		check(bounded, "rapid pan, fine-pan and gain changes retarget an unfinished ramp without steps");
+		engine.control_change(0, 10, 64);
+		engine.control_change(0, 42, 0);
+		engine.control_change(0, 7, 127);
+		engine.control_change(0, 11, 127);
+		engine.set_master_volume(16383);
+		std::array<float, 512> settled{};
+		engine.render_audio(settled.data(), 256);
+		check(std::all_of(settled.end() - 16, settled.end(), [](float value) -> bool
+			{ return std::abs(value - 0.35355339f) < 1e-6f; }),
+			"an interrupted gain ramp settles to the final controller values");
+	}
+}
+
 void test_rpn_pitch_bend_sensitivity()
 {
 	safsyn::Soundfont bank;
@@ -1206,6 +1250,7 @@ int main(int argc, char** argv)
 	test_lowpass_controllers();
 	test_stereo_center_gain();
 	test_controller_gain_ramps();
+	test_rapid_gain_changes();
 	test_controller_contract();
 	test_rpn_pitch_bend_sensitivity();
 	test_determinism_and_block_invariance();

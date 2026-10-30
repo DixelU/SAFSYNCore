@@ -145,6 +145,8 @@ public:
 	// In cohort mode this is represented logical region voices, not slot count.
 	size_t active_voice_count() const noexcept;
 	size_t active_cohort_count() const noexcept;
+	// Stolen audio tails can remain after the logical voice count reaches zero.
+	[[nodiscard]] auto has_active_audio() const noexcept -> bool;
 	const RenderStats& stats() const noexcept { return stats_; }
 	const PhaseSettings& phase_settings() const noexcept { return phase_processor_.settings(); }
 	PhaseCacheStats phase_cache_stats() const noexcept { return phase_processor_.stats(); }
