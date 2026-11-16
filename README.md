@@ -85,7 +85,11 @@ seconds of buffering for dense files. The **Phase mode** selector defaults to
 direct sampling (coherent), with analytic rotation available. Stop to change
 mode. Analytic sample quadratures are precomputed in parallel before playback,
 with progress, cancellation, and an adjustable cache limit; large banks can take
-time and memory to prepare. Cohort storage and worker buffers are reserved at
+time and memory to prepare. A host can persist the quadratures by setting
+`PhasePreparationOptions::disk_cache_directory` (SAFC uses
+`%LOCALAPPDATA%\SAFC\SYNCore\phase-cache`); files are keyed by sample content,
+load bit-identically, and are pruned least-recently-used beyond 8 GiB by default.
+Cohort storage and worker buffers are reserved at
 startup, while cohort membership follows MIDI events.
 
 Live playback uses a finite cohort ceiling (default 4096), an automatic persistent

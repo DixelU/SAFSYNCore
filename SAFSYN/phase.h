@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <span>
@@ -39,6 +40,8 @@ struct PhaseCacheStats
 	uint64_t assignments = 0;
 	uint64_t failures = 0;
 	double preprocessing_ms = 0.0;
+	uint64_t disk_loaded_samples = 0; // Quadratures read from the disk cache.
+	uint64_t disk_written_bytes = 0;
 };
 
 struct PhasePreparationProgress
@@ -55,6 +58,12 @@ struct PhasePreparationOptions
 	// Unique samples are transformed concurrently. Zero selects a bounded
 	// automatic count; the cache contents do not depend on it.
 	uint32_t threads = 0;
+	// Persistent quadrature cache. Empty disables it. Files are keyed by sample
+	// content, so a bank edited on disk misses instead of loading stale data.
+	// Disk errors never fail preparation; the transform is computed instead.
+	std::filesystem::path disk_cache_directory;
+	// Least recently used cache files are removed beyond this total; 0 keeps all.
+	uint64_t maximum_disk_cache_bytes = uint64_t{8} * 1024 * 1024 * 1024;
 	std::stop_token stop;
 	std::function<void(const PhasePreparationProgress&)> progress;
 };

@@ -8,7 +8,9 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
+#include <string>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -768,6 +770,111 @@ void test_preparation_budget_and_cancellation()
 	check(processor.stats().analytic_samples == 0 && processor.stats().cache_bytes == 0 && processor.stats().failures == 0,
 		"cancelled FFT does not publish partial PCM or report a playback fallback");
 }
+// Every pointer, rotation and scale an assignment exposes, bit for bit.
+bool same_analytic_state(safsyn::PhaseProcessor& left, safsyn::PhaseProcessor& right,
+	const safsyn::Soundfont& bank)
+{
+	for (size_t id = 0; id < bank.regions.size(); ++id)
+	{
+		const auto& region = bank.regions[id];
+		for (uint64_t onset = 0; onset < 16; ++onset)
+		{
+			const auto a = left.assign(region, id, onset, 0, 60);
+			const auto b = right.assign(region, id, onset, 0, 60);
+			if (a.kind != safsyn::PhaseVoiceState::Kind::Analytic || a.kind != b.kind ||
+				a.cosine != b.cosine || a.sine != b.sine ||
+				a.scale_left != b.scale_left || a.scale_right != b.scale_right ||
+				!std::equal(a.quadrature_left, a.quadrature_left + region.pcm_len, b.quadrature_left) ||
+				!std::equal(a.quadrature_right, a.quadrature_right + region.pcm_len, b.quadrature_right))
+				return false;
+		}
+	}
+	return true;
+}
+
+void test_disk_cache_round_trip()
+{
+	namespace fs = std::filesystem;
+	const fs::path directory = fs::temp_directory_path() /
+		("safsyn-phase-cache-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+	auto bank = make_bank(make_signal(3001), 12000, 1, true, 100, 2900);
+	bank.sfz_pcm.push_back(make_signal(2048, 2));
+	auto stereo = bank.regions.front();
+	stereo.logical_sample_id += 1;
+	stereo.pcm = bank.sfz_pcm.back().data();
+	stereo.pcm_len = 2048;
+	stereo.channels = 2;
+	stereo.loop_mode = safsyn::LoopMode::None;
+	bank.regions.push_back(stereo);
+	auto layer = bank.regions.front(); // Same PCM under another region and id.
+	layer.logical_sample_id += 2;
+	bank.regions.push_back(layer);
+	bank.regions[0].pcm = bank.sfz_pcm.front().data();
+	bank.regions[2].pcm = bank.sfz_pcm.front().data();
+
+	safsyn::PhasePreparationOptions options;
+	options.disk_cache_directory = directory;
+	options.threads = 2;
+	const auto phase = settings(safsyn::PhaseMode::Analytic, 8, 11);
+	auto count_files = [&] {
+		size_t files = 0;
+		for (const auto& item : fs::directory_iterator(directory))
+			files += item.path().extension() == ".safphase";
+		return files;
+	};
+
+	safsyn::PhaseProcessor reference, first, second;
+	reference.configure(phase);
+	first.configure(phase);
+	second.configure(phase);
+	check(reference.prepare(bank.regions), "reference preparation without a disk cache");
+	check(first.prepare(bank.regions, options) && first.stats().disk_loaded_samples == 0 &&
+		first.stats().disk_written_bytes > 0 && count_files() == 1,
+		"a cold preparation writes one disk cache file");
+	check(second.prepare(bank.regions, options) && second.stats().disk_loaded_samples == 3 &&
+		second.stats().disk_written_bytes == 0 && second.stats().analytic_samples == 3,
+		"a warm preparation loads every unique sample from disk");
+	check(same_analytic_state(reference, second, bank),
+		"disk-loaded quadratures and rotations equal computed ones bit for bit");
+
+	// Changed PCM must miss, not load the old quadrature.
+	bank.sfz_pcm.back()[10] = static_cast<int16_t>(bank.sfz_pcm.back()[10] + 1);
+	safsyn::PhaseProcessor edited, edited_reference;
+	edited.configure(phase);
+	edited_reference.configure(phase);
+	check(edited_reference.prepare(bank.regions), "edited bank reference preparation");
+	check(edited.prepare(bank.regions, options) && edited.stats().disk_loaded_samples == 0 &&
+		count_files() == 2 && same_analytic_state(edited_reference, edited, bank),
+		"edited sample content misses the old cache file");
+
+	// A truncated file is ignored, recomputed and replaced. Over budget, the
+	// write also drops the older file and keeps the one just written.
+	for (const auto& item : fs::directory_iterator(directory))
+		if (item.path().extension() == ".safphase")
+			fs::resize_file(item.path(), fs::file_size(item.path()) - 4);
+	options.maximum_disk_cache_bytes = 1;
+	safsyn::PhaseProcessor damaged;
+	damaged.configure(phase);
+	check(damaged.prepare(bank.regions, options) && damaged.stats().disk_loaded_samples == 0 &&
+		damaged.stats().disk_written_bytes > 0 && same_analytic_state(edited_reference, damaged, bank),
+		"a damaged cache file is recomputed");
+	check(count_files() == 1, "least recently used cache files are pruned");
+	safsyn::PhaseProcessor reloaded;
+	reloaded.configure(phase);
+	check(reloaded.prepare(bank.regions, options) && reloaded.stats().disk_loaded_samples == 3 &&
+		same_analytic_state(edited_reference, reloaded, bank), "the rewritten cache file loads");
+
+	std::stop_source stop;
+	stop.request_stop();
+	options.stop = stop.get_token();
+	safsyn::PhaseProcessor cancelled;
+	cancelled.configure(phase);
+	check(!cancelled.prepare(bank.regions, options) && cancelled.stats().analytic_samples == 0,
+		"a cancelled preparation loads nothing");
+
+	std::error_code ignored;
+	fs::remove_all(directory, ignored);
+}
 } // namespace
 
 int main()
@@ -791,6 +898,7 @@ int main()
 	test_preparation_preserves_audio_and_warms_all_variants();
 	test_parallel_preparation_matches_serial();
 	test_preparation_budget_and_cancellation();
+	test_disk_cache_round_trip();
 	if (failures != 0)
 	{
 		std::cerr << failures << " phase test(s) failed\n";

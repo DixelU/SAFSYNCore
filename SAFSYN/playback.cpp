@@ -141,6 +141,7 @@ struct BufferedSynth::Impl
 			current.render_threads = engine.render_threads();
 			PhasePreparationOptions prepare;
 			prepare.maximum_cache_bytes = options.maximum_phase_cache_bytes;
+			prepare.disk_cache_directory = options.phase_disk_cache_directory;
 			prepare.stop = preparation_stop.get_token();
 			prepare.progress = [&](const PhasePreparationProgress& progress) {
 				current.preparation = progress;

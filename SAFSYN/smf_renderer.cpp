@@ -196,6 +196,7 @@ bool render_timed_midi_pcm(uint64_t duration_frames,
 		bool preparation_cancelled = false;
 		PhasePreparationOptions preparation;
 		preparation.stop = preparation_stop.get_token();
+		preparation.disk_cache_directory = options.phase_disk_cache_directory;
 		preparation.progress = [&](const PhasePreparationProgress& progress) {
 			phase_preparation = progress;
 			if (!report_progress(SmfRenderProgressStage::Preparing, 0, expected_frames))

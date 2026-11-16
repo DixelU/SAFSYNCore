@@ -85,6 +85,8 @@ struct SmfRenderOptions
 	uint32_t block_frames = 256;
 	bool all_regions = false;
 	PhaseSettings phase;
+	// Persistent analytic quadrature cache (PhasePreparationOptions); empty disables.
+	std::filesystem::path phase_disk_cache_directory;
 	MasteringSettings mastering;
 	SmfRenderProgressCallback progress_callback = nullptr;
 	void* progress_user_data = nullptr;

@@ -3,18 +3,24 @@
 #include "core.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <complex>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -422,6 +428,184 @@ size_t automatic_preparation_threads() noexcept
 	const unsigned hardware = std::thread::hardware_concurrency();
 	return std::clamp<size_t>(hardware > 1 ? hardware - 1 : 1, 1, 8);
 }
+
+// ---- Persistent quadrature cache -------------------------------------------
+//
+// One file per unique-sample set, named by a digest of every sample's content
+// key. Each record repeats its own key, so a file is only ever applied to the
+// exact PCM, loop and rate that produced it. Files are written to a temporary
+// name and renamed, so a crash leaves either the old file or none.
+
+// Bump whenever build_sample_quadrature() arithmetic or the file layout changes;
+// it is part of every content key, so old files simply stop matching.
+constexpr uint64_t quadrature_cache_version = 1;
+constexpr char quadrature_cache_magic[8] = {'S', 'A', 'F', 'P', 'H', 'Q', 'C', '1'};
+constexpr const char* quadrature_cache_extension = ".safphase";
+
+struct ContentKey
+{
+	uint64_t first = 0;
+	uint64_t second = 0;
+	bool operator==(const ContentKey&) const noexcept = default;
+};
+
+struct ContentKeyHash
+{
+	size_t operator()(const ContentKey& key) const noexcept { return static_cast<size_t>(key.first); }
+};
+
+// Two independently mixed 64-bit lanes. Not cryptographic; it only has to tell
+// apart sample contents that are already known to share length and loop.
+class ContentHasher
+{
+	uint64_t first_ = 0x243f6a8885a308d3ULL;
+	uint64_t second_ = 0x13198a2e03707344ULL;
+
+public:
+	void add(uint64_t word) noexcept
+	{
+		first_ = std::rotl((first_ ^ word) * 0x9e3779b97f4a7c15ULL, 29);
+		second_ = std::rotl((second_ + word) * 0xc2b2ae3d27d4eb4fULL, 31) ^ first_;
+	}
+
+	void add_bytes(const void* data, size_t size) noexcept
+	{
+		const auto* bytes = static_cast<const unsigned char*>(data);
+		size_t offset = 0;
+		for (; offset + 8 <= size; offset += 8)
+		{
+			uint64_t word;
+			std::memcpy(&word, bytes + offset, 8);
+			add(word);
+		}
+		uint64_t tail = 0;
+		std::memcpy(&tail, bytes + offset, size - offset);
+		add(tail);
+		add(size);
+	}
+
+	ContentKey finish() const noexcept
+	{
+		return {splitmix64(first_ ^ std::rotl(second_, 17)),
+			splitmix64(second_ + 0x9e3779b97f4a7c15ULL * first_)};
+	}
+};
+
+// Covers exactly the inputs build_sample_quadrature() reads.
+ContentKey sample_content_key(const SampleRegion& region) noexcept
+{
+	ContentHasher hasher;
+	hasher.add(quadrature_cache_version);
+	hasher.add(region.pcm_len);
+	hasher.add(region.channels);
+	hasher.add(region.sample_rate);
+	const bool looped = has_valid_loop(region);
+	hasher.add(looped ? (static_cast<uint64_t>(region.loop_start) << 32) | region.loop_end :
+		~uint64_t{0});
+	const size_t frames = region.pcm_len;
+	if (region.pcm_right)
+	{
+		hasher.add_bytes(region.pcm, frames * sizeof(int16_t));
+		if (region.channels == 2)
+			hasher.add_bytes(region.pcm_right, frames * sizeof(int16_t));
+	}
+	else
+		hasher.add_bytes(region.pcm, frames * region.channels * sizeof(int16_t));
+	return hasher.finish();
+}
+
+struct CacheFileHeader
+{
+	char magic[8];
+	uint64_t version;
+	uint64_t record_count;
+	uint64_t set_first;
+	uint64_t set_second;
+};
+
+struct CacheFileRecord
+{
+	uint64_t key_first;
+	uint64_t key_second;
+	uint32_t length;
+	uint32_t channels;
+	double energies[6]; // original, quadrature, cross; left then right.
+};
+
+static_assert(std::is_trivially_copyable_v<CacheFileHeader> && sizeof(CacheFileHeader) == 40);
+static_assert(std::is_trivially_copyable_v<CacheFileRecord> && sizeof(CacheFileRecord) == 72);
+
+std::string hex_digest(const ContentKey& key)
+{
+	static constexpr char digits[] = "0123456789abcdef";
+	std::string result(32, '0');
+	for (int index = 0; index < 16; ++index)
+	{
+		result[15 - index] = digits[(key.first >> (index * 4)) & 15];
+		result[31 - index] = digits[(key.second >> (index * 4)) & 15];
+	}
+	return result;
+}
+
+uint64_t record_payload_bytes(const CacheFileRecord& record) noexcept
+{
+	return uint64_t{record.length} * record.channels * sizeof(float);
+}
+
+// Drops least recently used cache files beyond the budget, never `keep`.
+void prune_disk_cache(const std::filesystem::path& directory, const std::filesystem::path& keep,
+	uint64_t maximum_bytes) noexcept
+{
+	try
+	{
+		namespace fs = std::filesystem;
+		struct CacheFile { fs::file_time_type time; uint64_t size; fs::path path; };
+		std::vector<CacheFile> files;
+		uint64_t total = 0;
+		std::error_code error;
+		const auto now = fs::file_time_type::clock::now();
+		for (fs::directory_iterator it(directory, error), end; !error && it != end; it.increment(error))
+		{
+			const auto& path = it->path();
+			const auto name = path.filename().string();
+			const auto time = it->last_write_time(error);
+			if (error) { error.clear(); continue; }
+			// Temporary files of a crashed or concurrent writer; give live ones a day.
+			if (name.find(std::string(quadrature_cache_extension) + ".tmp") != std::string::npos)
+			{
+				if (now - time > std::chrono::hours(24))
+					fs::remove(path, error);
+				error.clear();
+				continue;
+			}
+			if (path.extension() != quadrature_cache_extension)
+				continue;
+			const uint64_t size = it->file_size(error);
+			if (error) { error.clear(); continue; }
+			files.push_back({time, size, path});
+			total += size;
+		}
+		if (maximum_bytes == 0 || total <= maximum_bytes)
+			return;
+		std::sort(files.begin(), files.end(), [](const CacheFile& left, const CacheFile& right) {
+			return left.time < right.time;
+		});
+		for (const auto& file : files)
+		{
+			if (total <= maximum_bytes)
+				break;
+			if (file.path == keep)
+				continue;
+			if (fs::remove(file.path, error))
+				total -= file.size;
+			error.clear();
+		}
+	}
+	catch (...)
+	{
+		// The cache is an optimization; a directory error must not fail playback.
+	}
+}
 } // namespace
 
 struct PhaseProcessor::Impl
@@ -650,7 +834,186 @@ struct PhaseProcessor::Impl
 	{
 		Entry* entry = nullptr;
 		const SampleRegion* region = nullptr;
+		ContentKey content; // Set only when a disk cache is in use.
 	};
+
+	// Publishes every job found in `file` and removes it from `jobs`. A missing,
+	// foreign or damaged file loads nothing (or stops at the damage); only
+	// cancellation escapes.
+	void load_disk_cache(const std::filesystem::path& file, const ContentKey& set_key,
+		std::vector<Job>& jobs, PhasePreparationProgress& progress,
+		const PhasePreparationOptions& options)
+	{
+		std::vector<bool> loaded(jobs.size(), false);
+		auto drop_loaded = [&] {
+			size_t kept = 0;
+			for (size_t index = 0; index < jobs.size(); ++index)
+				if (!loaded[index])
+					jobs[kept++] = jobs[index];
+			jobs.resize(kept);
+		};
+		try
+		{
+			std::ifstream input(file, std::ios::binary);
+			if (!input)
+				return;
+			CacheFileHeader header{};
+			if (!input.read(reinterpret_cast<char*>(&header), sizeof(header)) ||
+				std::memcmp(header.magic, quadrature_cache_magic, sizeof(header.magic)) != 0 ||
+				header.version != quadrature_cache_version ||
+				header.set_first != set_key.first || header.set_second != set_key.second ||
+				header.record_count == 0 || header.record_count > (uint64_t{1} << 20))
+				return;
+			std::vector<CacheFileRecord> records(static_cast<size_t>(header.record_count));
+			if (!input.read(reinterpret_cast<char*>(records.data()),
+				static_cast<std::streamsize>(records.size() * sizeof(CacheFileRecord))))
+				return;
+			// A short file means an interrupted copy; refuse it before reading PCM.
+			uint64_t expected = sizeof(header) + records.size() * sizeof(CacheFileRecord);
+			for (const auto& record : records)
+			{
+				if (record.channels < 1 || record.channels > 2)
+					return;
+				expected += record_payload_bytes(record);
+			}
+			std::error_code error;
+			if (std::filesystem::file_size(file, error) != expected || error)
+				return;
+
+			std::unordered_multimap<ContentKey, size_t, ContentKeyHash> wanted;
+			for (size_t index = 0; index < jobs.size(); ++index)
+				wanted.emplace(jobs[index].content, index);
+			uint64_t offset = sizeof(header) + records.size() * sizeof(CacheFileRecord);
+			for (const auto& record : records)
+			{
+				check_cancel(options.stop);
+				const uint64_t bytes = record_payload_bytes(record);
+				const auto [first, last] = wanted.equal_range({record.key_first, record.key_second});
+				std::vector<size_t> matches;
+				for (auto it = first; it != last; ++it)
+				{
+					const SampleRegion& region = *jobs[it->second].region;
+					if (!loaded[it->second] && region.pcm_len == record.length &&
+						region.channels == record.channels)
+						matches.push_back(it->second);
+				}
+				if (matches.empty())
+				{
+					offset += bytes;
+					continue;
+				}
+				SampleQuadrature quadrature;
+				auto read_plane = [&](ChannelQuadrature& channel) {
+					channel.quadrature.resize(record.length);
+					return static_cast<bool>(input.read(reinterpret_cast<char*>(channel.quadrature.data()),
+						static_cast<std::streamsize>(uint64_t{record.length} * sizeof(float))));
+				};
+				input.seekg(static_cast<std::streamoff>(offset));
+				if (!read_plane(quadrature.left) || (record.channels == 2 && !read_plane(quadrature.right)))
+					return;
+				offset += bytes;
+				quadrature.left.original_energy = record.energies[0];
+				quadrature.left.quadrature_energy = record.energies[1];
+				quadrature.left.cross_energy = record.energies[2];
+				quadrature.right.original_energy = record.energies[3];
+				quadrature.right.quadrature_energy = record.energies[4];
+				quadrature.right.cross_energy = record.energies[5];
+				for (size_t match = 0; match < matches.size(); ++match)
+				{
+					if (match + 1 == matches.size())
+						publish(*jobs[matches[match]].entry, std::move(quadrature));
+					else
+					{
+						SampleQuadrature copy = quadrature;
+						publish(*jobs[matches[match]].entry, std::move(copy));
+					}
+					loaded[matches[match]] = true;
+					++statistics.disk_loaded_samples;
+					++progress.completed;
+					progress.cache_bytes = statistics.cache_bytes;
+					if (options.progress) options.progress(progress);
+				}
+			}
+		}
+		catch (const PreparationCancelled&)
+		{
+			drop_loaded();
+			throw;
+		}
+		catch (const std::exception&)
+		{
+			// Unreadable or out of memory: whatever did load stays, the rest is computed.
+		}
+		drop_loaded();
+	}
+
+	// Best effort: any failure removes the temporary file and leaves no cache.
+	void write_disk_cache(const std::filesystem::path& directory, const std::filesystem::path& file,
+		const ContentKey& set_key, const std::vector<std::pair<ContentKey, const Entry*>>& samples) noexcept
+	{
+		namespace fs = std::filesystem;
+		fs::path temporary;
+		try
+		{
+			std::error_code error;
+			fs::create_directories(directory, error);
+			if (error)
+				return;
+			std::random_device random;
+			temporary = file;
+			temporary += ".tmp" + hex_digest({random(), random()}).substr(0, 12);
+
+			CacheFileHeader header{};
+			std::memcpy(header.magic, quadrature_cache_magic, sizeof(header.magic));
+			header.version = quadrature_cache_version;
+			header.record_count = samples.size();
+			header.set_first = set_key.first;
+			header.set_second = set_key.second;
+			std::vector<CacheFileRecord> records;
+			records.reserve(samples.size());
+			uint64_t total = sizeof(header) + samples.size() * sizeof(CacheFileRecord);
+			for (const auto& [key, entry] : samples)
+			{
+				const uint32_t channels = entry->quadrature_right.empty() ? 1 : 2;
+				records.push_back({key.first, key.second,
+					static_cast<uint32_t>(entry->quadrature_left.size()), channels,
+					{entry->original_energy_left, entry->quadrature_energy_left, entry->cross_energy_left,
+						entry->original_energy_right, entry->quadrature_energy_right, entry->cross_energy_right}});
+				total += record_payload_bytes(records.back());
+			}
+			{
+				std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+				output.write(reinterpret_cast<const char*>(&header), sizeof(header));
+				output.write(reinterpret_cast<const char*>(records.data()),
+					static_cast<std::streamsize>(records.size() * sizeof(CacheFileRecord)));
+				for (const auto& [key, entry] : samples)
+					for (const auto* plane : {&entry->quadrature_left, &entry->quadrature_right})
+						if (!plane->empty())
+							output.write(reinterpret_cast<const char*>(plane->data()),
+								static_cast<std::streamsize>(plane->size() * sizeof(float)));
+				output.close();
+				if (!output)
+				{
+					fs::remove(temporary, error);
+					return;
+				}
+			}
+			fs::rename(temporary, file, error);
+			if (error)
+			{
+				// Another process may hold the destination open; its copy is equivalent.
+				fs::remove(temporary, error);
+				return;
+			}
+			statistics.disk_written_bytes += total;
+		}
+		catch (...)
+		{
+			std::error_code ignored;
+			if (!temporary.empty())
+				fs::remove(temporary, ignored);
+		}
+	}
 
 	// Transforms are independent per sample, so worker scheduling cannot change
 	// cached values. Progress callbacks stay on the calling thread.
@@ -849,6 +1212,57 @@ bool PhaseProcessor::prepare(std::span<const SampleRegion> regions, const PhaseP
 		if (jobs.empty())
 			return !options.stop.stop_requested();
 
+		const auto started = std::chrono::steady_clock::now();
+		auto record_time = [&] {
+			state.statistics.preprocessing_ms += std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - started).count();
+		};
+		const auto& disk_directory = options.disk_cache_directory;
+		std::filesystem::path disk_file;
+		ContentKey set_key;
+		std::vector<std::pair<ContentKey, const Impl::Entry*>> disk_samples;
+		try
+		{
+			if (!disk_directory.empty())
+			{
+				// Key every unique sample by content; the set of keys names the file.
+				ContentHasher set_hasher;
+				set_hasher.add(quadrature_cache_version);
+				std::unordered_map<const Impl::Entry*, ContentKey> keys;
+				std::unordered_set<ContentKey, ContentKeyHash> recorded;
+				for (const size_t id : unique_regions)
+				{
+					check_cancel(options.stop);
+					const ContentKey key = sample_content_key(regions[id]);
+					set_hasher.add(key.first);
+					set_hasher.add(key.second);
+					const auto* entry = &state.entry_for(regions[id], id);
+					keys[entry] = key;
+					if (recorded.insert(key).second)
+						disk_samples.emplace_back(key, entry);
+				}
+				for (auto& job : jobs)
+					job.content = keys[job.entry];
+				set_key = set_hasher.finish();
+				disk_file = disk_directory / (hex_digest(set_key) + quadrature_cache_extension);
+				state.load_disk_cache(disk_file, set_key, jobs, progress, options);
+				if (jobs.empty())
+				{
+					// Refresh the LRU position of the file that was just used.
+					std::error_code ignored;
+					std::filesystem::last_write_time(disk_file,
+						std::filesystem::file_time_type::clock::now(), ignored);
+					record_time();
+					return !options.stop.stop_requested();
+				}
+			}
+		}
+		catch (...)
+		{
+			record_time();
+			throw;
+		}
+
 		// Longest samples first balances workers; the cache is order-independent.
 		std::stable_sort(jobs.begin(), jobs.end(), [](const Impl::Job& left, const Impl::Job& right) {
 			return uint64_t{left.region->pcm_len} * left.region->channels >
@@ -856,11 +1270,6 @@ bool PhaseProcessor::prepare(std::span<const SampleRegion> regions, const PhaseP
 		});
 		const size_t threads = (std::min)(jobs.size(),
 			options.threads != 0 ? size_t{options.threads} : automatic_preparation_threads());
-		const auto started = std::chrono::steady_clock::now();
-		auto record_time = [&] {
-			state.statistics.preprocessing_ms += std::chrono::duration<double, std::milli>(
-				std::chrono::steady_clock::now() - started).count();
-		};
 		try
 		{
 			if (threads <= 1)
@@ -880,8 +1289,18 @@ bool PhaseProcessor::prepare(std::span<const SampleRegion> regions, const PhaseP
 			record_time();
 			throw;
 		}
+		if (options.stop.stop_requested())
+		{
+			record_time();
+			return false;
+		}
+		if (!disk_directory.empty() && std::all_of(disk_samples.begin(), disk_samples.end(),
+			[](const auto& sample) { return sample.second->prepared(); }))
+		{
+			state.write_disk_cache(disk_directory, disk_file, set_key, disk_samples);
+			prune_disk_cache(disk_directory, disk_file, options.maximum_disk_cache_bytes);
+		}
 		record_time();
-		check_cancel(options.stop);
 		return true;
 	}
 	catch (const PreparationCancelled&) { return false; }

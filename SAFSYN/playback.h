@@ -40,6 +40,8 @@ struct PlaybackOptions
 	uint32_t maximum_tail_seconds = 10;
 	PhaseSettings phase;
 	uint64_t maximum_phase_cache_bytes = uint64_t{2048} * 1024 * 1024;
+	// Persistent analytic quadrature cache (PhasePreparationOptions); empty disables.
+	std::filesystem::path phase_disk_cache_directory;
 	MasteringSettings mastering{-12.0, true, -1.0, 5.0, 100.0};
 };
 

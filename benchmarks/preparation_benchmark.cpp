@@ -75,9 +75,9 @@ uint64_t cache_hash(safsyn::PhaseProcessor& processor, const safsyn::Soundfont& 
 
 int main(int argc, char** argv)
 {
-	if (argc < 2 || argc > 4)
+	if (argc < 2 || argc > 5)
 	{
-		std::cerr << "usage: safsyn-preparation-benchmark <bank.sf2|bank.sfz|--synthetic|--synthetic-large> [threads=0] [repeats=3]\n";
+		std::cerr << "usage: safsyn-preparation-benchmark <bank.sf2|bank.sfz|--synthetic|--synthetic-large> [threads=0] [repeats=3] [disk-cache-dir]\n";
 		return 2;
 	}
 	try
@@ -85,6 +85,7 @@ int main(int argc, char** argv)
 		const std::string path = argv[1];
 		const uint32_t threads = argc > 2 ? static_cast<uint32_t>(std::stoul(argv[2])) : 0;
 		const unsigned repeats = argc > 3 ? static_cast<unsigned>(std::stoul(argv[3])) : 3;
+		const std::string disk_cache = argc > 4 ? argv[4] : "";
 		safsyn::Soundfont bank;
 		const auto load_start = Clock::now();
 		if (path == "--synthetic" || path == "--synthetic-large")
@@ -96,7 +97,7 @@ int main(int argc, char** argv)
 			return 1;
 		}
 		std::cerr << "load_ms=" << milliseconds(load_start) << ", regions=" << bank.regions.size() << '\n';
-		std::cout << "threads,repeat,prepare_ms,warm_ms,unique_samples,cache_bytes,quadrature_hash\n";
+		std::cout << "threads,repeat,prepare_ms,warm_ms,unique_samples,cache_bytes,disk_loaded,disk_written,quadrature_hash\n";
 		for (unsigned repeat = 0; repeat < repeats; ++repeat)
 		{
 			safsyn::PhaseProcessor processor;
@@ -105,6 +106,7 @@ int main(int argc, char** argv)
 			processor.configure(settings);
 			safsyn::PhasePreparationOptions options;
 			options.threads = threads;
+			options.disk_cache_directory = disk_cache;
 			const auto started = Clock::now();
 			if (!processor.prepare(bank.regions, options)) return 1;
 			const double prepare_ms = milliseconds(started);
@@ -114,7 +116,8 @@ int main(int argc, char** argv)
 			const auto stats = processor.stats();
 			std::cout << threads << ',' << repeat << ',' << std::fixed << std::setprecision(3)
 				<< prepare_ms << ',' << warm_ms << ',' << stats.analytic_samples << ','
-				<< stats.cache_bytes << ',' << cache_hash(processor, bank) << '\n';
+				<< stats.cache_bytes << ',' << stats.disk_loaded_samples << ',' << stats.disk_written_bytes << ','
+				<< cache_hash(processor, bank) << '\n';
 		}
 	}
 	catch (const std::exception& error)
