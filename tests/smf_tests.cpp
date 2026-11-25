@@ -292,6 +292,33 @@ std::vector<uint8_t> master_volume_fixture()
 	return make_smf(0, 100, {track});
 }
 
+void test_mapped_input(const std::filesystem::path& directory)
+{
+	std::filesystem::create_directories(directory);
+	const auto path = directory / u8"mapped-\u266b.mid";
+	const auto bytes = master_volume_fixture();
+	{
+		std::ofstream output(path, std::ios::binary);
+		output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+	}
+	safsyn::SmfFile file;
+	check(file.load(path) && file.input_bytes() == bytes.size(), "wide file path maps all SMF bytes");
+	auto copy = file;
+	check(file.load_bytes(running_status_fixture()), "a mapped file can be reloaded from memory");
+	safsyn::MergedSmfStream stream(copy);
+	safsyn::SmfEvent event;
+	bool decoded = false;
+	while (stream.next(event))
+	{
+		uint16_t volume = 0;
+		if (safsyn::decode_universal_master_volume(copy, event, volume))
+			decoded = volume == 4096;
+	}
+	check(stream.good() && decoded, "a copy keeps the mapping and SysEx payload alive after reload");
+	check(!file.load(directory / "absent-midi-file.mid") && !file.valid() && file.input_bytes() == 0,
+		"a failed reload releases the old input");
+}
+
 void test_type0_running_status_and_usage()
 {
 	safsyn::SmfFile file;
@@ -849,6 +876,7 @@ void test_render_progress_and_cancellation(const std::filesystem::path& director
 int main(int argc, char** argv)
 {
 	const std::filesystem::path directory = argc > 1 ? argv[1] : "smf-test-data";
+	test_mapped_input(directory);
 	test_type0_running_status_and_usage();
 	test_type1_merge_and_tempo_changes();
 	test_smpte_timing();

@@ -674,12 +674,11 @@ void render_worker(HWND window, std::atomic_bool& cancel, RenderRequest request)
 	auto done = std::make_unique<DoneUpdate>();
 	try
 	{
-		const std::string midi_path = std::filesystem::path(request.midi_path).string();
 		const std::string bank_path = std::filesystem::path(request.bank_path).string();
 		const std::string output_path = std::filesystem::path(request.output_path).string();
 		post_stage(window, L"Reading MIDI...", L"Validating the file and track structure");
 		safsyn::SmfFile midi;
-		if (!midi.load(midi_path.c_str()))
+		if (!midi.load(request.midi_path))
 		{
 			done->error = diagnostics_text(midi.diagnostics());
 			if (done->error.empty()) done->error = L"Could not read the selected MIDI file.";

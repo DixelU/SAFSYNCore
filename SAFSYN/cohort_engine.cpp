@@ -260,7 +260,7 @@ struct RegionMatchCache
 struct CohortEngineState
 {
 	// Read the diagnostic override once, before any render workers are started.
-	const bool use_avx2 = detail::avx2_available() && !std::getenv("SAFSYN_DISABLE_AVX2");
+	const bool use_avx2 = !std::getenv("SAFSYN_DISABLE_AVX2") && detail::avx2_available();
 	// Retirements found while rendering a slot range, applied later by the owner.
 	struct RetiredList
 	{

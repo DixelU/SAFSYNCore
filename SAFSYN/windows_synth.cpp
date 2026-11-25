@@ -13,7 +13,6 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
-#include <fstream>
 #include <future>
 #include <mutex>
 #include <sstream>
@@ -114,19 +113,8 @@ std::shared_ptr<Soundfont> load_bank(const std::wstring& path)
 
 std::shared_ptr<SmfFile> load_midi(const std::wstring& path)
 {
-	// Load bytes through a wide filesystem path; parsing remains the portable,
-	// streaming scheduler. There is no full analysis pass before playback.
-	std::ifstream source(std::filesystem::path(path), std::ios::binary | std::ios::ate);
-	if (!source) throw std::runtime_error("could not open MIDI file");
-	const auto length = source.tellg();
-	if (length < 0 || static_cast<uint64_t>(length) > SIZE_MAX)
-		throw std::runtime_error("invalid MIDI file size");
-	std::vector<uint8_t> bytes(static_cast<size_t>(length));
-	source.seekg(0);
-	if (!bytes.empty() && !source.read(reinterpret_cast<char*>(bytes.data()), length))
-		throw std::runtime_error("could not read MIDI file");
 	auto file = std::make_shared<SmfFile>();
-	if (!file->load_bytes(std::move(bytes)))
+	if (!file->load(path))
 		throw std::runtime_error(file->diagnostics().empty() ? "invalid MIDI file" : file->diagnostics().front().message);
 	return file;
 }

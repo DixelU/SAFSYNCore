@@ -1,11 +1,11 @@
 #include "smf.h"
 
 #include "long_uint.h"
+#include "memory_mapped_file_reader.h"
 
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <fstream>
 #include <limits>
 #include <map>
 #include <queue>
@@ -16,13 +16,13 @@ namespace safsyn
 {
 namespace
 {
-uint16_t read_be16(const std::vector<uint8_t>& bytes, size_t offset) noexcept
+uint16_t read_be16(std::span<const uint8_t> bytes, size_t offset) noexcept
 {
 	return static_cast<uint16_t>((static_cast<uint16_t>(bytes[offset]) << 8) |
 		bytes[offset + 1]);
 }
 
-uint32_t read_be32(const std::vector<uint8_t>& bytes, size_t offset) noexcept
+uint32_t read_be32(std::span<const uint8_t> bytes, size_t offset) noexcept
 {
 	return (static_cast<uint32_t>(bytes[offset]) << 24) |
 		(static_cast<uint32_t>(bytes[offset + 1]) << 16) |
@@ -30,7 +30,7 @@ uint32_t read_be32(const std::vector<uint8_t>& bytes, size_t offset) noexcept
 		bytes[offset + 3];
 }
 
-bool chunk_is(const std::vector<uint8_t>& bytes, size_t offset, const char* name) noexcept
+bool chunk_is(std::span<const uint8_t> bytes, size_t offset, const char* name) noexcept
 {
 	return offset + 4 <= bytes.size() && std::memcmp(bytes.data() + offset, name, 4) == 0;
 }
@@ -45,7 +45,7 @@ enum class ParseResult { Event, End, Error };
 
 struct TrackCursor
 {
-	const std::vector<uint8_t>* bytes = nullptr;
+	const uint8_t* bytes = nullptr;
 	size_t position = 0;
 	size_t end = 0;
 	uint32_t track = 0;
@@ -68,7 +68,7 @@ struct TrackCursor
 					std::string("truncated ") + purpose + " VLQ");
 				return false;
 			}
-			const uint8_t byte = (*bytes)[position++];
+			const uint8_t byte = bytes[position++];
 			value = (value << 7) | (byte & 0x7fU);
 			if ((byte & 0x80U) == 0)
 				return true;
@@ -86,7 +86,7 @@ struct TrackCursor
 				std::string("truncated ") + purpose);
 			return false;
 		}
-		value = (*bytes)[position++];
+		value = bytes[position++];
 		if (value >= 0x80)
 		{
 			add_diagnostic(*diagnostics, SmfDiagnosticSeverity::Error, track, position - 1,
@@ -130,7 +130,7 @@ struct TrackCursor
 			return ParseResult::Error;
 		}
 
-		const uint8_t first = (*bytes)[position++];
+		const uint8_t first = bytes[position++];
 		uint8_t status = first;
 		bool has_first_data = false;
 		uint8_t first_data = 0;
@@ -180,7 +180,7 @@ struct TrackCursor
 					"truncated meta-event type");
 				return ParseResult::Error;
 			}
-			event.meta_type = (*bytes)[position++];
+			event.meta_type = bytes[position++];
 			uint32_t length = 0;
 			if (!read_vlq(length, "meta-event length"))
 				return ParseResult::Error;
@@ -213,9 +213,9 @@ struct TrackCursor
 				if (length == 3)
 				{
 					event.tempo_us_per_quarter =
-						(static_cast<uint32_t>((*bytes)[payload]) << 16) |
-						(static_cast<uint32_t>((*bytes)[payload + 1]) << 8) |
-						(*bytes)[payload + 2];
+						(static_cast<uint32_t>(bytes[payload]) << 16) |
+						(static_cast<uint32_t>(bytes[payload + 1]) << 8) |
+						bytes[payload + 2];
 					if (event.tempo_us_per_quarter != 0)
 					{
 						event.kind = SmfEventKind::Tempo;
@@ -370,45 +370,37 @@ private:
 
 bool SmfFile::load(const char* path) noexcept
 {
-	header_ = {};
-	bytes_.clear();
-	tracks_.clear();
-	diagnostics_.clear();
-	valid_ = false;
 	if (!path)
 	{
-		add_diagnostic(diagnostics_, SmfDiagnosticSeverity::Error, UINT32_MAX, 0,
-			"null SMF path");
+		*this = {};
+		add_diagnostic(diagnostics_, SmfDiagnosticSeverity::Error, UINT32_MAX, 0, "null SMF path");
 		return false;
 	}
 	try
 	{
-		std::ifstream stream(path, std::ios::binary | std::ios::ate);
-		if (!stream)
+		return load(std::filesystem::path(path));
+	}
+	catch (...)
+	{
+		*this = {};
+		add_diagnostic(diagnostics_, SmfDiagnosticSeverity::Error, UINT32_MAX, 0, "invalid SMF path");
+		return false;
+	}
+}
+
+bool SmfFile::load(const std::filesystem::path& path) noexcept
+{
+	*this = {};
+	try
+	{
+		auto mapping = std::make_shared<dixelu::memory_mapped_file_reader>(path);
+		if (!mapping->is_open())
 		{
 			add_diagnostic(diagnostics_, SmfDiagnosticSeverity::Error, UINT32_MAX, 0,
-				"could not open SMF file");
+				"could not map SMF file: " + mapping->last_error().message());
 			return false;
 		}
-		const std::streamoff length = stream.tellg();
-		if (length < 0 || static_cast<uint64_t>(length) >
-			(static_cast<uint64_t>((std::numeric_limits<size_t>::max)())))
-		{
-			add_diagnostic(diagnostics_, SmfDiagnosticSeverity::Error, UINT32_MAX, 0,
-				"SMF file is too large for this process");
-			return false;
-		}
-		bytes_.resize(static_cast<size_t>(length));
-		stream.seekg(0);
-		if (!bytes_.empty())
-			stream.read(reinterpret_cast<char*>(bytes_.data()),
-				static_cast<std::streamsize>(bytes_.size()));
-		if (!stream && !bytes_.empty())
-		{
-			add_diagnostic(diagnostics_, SmfDiagnosticSeverity::Error, UINT32_MAX, 0,
-				"failed while reading SMF file");
-			return false;
-		}
+		mapping_ = std::move(mapping);
 		return parse_chunks();
 	}
 	catch (...)
@@ -421,11 +413,8 @@ bool SmfFile::load(const char* path) noexcept
 
 bool SmfFile::load_bytes(std::vector<uint8_t> bytes) noexcept
 {
-	header_ = {};
-	bytes_ = std::move(bytes);
-	tracks_.clear();
-	diagnostics_.clear();
-	valid_ = false;
+	*this = {};
+	owned_bytes_ = std::move(bytes);
 	try
 	{
 		return parse_chunks();
@@ -438,32 +427,41 @@ bool SmfFile::load_bytes(std::vector<uint8_t> bytes) noexcept
 	}
 }
 
+std::span<const uint8_t> SmfFile::bytes() const noexcept
+{
+	if (mapping_)
+		return {reinterpret_cast<const uint8_t*>(mapping_->data()), static_cast<size_t>(mapping_->size())};
+	return owned_bytes_;
+}
+
 const uint8_t* SmfFile::payload_data(const SmfEvent& event) const noexcept
 {
-	if (event.payload_size == 0 || event.payload_offset > bytes_.size() ||
-		event.payload_size > bytes_.size() - static_cast<size_t>(event.payload_offset))
+	const auto input = bytes();
+	if (event.payload_size == 0 || event.payload_offset > input.size() ||
+		event.payload_size > input.size() - static_cast<size_t>(event.payload_offset))
 		return nullptr;
-	return bytes_.data() + static_cast<size_t>(event.payload_offset);
+	return input.data() + static_cast<size_t>(event.payload_offset);
 }
 
 bool SmfFile::parse_chunks()
 {
-	if (bytes_.size() < 14 || !chunk_is(bytes_, 0, "MThd"))
+	const auto input = bytes();
+	if (input.size() < 14 || !chunk_is(input, 0, "MThd"))
 	{
 		add_diagnostic(diagnostics_, SmfDiagnosticSeverity::Error, UINT32_MAX, 0,
 			"missing or truncated MThd chunk");
 		return false;
 	}
-	const uint32_t header_length = read_be32(bytes_, 4);
-	if (header_length < 6 || header_length > bytes_.size() - 8)
+	const uint32_t header_length = read_be32(input, 4);
+	if (header_length < 6 || header_length > input.size() - 8)
 	{
 		add_diagnostic(diagnostics_, SmfDiagnosticSeverity::Error, UINT32_MAX, 4,
 			"invalid MThd chunk length");
 		return false;
 	}
-	header_.format = read_be16(bytes_, 8);
-	header_.track_count = read_be16(bytes_, 10);
-	header_.division = read_be16(bytes_, 12);
+	header_.format = read_be16(input, 8);
+	header_.track_count = read_be16(input, 10);
+	header_.division = read_be16(input, 12);
 	if (header_.format == 2)
 	{
 		add_diagnostic(diagnostics_, SmfDiagnosticSeverity::Error, UINT32_MAX, 8,
@@ -510,28 +508,28 @@ bool SmfFile::parse_chunks()
 	size_t position = 8 + header_length;
 	while (tracks_.size() < header_.track_count)
 	{
-		if (position > bytes_.size() || bytes_.size() - position < 8)
+		if (position > input.size() || input.size() - position < 8)
 		{
 			add_diagnostic(diagnostics_, SmfDiagnosticSeverity::Error, UINT32_MAX, position,
 				"truncated chunk header before all declared tracks");
 			return false;
 		}
-		const uint32_t chunk_length = read_be32(bytes_, position + 4);
+		const uint32_t chunk_length = read_be32(input, position + 4);
 		const size_t payload = position + 8;
-		if (chunk_length > bytes_.size() - payload)
+		if (chunk_length > input.size() - payload)
 		{
 			add_diagnostic(diagnostics_, SmfDiagnosticSeverity::Error, UINT32_MAX, position + 4,
 				"chunk length exceeds the SMF file");
 			return false;
 		}
-		if (chunk_is(bytes_, position, "MTrk"))
+		if (chunk_is(input, position, "MTrk"))
 			tracks_.push_back({payload, payload + chunk_length});
 		else
 			add_diagnostic(diagnostics_, SmfDiagnosticSeverity::Warning, UINT32_MAX, position,
 				"unknown non-track chunk was skipped");
 		position = payload + chunk_length;
 	}
-	if (position < bytes_.size())
+	if (position < input.size())
 		add_diagnostic(diagnostics_, SmfDiagnosticSeverity::Warning, UINT32_MAX, position,
 			"trailing bytes after declared track chunks were ignored");
 	valid_ = true;
@@ -545,7 +543,7 @@ struct MergedSmfStream::Impl
 	std::vector<SmfDiagnostic> diagnostics;
 	bool valid = true;
 
-	Impl(const std::vector<uint8_t>& bytes, const std::vector<SmfFile::TrackSpan>& tracks,
+	Impl(std::span<const uint8_t> bytes, const std::vector<SmfFile::TrackSpan>& tracks,
 		const std::vector<SmfDiagnostic>& file_diagnostics, bool file_valid)
 		: diagnostics(file_diagnostics), valid(file_valid)
 	{
@@ -555,7 +553,7 @@ struct MergedSmfStream::Impl
 		for (uint32_t index = 0; index < tracks.size(); ++index)
 		{
 			const auto& span = tracks[index];
-			cursors.push_back({&bytes, span.begin, span.end, index, 0, 0, 0,
+			cursors.push_back({bytes.data(), span.begin, span.end, index, 0, 0, 0,
 				false, false, false, &diagnostics});
 		}
 		for (auto& cursor : cursors)
@@ -571,7 +569,7 @@ struct MergedSmfStream::Impl
 };
 
 MergedSmfStream::MergedSmfStream(const SmfFile& file)
-	: impl_(std::make_unique<Impl>(file.bytes_, file.tracks_, file.diagnostics_, file.valid_)) {}
+	: impl_(std::make_unique<Impl>(file.bytes(), file.tracks_, file.diagnostics_, file.valid_)) {}
 MergedSmfStream::~MergedSmfStream() = default;
 MergedSmfStream::MergedSmfStream(MergedSmfStream&&) noexcept = default;
 MergedSmfStream& MergedSmfStream::operator=(MergedSmfStream&&) noexcept = default;

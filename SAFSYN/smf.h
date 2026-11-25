@@ -2,9 +2,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
+
+namespace dixelu { class memory_mapped_file_reader; }
 
 namespace safsyn
 {
@@ -60,12 +64,13 @@ class SmfFile
 {
 public:
 	bool load(const char* path) noexcept;
+	bool load(const std::filesystem::path& path) noexcept;
 	bool load_bytes(std::vector<uint8_t> bytes) noexcept;
 
 	const SmfHeader& header() const noexcept { return header_; }
 	const std::vector<SmfDiagnostic>& diagnostics() const noexcept { return diagnostics_; }
 	bool valid() const noexcept { return valid_; }
-	uint64_t input_bytes() const noexcept { return bytes_.size(); }
+	uint64_t input_bytes() const noexcept { return bytes().size(); }
 	// Meta and SysEx payloads remain owned by the file for the lifetime of the
 	// SmfFile. A null result means the event does not describe a valid payload.
 	const uint8_t* payload_data(const SmfEvent& event) const noexcept;
@@ -73,9 +78,11 @@ public:
 private:
 	struct TrackSpan { size_t begin = 0; size_t end = 0; };
 	bool parse_chunks();
+	std::span<const uint8_t> bytes() const noexcept;
 
 	SmfHeader header_;
-	std::vector<uint8_t> bytes_;
+	std::vector<uint8_t> owned_bytes_;
+	std::shared_ptr<const dixelu::memory_mapped_file_reader> mapping_;
 	std::vector<TrackSpan> tracks_;
 	std::vector<SmfDiagnostic> diagnostics_;
 	bool valid_ = false;

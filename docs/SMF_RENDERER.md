@@ -8,10 +8,10 @@ Filtering, realtime audio, and a production phase policy remain out of scope.
 
 ## Parsing and scheduling architecture
 
-`SmfFile` buffers the input bytes and validates the chunk envelope. Buffering is
-explicitly excluded from the parser-state bound; it permits inexpensive second
-passes without retaining decoded events. Each track cursor stores only its
-chunk bounds, byte position, absolute tick, event ordinal, and running status.
+A file-backed `SmfFile` keeps a read-only mapping for chunk validation, track
+cursors and repeated passes. `load_bytes()` takes ownership of an in-memory
+input. Each track cursor stores its chunk bounds, byte position, absolute tick,
+event ordinal and running status.
 
 `MergedSmfStream` primes one event per track and uses a min-heap ordered by:
 
