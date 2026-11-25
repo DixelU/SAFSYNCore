@@ -677,6 +677,7 @@ void test_safety_limit_stealing()
 
 void test_stolen_tails()
 {
+	for (size_t threads : {1u, 4u})
 	for (unsigned action = 0; action < 3; ++action)
 	{
 		auto bank = make_bank(48000);
@@ -689,17 +690,21 @@ void test_stolen_tails()
 		silent.attenuation = 0.0f;
 		silent.release = 0.0f;
 		bank.regions.push_back(silent);
-		safsyn::SynthEngine engine(48000, 1);
-		engine.set_voice_model(safsyn::VoiceModel::Cohorts, 1);
+		const unsigned capacity = threads == 1 ? 1 : 2;
+		safsyn::SynthEngine engine(48000, capacity);
+		engine.set_voice_model(safsyn::VoiceModel::Cohorts, capacity);
+		engine.set_render_threads(threads);
 		engine.set_soundfont(&bank);
-		engine.note_on(0, 60, 127);
+		for (unsigned voice = 0; voice < capacity; ++voice)
+			engine.note_on(0, 60, static_cast<uint8_t>(127 - voice));
 		auto before = render(engine, 64);
-		engine.note_on(0, 64, 127);
+		for (unsigned voice = 0; voice < capacity; ++voice)
+			engine.note_on(0, 64, static_cast<uint8_t>(127 - voice));
 		if (action == 0) engine.control_change(0, 120, 0);
 		if (action == 1)
 		{
 			engine.control_change(0, 7, 0);
-			engine.note_off(0, 64);
+			engine.note_off_batch(0, 64, capacity);
 			check(engine.active_voice_count() == 0 && engine.active_cohort_count() == 0 && engine.has_active_audio(),
 				"audio draining includes stolen tails after the last logical voice ends");
 		}
@@ -734,7 +739,9 @@ void test_overlapping_stolen_tails()
 	bank.regions.push_back(silent);
 	safsyn::SynthEngine engine(48000, 512);
 	engine.set_voice_model(safsyn::VoiceModel::Cohorts, 512);
+	engine.set_render_threads(4);
 	engine.set_soundfont(&bank);
+	engine.prepare_playback(64);
 	for (unsigned note = 0; note < 512; ++note)
 	{
 		engine.control_change(0, 1, static_cast<uint8_t>(note & 127));
@@ -758,31 +765,51 @@ void test_parallel_stolen_tails()
 {
 	for (auto mode : {safsyn::PhaseMode::Coherent, safsyn::PhaseMode::Analytic})
 	{
-		auto bank = make_bank(4000, true);
-		safsyn::SynthEngine scalar(4000, 128), parallel(4000, 128);
+		auto bank = make_bank(48000, true);
+		bank.regions[0].hi_key = 126;
+		auto silent = bank.regions[0];
+		silent.lo_key = silent.hi_key = 127;
+		silent.attenuation = 0.0f;
+		bank.regions.push_back(silent);
+		safsyn::SynthEngine scalar(48000, 254), parallel(48000, 254);
+		parallel.set_render_threads(4);
 		for (auto *engine : {&scalar, &parallel})
 		{
-			engine->set_voice_model(safsyn::VoiceModel::Cohorts, 128);
+			engine->set_voice_model(safsyn::VoiceModel::Cohorts, 254);
 			engine->set_soundfont(&bank);
 			safsyn::PhaseSettings phase;
 			phase.mode = mode;
 			engine->set_phase_settings(phase);
-			for (uint8_t note = 0; note < 128; ++note) engine->note_on(0, note, 80);
+			engine->prepare_playback(256);
+			for (uint8_t channel = 0; channel < 2; ++channel)
+				for (uint8_t note = 0; note < 127; ++note)
+					engine->note_on(channel, note, 80);
 			render(*engine, 256);
-			for (uint8_t note = 0; note < 128; ++note)
-			{
-				engine->control_change(0, 1, note);
-				engine->note_on(0, 60, 127);
-			}
-			engine->control_change(0, 7, 20);
+			auto steal_range = [&](uint8_t first, uint8_t end) {
+				for (uint8_t channel = 0; channel < 2; ++channel)
+					for (uint8_t note = first; note < end; ++note)
+					{
+						engine->control_change(channel, 1, note);
+						engine->note_on(channel, 127, 127);
+					}
+			};
+			steal_range(0, 64);
+			render(*engine, 17);
+			steal_range(64, 127);
+			engine->control_change(0, 120, 0);
+			engine->control_change(1, 7, 0);
+			engine->set_pitch_bend(1, 16000);
+			engine->set_master_volume(4096);
 		}
-		parallel.set_render_threads(4);
-		check(close_audio(render(scalar, 256), render(parallel, 256)) &&
+		const auto expected = render(scalar, 512, 37);
+		check(expected == render(parallel, 512, 37) &&
+			std::any_of(expected.begin(), expected.end(), [](float sample) { return sample != 0.0f; }) &&
+			std::all_of(expected.end() - 128, expected.end(), [](float sample) { return sample == 0.0f; }) &&
 			parallel.stats().parallel_render_calls != 0 &&
-			parallel.stats().cohort_capacity_steals == scalar.stats().cohort_capacity_steals &&
+			parallel.stats().cohort_capacity_steals == 254 &&
 			parallel.active_voice_count() == scalar.active_voice_count(),
-			"stolen tails render and retire identically on the owner and worker threads");
-		for (auto *engine : {&scalar, &parallel}) engine->control_change(0, 120, 0);
+			"queued releases preserve samples across controller changes and channel-specific All Sound Off");
+		for (auto *engine : {&scalar, &parallel}) engine->control_change(1, 120, 0);
 		check(!scalar.has_active_audio() && !parallel.has_active_audio(),
 			"parallel tail retirement leaves consistent channel lists");
 	}

@@ -80,7 +80,6 @@ void add_mix_buffer(float* destination, const float* source, size_t samples) noe
 struct OnsetKey
 {
 	const SampleRegion* region = nullptr;
-	uint8_t channel = 0;
 	uint8_t note = 0;
 	uint8_t velocity = 0;
 
@@ -91,11 +90,8 @@ struct OnsetKeyHash
 {
 	size_t operator()(const OnsetKey& key) const noexcept
 	{
-		size_t hash = reinterpret_cast<size_t>(key.region);
-		hash ^= static_cast<size_t>(key.channel) << 3;
-		hash ^= static_cast<size_t>(key.note) << 11;
-		hash ^= static_cast<size_t>(key.velocity) << 19;
-		return hash;
+		const size_t region = reinterpret_cast<size_t>(key.region) / alignof(SampleRegion);
+		return region * size_t{0x85ebca77} + size_t{key.note} * 0x9e3779b1u + key.velocity;
 	}
 };
 
@@ -316,6 +312,7 @@ struct CohortEngineState
 		std::vector<Chunk> chunks;
 		SynthEngine* owner = nullptr;
 		uint32_t frames = 0;
+		bool rendering_fades = false;
 		size_t slot_count = 0;
 		size_t chunk_count = 0;
 		size_t stride = 0;
@@ -362,7 +359,7 @@ struct CohortEngineState
 	// notes for a later note-off to match. Remember the unsearched prefix so a
 	// burst of note-offs does not repeatedly scan that growing sustained suffix.
 	std::array<size_t, 16 * 128> note_search_ends{};
-	std::unordered_map<OnsetKey, StableHandle, OnsetKeyHash> onset_candidates;
+	std::array<std::unordered_map<OnsetKey, StableHandle, OnsetKeyHash>, 16> onset_candidates;
 	uint64_t active_logical = 0;
 	size_t active_cohort_count = 0;
 	std::array<size_t, 16> active_cohorts_by_channel{};
@@ -373,11 +370,29 @@ struct CohortEngineState
 	struct StealFade
 	{
 		std::vector<float> audio;
+		uint32_t first = 0;
 		uint32_t remaining = 0;
+
+		// Keep the unread samples contiguous. Move them only when another steal
+		// needs the full fade window starting at the current audio frame.
+		void rewind_for_steal() noexcept
+		{
+			if (first == 0) return;
+			const size_t samples = size_t{remaining} * 2;
+			std::memmove(audio.data(), audio.data() + size_t{first} * 2, samples * sizeof(float));
+			std::fill(audio.begin() + samples, audio.end(), 0.0f);
+			first = 0;
+		}
 	};
+	struct FadeVoice
+	{
+		RenderCohort cohort;
+		double increment;
+		float amplitude;
+	};
+	static constexpr size_t fade_batch_size = 256;
+	std::vector<FadeVoice> pending_fades;
 	std::array<StealFade, 16> steal_fades;
-	std::vector<float> steal_scratch;
-	size_t steal_cursor = 0;
 	std::unique_ptr<ParallelRenderState> parallel_render;
 	std::vector<RegionMatch> matching_regions_scratch;
 	RegionMatchCache region_matches;
@@ -494,20 +509,25 @@ struct CohortEngineState
 		(void)owner;
 	}
 
-	void reserve_steal_fades(const SynthEngine& owner)
+	void reserve_parallel_fades(ParallelRenderState& state, size_t samples)
 	{
-		auto samples = static_cast<size_t>((std::max)(1L,
-			std::lround(owner.sample_rate_ * steal_fade_seconds))) * 2;
-		if (steal_scratch.size() == samples)
-			return;
-
-		steal_scratch.resize(samples);
-		for (auto& fade : steal_fades) fade.audio.resize(samples);
+		const size_t batch_limit = (std::min)(fade_batch_size, maximum_cohorts);
+		pending_fades.reserve(batch_limit);
+		const size_t count = (std::min)(batch_limit, ParallelRenderState::maximum_audio_samples / samples);
+		if (state.audio.size() < count * samples)
+			state.audio.resize(count * samples);
 	}
 
-	// Render a victim's short release before reusing its slot. Overlapping tails
-	// add into fixed-size channel buffers, without retaining logical voices or
-	// imposing another polyphony limit. Later controllers cannot step this audio.
+	void reserve_steal_fades(const SynthEngine& owner)
+	{
+		const size_t samples = static_cast<size_t>((std::max)(1L,
+			std::lround(owner.sample_rate_ * steal_fade_seconds))) * 2;
+		for (auto& fade : steal_fades) fade.audio.resize(samples);
+		if (parallel_render) reserve_parallel_fades(*parallel_render, samples);
+	}
+
+	// Capture the release at the instant of the steal so later MIDI controls
+	// can change immediately and the logical slot can be reused.
 	void fade_out_stolen(SynthEngine& owner, uint32_t index)
 	{
 		auto& cohort = cohorts[index].cohort;
@@ -517,7 +537,9 @@ struct CohortEngineState
 			return;
 		}
 
-		reserve_steal_fades(owner);
+		const size_t batch_limit = (std::min)(fade_batch_size, maximum_cohorts);
+		if (steal_fades.back().audio.empty() || (parallel_render && pending_fades.capacity() < batch_limit))
+			reserve_steal_fades(owner);
 		if (!begin_release(owner, cohort, static_cast<float>(steal_fade_seconds), false))
 		{
 			retire_cohort(owner, index, true);
@@ -525,38 +547,70 @@ struct CohortEngineState
 		}
 
 		auto& fade = steal_fades[cohort.channel];
-		auto frames = static_cast<uint32_t>(steal_scratch.size() / 2);
-		std::fill(steal_scratch.begin(), steal_scratch.end(), 0.0f);
-		render_range(owner, steal_scratch.data(), frames, index, index + 1, nullptr);
-		retire_cohort(owner, index, true);
-		for (uint32_t frame = 0; frame < frames; ++frame)
+		fade.rewind_for_steal();
+		const auto frames = static_cast<uint32_t>(fade.audio.size() / 2);
+		const double increment = cohort.base_inc * owner.channels_[cohort.channel].pitch_bend_ratio;
+		const float amplitude = owner.channel_amplitude(cohort.channel);
+		if (parallel_render && batch_limit > 1)
 		{
-			auto offset = (steal_cursor + frame) % frames * 2;
-			fade.audio[offset] += steal_scratch[frame * 2];
-			fade.audio[offset + 1] += steal_scratch[frame * 2 + 1];
+			if (pending_fades.size() >= batch_limit)
+				flush_stolen_voices(owner);
+			pending_fades.push_back({cohort, increment, amplitude});
+		}
+		else
+		{
+			flush_stolen_voices(owner);
+			render_voice<true>(owner, cohort, fade.audio.data(), frames, increment, amplitude);
 		}
 		fade.remaining = frames;
+		retire_cohort(owner, index, true);
+	}
+
+	void flush_stolen_voices(SynthEngine& owner) noexcept
+	{
+		if (pending_fades.empty())
+			return;
+		const size_t samples = steal_fades.front().audio.size();
+		const auto frames = static_cast<uint32_t>(samples / 2);
+		const size_t count = pending_fades.size();
+		const uint64_t work = uint64_t{count} * frames;
+		const size_t participants = parallel_render ? static_cast<size_t>((std::min)(
+			uint64_t{parallel_render->lanes()}, work / ParallelRenderState::work_per_participant)) : 0;
+		if (participants >= 2 && count <= parallel_render->audio.size() / samples)
+		{
+			auto& state = *parallel_render;
+			state.rendering_fades = true;
+			state.owner = &owner;
+			state.frames = frames;
+			state.slot_count = count;
+			state.chunk_count = (std::min)(count, participants * ParallelRenderState::chunks_per_lane);
+			run_workers(state, participants);
+			state.rendering_fades = false;
+			// Workers write one buffer per victim. Mix in steal order to keep the
+			// floating-point sum independent of how the workers divide the batch.
+			for (size_t i = 0; i < count; ++i)
+				add_mix_buffer(steal_fades[pending_fades[i].cohort.channel].audio.data(),
+					state.audio.data() + i * samples, samples);
+		}
+		else
+		{
+			for (auto& voice : pending_fades)
+				render_voice<true>(owner, voice.cohort, steal_fades[voice.cohort.channel].audio.data(),
+					frames, voice.increment, voice.amplitude);
+		}
+		pending_fades.clear();
 	}
 
 	void render_steal_fades(float* out, uint32_t frames) noexcept
 	{
-		if (steal_scratch.empty())
-			return;
-
-		auto capacity = steal_scratch.size() / 2;
 		for (auto& fade : steal_fades)
 		{
-			auto count = (std::min)(frames, fade.remaining);
-			for (uint32_t frame = 0; frame < count; ++frame)
-			{
-				auto offset = (steal_cursor + frame) % capacity * 2;
-				out[frame * 2] += fade.audio[offset];
-				out[frame * 2 + 1] += fade.audio[offset + 1];
-				fade.audio[offset] = fade.audio[offset + 1] = 0.0f;
-			}
+			const auto count = (std::min)(frames, fade.remaining);
+			if (count == 0) continue;
+			add_mix_buffer(out, fade.audio.data() + size_t{fade.first} * 2, size_t{count} * 2);
+			fade.first += count;
 			fade.remaining -= count;
 		}
-		steal_cursor = (steal_cursor + frames) % capacity;
 	}
 
 	struct StealCandidate
@@ -573,7 +627,7 @@ struct CohortEngineState
 			return static_cast<double>(cohort.env) * channel.volume * channel.expression *
 				owner.master_volume_ * cohort.gain * cohort.multiplicity;
 		};
-		// Each probed cohort's level is estimated once and kept with the leaders.
+		// Prefer releases, then quieter cohorts, then newer notes when levels tie.
 		auto prefer = [&](uint32_t selected, double candidate_level, uint32_t challenger,
 			double current_level) {
 			if (selected == invalid_index)
@@ -633,9 +687,8 @@ struct CohortEngineState
 			cohorts[index].cohort.channel != victim_channel)
 			index = head;
 		uint32_t best = invalid_index;
-		uint32_t best_different_key = invalid_index;
+		bool best_same_key = true;
 		double best_level = 0.0;
-		double best_different_key_level = 0.0;
 		for (size_t offset = 0; offset < probe_count; ++offset)
 		{
 			auto& cohort = steal_info[index];
@@ -647,18 +700,18 @@ struct CohortEngineState
 				cohort.stage = cohorts[index].cohort.stage;
 				cohort.envelope_frame = owner.stats_.rendered_frames;
 			}
-			const double level = estimated_level(cohort);
-			if (prefer(best, best_level, index, level))
+			const bool same_key = cohort.channel == request_channel && cohort.note == request_note;
+			// A different key always wins over the incoming key. Once found,
+			// only other different-key candidates can replace it.
+			if (best_same_key || !same_key)
 			{
-				best = index;
-				best_level = level;
-			}
-			const bool same_key = cohort.channel == request_channel &&
-				cohort.note == request_note;
-			if (!same_key && prefer(best_different_key, best_different_key_level, index, level))
-			{
-				best_different_key = index;
-				best_different_key_level = level;
+				const double level = estimated_level(cohort);
+				if (same_key != best_same_key || prefer(best, best_level, index, level))
+				{
+					best = index;
+					best_level = level;
+					best_same_key = same_key;
+				}
 			}
 			index = cohort.next != invalid_index ? cohort.next : head;
 		}
@@ -667,7 +720,7 @@ struct CohortEngineState
 		owner.stats_.maximum_steal_probe = (std::max)(owner.stats_.maximum_steal_probe,
 			static_cast<uint32_t>(probe_count));
 
-		if (best_different_key == invalid_index && victim_channel == request_channel)
+		if (best_same_key && victim_channel == request_channel)
 		{
 			for (uint16_t distance = 1; distance < 128; ++distance)
 			{
@@ -675,7 +728,7 @@ struct CohortEngineState
 				const uint32_t representative = note_heads[note_index(victim_channel, note)];
 				if (representative != invalid_index)
 				{
-					best_different_key = representative;
+					best = representative;
 					++owner.stats_.steal_candidate_visits;
 					owner.stats_.maximum_steal_probe = (std::max)(
 						owner.stats_.maximum_steal_probe,
@@ -685,7 +738,7 @@ struct CohortEngineState
 			}
 		}
 		++owner.stats_.steal_searches;
-		return {best_different_key != invalid_index ? best_different_key : best, scope};
+		return {best, scope};
 	}
 
 	StableHandle allocate_cohort(SynthEngine& owner, RenderCohort cohort,
@@ -966,6 +1019,7 @@ struct CohortEngineState
 		batch.onset_identity = owner.midi_tick_.value_or(owner.stats_.rendered_frames);
 		batch.one_shot_blocking = has_one_shot;
 		const bool allow_onset_merge = !batch.one_shot_blocking;
+		auto& candidates = onset_candidates[channel];
 		// The slot that receives the batch keeps its own link storage.
 		auto& links = links_scratch;
 		links.clear();
@@ -976,10 +1030,10 @@ struct CohortEngineState
 			const SampleRegion* region = match.region;
 			PhaseAggregate aggregate = make_phase_aggregate(owner, *region, region_id,
 				first_serial, count, channel, note, batch.onset_identity, true);
-			const OnsetKey key{region, channel, note, velocity};
+			const OnsetKey key{region, note, velocity};
 			StableHandle handle;
-			auto candidate = onset_candidates.find(key);
-			if (allow_onset_merge && candidate != onset_candidates.end())
+			auto candidate = allow_onset_merge ? candidates.try_emplace(key).first : candidates.end();
+			if (candidate != candidates.end())
 			{
 				if (auto* candidate_slot = resolve(candidate->second);
 					candidate_slot && candidate_slot->cohort.stage != CohortStage::Release &&
@@ -1022,8 +1076,8 @@ struct CohortEngineState
 			if (handle.valid())
 			{
 				links.push_back({handle, region_id});
-				if (allow_onset_merge)
-					onset_candidates[key] = handle;
+				if (candidate != candidates.end())
+					candidate->second = handle;
 			}
 			owner.stats_.started_voices += count;
 			owner.stats_.logical_voices_started += count;
@@ -1302,6 +1356,10 @@ struct CohortEngineState
 			return;
 		while (channel_heads[channel] != invalid_index)
 			retire_cohort(owner, channel_heads[channel], true);
+		std::erase_if(pending_fades, [channel](const FadeVoice& voice) {
+			return voice.cohort.channel == channel;
+		});
+		steal_fades[channel].first = 0;
 		std::fill(steal_fades[channel].audio.begin(), steal_fades[channel].audio.end(), 0.0f);
 		steal_fades[channel].remaining = 0;
 		for (uint32_t index = 0; index < logical_batches.size(); ++index)
@@ -1314,11 +1372,7 @@ struct CohortEngineState
 			note_stacks[index].clear();
 			note_search_ends[index] = 0;
 		}
-		for (auto it = onset_candidates.begin(); it != onset_candidates.end();)
-			if (it->first.channel == channel)
-				it = onset_candidates.erase(it);
-			else
-				++it;
+		onset_candidates[channel].clear();
 	}
 
 	void update_channel_gains(SynthEngine& owner, uint8_t channel, float previous_amplitude,
@@ -1400,6 +1454,8 @@ struct CohortEngineState
 						signal.notify_one();
 					}
 				});
+			if (!steal_fades.front().audio.empty())
+				reserve_parallel_fades(*state, steal_fades.front().audio.size());
 			parallel_render = std::move(state);
 		}
 		catch (...)
@@ -1411,6 +1467,30 @@ struct CohortEngineState
 	size_t render_threads() const noexcept
 	{
 		return parallel_render ? parallel_render->lanes() : 1;
+	}
+
+	void run_workers(ParallelRenderState& state, size_t participants) noexcept
+	{
+		using Phase = ParallelRenderState::Phase;
+		state.next_chunk.store(0, std::memory_order_relaxed);
+		state.epoch += ParallelRenderState::epoch_step;
+		for (size_t lane = 1; lane < participants; ++lane)
+		{
+			auto& signal = state.signals[lane].state;
+			signal.store(state.epoch + Phase::Requested, std::memory_order_release);
+			signal.notify_one();
+		}
+		render_chunks(state);
+		for (size_t lane = 1; lane < participants; ++lane)
+		{
+			auto& signal = state.signals[lane].state;
+			uint64_t observed = state.epoch + Phase::Requested;
+			if (signal.compare_exchange_strong(observed, state.epoch + Phase::Idle,
+				std::memory_order_acq_rel, std::memory_order_acquire))
+				continue;
+			while (observed != state.epoch + Phase::Done)
+				observed = wait_for_change(signal, observed);
+		}
 	}
 
 	// Runs on the owner and on every claimed worker until the cursor runs out.
@@ -1425,6 +1505,18 @@ struct CohortEngineState
 				return;
 			const uint32_t begin = static_cast<uint32_t>(state.chunk_begin(chunk));
 			const uint32_t end = static_cast<uint32_t>(state.chunk_begin(chunk + 1));
+			if (state.rendering_fades)
+			{
+				for (auto i = begin; i < end; ++i)
+				{
+					auto& voice = pending_fades[i];
+					float* audio = state.audio.data() + i * samples;
+					std::fill_n(audio, samples, 0.0f);
+					render_voice<true>(*state.owner, voice.cohort, audio, state.frames,
+						voice.increment, voice.amplitude);
+				}
+				continue;
+			}
 			uint32_t first = begin;
 			while (first < end && !cohorts[first].occupied)
 				++first;
@@ -1828,144 +1920,142 @@ struct CohortEngineState
 	void render_range_impl(SynthEngine& owner, float* out, uint32_t frames,
 		uint32_t begin, uint32_t end, RetiredList* retired) noexcept
 	{
-		if constexpr (SingleFrame) frames = 1;
 		for (uint32_t cohort_index = begin; cohort_index < end; ++cohort_index)
 		{
 			auto& slot = cohorts[cohort_index];
 			if (!slot.occupied || !slot.cohort.region)
 				continue;
-			auto retire = [&] {
+			auto& cohort = slot.cohort;
+			const auto& channel = owner.channels_[cohort.channel];
+			if (!render_voice<Vectorize, SingleFrame>(owner, cohort, out, frames,
+				cohort.base_inc * channel.pitch_bend_ratio, owner.channel_amplitude(cohort.channel)))
+			{
 				if (retired)
 					retired->push_back(cohort_index);
 				else
 					retire_cohort(owner, cohort_index, true);
-			};
-			auto& cohort = slot.cohort;
-			const SampleRegion& region = *cohort.region;
-			const auto& channel = owner.channels_[cohort.channel];
-			const double increment = cohort.base_inc * channel.pitch_bend_ratio;
-			auto amplitude = channel.volume * channel.expression * owner.master_volume_;
-			const bool looping = region.loop_mode == LoopMode::Forward ||
-				region.loop_mode == LoopMode::PingPong ||
-				(region.loop_mode == LoopMode::Sustain && cohort.stage != CohortStage::Release);
-			const bool valid_loop = looping && region.loop_start < region.loop_end &&
-				region.loop_end <= region.pcm_len && region.loop_end - region.loop_start >= 2;
-			const bool coherent_phase = cohort.phase.transformed_count == 0;
-			const double coherent_count = static_cast<double>(cohort.phase.coherent_count);
-			// Ping-pong playback, protected attacks, and loop/sample boundaries
-			// use the general kernel.
-#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
-			VectorKernel vector_kernel = nullptr;
-			double vector_start = 0.0;
-			if constexpr (Vectorize)
-				vector_kernel = select_vector_kernel(cohort, vector_start, frames);
-#endif
-			for (uint32_t frame = 0; frame < frames && slot.occupied; ++frame)
-			{
-#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
-				if (vector_kernel && frames - frame >= 4 && cohort.pos >= vector_start)
-				{
-					frame += vector_kernel(owner, cohort, out + static_cast<size_t>(frame) * 2,
-						frames - frame, increment, valid_loop, amplitude);
-					if (frame == frames) break;
-				}
-#endif
-				if (cohort.pos < 0.0 || cohort.pos >= region.pcm_len)
-				{
-					retire();
-					break;
-				}
-				const float envelope = advance_envelope(owner.sample_rate_, cohort);
-				if (cohort.stage == CohortStage::Off)
-				{
-					retire();
-					break;
-				}
-
-				const uint32_t index0 = static_cast<uint32_t>(cohort.pos);
-				uint32_t index1 = (std::min)(index0 + 1, region.pcm_len - 1);
-				if (valid_loop && cohort.loop_dir_fwd && index1 >= region.loop_end)
-					index1 = region.loop_start;
-				const float fraction = static_cast<float>(cohort.pos - index0);
-				const size_t offset0 = region.pcm_right ? index0 :
-					static_cast<size_t>(index0) * region.channels;
-				const size_t offset1 = region.pcm_right ? index1 :
-					static_cast<size_t>(index1) * region.channels;
-				const float original_l0 = pcm_to_float(region.pcm[offset0]);
-				const float original_l1 = pcm_to_float(region.pcm[offset1]);
-				const float original_r0 = region.channels == 2 ? pcm_to_float(region.pcm_right ?
-					region.pcm_right[index0] : region.pcm[offset0 + 1]) : original_l0;
-				const float original_r1 = region.channels == 2 ? pcm_to_float(region.pcm_right ?
-					region.pcm_right[index1] : region.pcm[offset1 + 1]) : original_l1;
-				float filtered_l;
-				float filtered_r;
-				if (cohort.filter.active())
-				{
-					const auto filtered = cohort.phase.filtered_sample({original_l0, original_r0},
-						{original_l1, original_r1}, index0, index1, fraction, envelope, cohort.filter);
-					filtered_l = filtered[0];
-					filtered_r = filtered[1];
-				}
-				else
-				{
-					const float source_l0 = coherent_phase
-						? static_cast<float>(static_cast<double>(original_l0) * coherent_count)
-						: cohort.phase.sample(original_l0, index0, false);
-					const float source_l1 = coherent_phase
-						? static_cast<float>(static_cast<double>(original_l1) * coherent_count)
-						: cohort.phase.sample(original_l1, index1, false);
-					const float sample_l = source_l0 + (source_l1 - source_l0) * fraction;
-					float sample_r = sample_l;
-					if (region.channels == 2)
-					{
-						const float source_r0 = coherent_phase
-							? static_cast<float>(static_cast<double>(original_r0) * coherent_count)
-							: cohort.phase.sample(original_r0, index0, true);
-						const float source_r1 = coherent_phase
-							? static_cast<float>(static_cast<double>(original_r1) * coherent_count)
-							: cohort.phase.sample(original_r1, index1, true);
-						sample_r = source_r0 + (source_r1 - source_r0) * fraction;
-					}
-					filtered_l = sample_l * envelope;
-					filtered_r = sample_r * envelope;
-				}
-				cohort.filter.advance();
-				if (cohort.gain_ramp.active())
-				{
-					out[static_cast<size_t>(frame) * 2] += filtered_l * cohort.gain_ramp.current[0];
-					out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * cohort.gain_ramp.current[1];
-					cohort.gain_ramp.advance();
-				}
-				else
-				{
-					out[static_cast<size_t>(frame) * 2] += filtered_l * cohort.gain_l * amplitude;
-					out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * cohort.gain_r * amplitude;
-				}
-
-				cohort.pos += cohort.loop_dir_fwd ? increment : -increment;
-				if (valid_loop && (region.loop_mode == LoopMode::Forward ||
-					region.loop_mode == LoopMode::Sustain) && cohort.pos >= region.loop_end)
-				{
-					const double length = region.loop_end - region.loop_start;
-					cohort.pos = region.loop_start + std::fmod(cohort.pos - region.loop_start, length);
-				}
-				else if (valid_loop && region.loop_mode == LoopMode::PingPong)
-				{
-					const double start = region.loop_start;
-					const double span = static_cast<double>(region.loop_end - 1) - start;
-					const double period = span * 2.0;
-					double phase = std::fmod(cohort.pos - start, period);
-					if (phase < 0.0) phase += period;
-					cohort.loop_dir_fwd = phase <= span;
-					cohort.pos = start + (cohort.loop_dir_fwd ? phase : period - phase);
-				}
-				else if (!valid_loop && cohort.pos >= region.pcm_len)
-				{
-					retire();
-					break;
-				}
 			}
 		}
+	}
+
+	template<bool Vectorize, bool SingleFrame = false>
+	bool render_voice(SynthEngine& owner, RenderCohort& cohort, float* out, uint32_t frames,
+		double increment, float amplitude) const noexcept
+	{
+		if constexpr (SingleFrame) frames = 1;
+		const SampleRegion& region = *cohort.region;
+		const bool looping = region.loop_mode == LoopMode::Forward ||
+			region.loop_mode == LoopMode::PingPong ||
+			(region.loop_mode == LoopMode::Sustain && cohort.stage != CohortStage::Release);
+		const bool valid_loop = looping && region.loop_start < region.loop_end &&
+			region.loop_end <= region.pcm_len && region.loop_end - region.loop_start >= 2;
+		const bool coherent_phase = cohort.phase.transformed_count == 0;
+		const double coherent_count = static_cast<double>(cohort.phase.coherent_count);
+		// Ping-pong playback, protected attacks, and loop/sample boundaries
+		// use the general kernel.
+#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+		VectorKernel vector_kernel = nullptr;
+		double vector_start = 0.0;
+		if constexpr (Vectorize)
+			vector_kernel = select_vector_kernel(cohort, vector_start, frames);
+#endif
+		for (uint32_t frame = 0; frame < frames; ++frame)
+		{
+#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+			if (vector_kernel && frames - frame >= 4 && cohort.pos >= vector_start)
+			{
+				frame += vector_kernel(owner, cohort, out + static_cast<size_t>(frame) * 2,
+					frames - frame, increment, valid_loop, amplitude);
+				if (frame == frames) break;
+			}
+#endif
+			if (cohort.pos < 0.0 || cohort.pos >= region.pcm_len)
+				return false;
+			const float envelope = advance_envelope(owner.sample_rate_, cohort);
+			if (cohort.stage == CohortStage::Off)
+				return false;
+
+			const uint32_t index0 = static_cast<uint32_t>(cohort.pos);
+			uint32_t index1 = (std::min)(index0 + 1, region.pcm_len - 1);
+			if (valid_loop && cohort.loop_dir_fwd && index1 >= region.loop_end)
+				index1 = region.loop_start;
+			const float fraction = static_cast<float>(cohort.pos - index0);
+			const size_t offset0 = region.pcm_right ? index0 :
+				static_cast<size_t>(index0) * region.channels;
+			const size_t offset1 = region.pcm_right ? index1 :
+				static_cast<size_t>(index1) * region.channels;
+			const float original_l0 = pcm_to_float(region.pcm[offset0]);
+			const float original_l1 = pcm_to_float(region.pcm[offset1]);
+			const float original_r0 = region.channels == 2 ? pcm_to_float(region.pcm_right ?
+				region.pcm_right[index0] : region.pcm[offset0 + 1]) : original_l0;
+			const float original_r1 = region.channels == 2 ? pcm_to_float(region.pcm_right ?
+				region.pcm_right[index1] : region.pcm[offset1 + 1]) : original_l1;
+			float filtered_l;
+			float filtered_r;
+			if (cohort.filter.active())
+			{
+				const auto filtered = cohort.phase.filtered_sample({original_l0, original_r0},
+					{original_l1, original_r1}, index0, index1, fraction, envelope, cohort.filter);
+				filtered_l = filtered[0];
+				filtered_r = filtered[1];
+			}
+			else
+			{
+				const float source_l0 = coherent_phase
+					? static_cast<float>(static_cast<double>(original_l0) * coherent_count)
+					: cohort.phase.sample(original_l0, index0, false);
+				const float source_l1 = coherent_phase
+					? static_cast<float>(static_cast<double>(original_l1) * coherent_count)
+					: cohort.phase.sample(original_l1, index1, false);
+				const float sample_l = source_l0 + (source_l1 - source_l0) * fraction;
+				float sample_r = sample_l;
+				if (region.channels == 2)
+				{
+					const float source_r0 = coherent_phase
+						? static_cast<float>(static_cast<double>(original_r0) * coherent_count)
+						: cohort.phase.sample(original_r0, index0, true);
+					const float source_r1 = coherent_phase
+						? static_cast<float>(static_cast<double>(original_r1) * coherent_count)
+						: cohort.phase.sample(original_r1, index1, true);
+					sample_r = source_r0 + (source_r1 - source_r0) * fraction;
+				}
+				filtered_l = sample_l * envelope;
+				filtered_r = sample_r * envelope;
+			}
+			cohort.filter.advance();
+			if (cohort.gain_ramp.active())
+			{
+				out[static_cast<size_t>(frame) * 2] += filtered_l * cohort.gain_ramp.current[0];
+				out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * cohort.gain_ramp.current[1];
+				cohort.gain_ramp.advance();
+			}
+			else
+			{
+				out[static_cast<size_t>(frame) * 2] += filtered_l * cohort.gain_l * amplitude;
+				out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * cohort.gain_r * amplitude;
+			}
+
+			cohort.pos += cohort.loop_dir_fwd ? increment : -increment;
+			if (valid_loop && (region.loop_mode == LoopMode::Forward ||
+				region.loop_mode == LoopMode::Sustain) && cohort.pos >= region.loop_end)
+			{
+				const double length = region.loop_end - region.loop_start;
+				cohort.pos = region.loop_start + std::fmod(cohort.pos - region.loop_start, length);
+			}
+			else if (valid_loop && region.loop_mode == LoopMode::PingPong)
+			{
+				const double start = region.loop_start;
+				const double span = static_cast<double>(region.loop_end - 1) - start;
+				const double period = span * 2.0;
+				double phase = std::fmod(cohort.pos - start, period);
+				if (phase < 0.0) phase += period;
+				cohort.loop_dir_fwd = phase <= span;
+				cohort.pos = start + (cohort.loop_dir_fwd ? phase : period - phase);
+			}
+			else if (!valid_loop && cohort.pos >= region.pcm_len)
+				return false;
+		}
+		return true;
 	}
 
 	bool render_parallel(SynthEngine& owner, float* out, uint32_t frames) noexcept
@@ -1976,7 +2066,6 @@ struct CohortEngineState
 		const uint64_t work = static_cast<uint64_t>(active_cohort_count) * frames;
 		if (work < ParallelRenderState::work_per_participant)
 			return false;
-		using Phase = ParallelRenderState::Phase;
 		auto& state = *parallel_render;
 		const size_t samples = static_cast<size_t>(frames) * 2;
 		const size_t slot_count = cohorts.size();
@@ -2001,29 +2090,11 @@ struct CohortEngineState
 		state.slot_count = slot_count;
 		state.chunk_count = chunk_count;
 		state.stride = stride;
-		state.next_chunk.store(0, std::memory_order_relaxed);
-		state.epoch += ParallelRenderState::epoch_step;
 		// Short event intervals wake only as many workers as they can keep busy.
 		const size_t participants = static_cast<size_t>((std::min)({
 			uint64_t{state.lanes()}, uint64_t{chunk_count},
 			(std::max)(uint64_t{2}, work / ParallelRenderState::work_per_participant)}));
-		for (size_t lane = 1; lane < participants; ++lane)
-		{
-			auto& signal = state.signals[lane].state;
-			signal.store(state.epoch + Phase::Requested, std::memory_order_release);
-			signal.notify_one();
-		}
-		render_chunks(state);
-		for (size_t lane = 1; lane < participants; ++lane)
-		{
-			auto& signal = state.signals[lane].state;
-			uint64_t observed = state.epoch + Phase::Requested;
-			if (signal.compare_exchange_strong(observed, state.epoch + Phase::Idle,
-				std::memory_order_acq_rel, std::memory_order_acquire))
-				continue;
-			while (observed != state.epoch + Phase::Done)
-				observed = wait_for_change(signal, observed);
-		}
+		run_workers(state, participants);
 
 		std::fill(out, out + samples, 0.0f);
 		for (size_t chunk = 0; chunk < chunk_count; ++chunk)
@@ -2043,7 +2114,8 @@ struct CohortEngineState
 
 	void render_audio(SynthEngine& owner, float* out, uint32_t frames) noexcept
 	{
-		onset_candidates.clear();
+		for (auto& candidates : onset_candidates) candidates.clear();
+		flush_stolen_voices(owner);
 		if (!render_parallel(owner, out, frames))
 		{
 			std::fill(out, out + static_cast<size_t>(frames) * 2, 0.0f);
@@ -2055,12 +2127,13 @@ struct CohortEngineState
 
 	void clear() noexcept
 	{
+		pending_fades.clear();
 		for (auto& fade : steal_fades)
 		{
 			std::fill(fade.audio.begin(), fade.audio.end(), 0.0f);
+			fade.first = 0;
 			fade.remaining = 0;
 		}
-		steal_cursor = 0;
 		cohorts.clear();
 		steal_info.clear();
 		free_cohorts.clear();
@@ -2072,7 +2145,7 @@ struct CohortEngineState
 		for (auto& stack : note_stacks)
 			stack.clear();
 		note_search_ends.fill(0);
-		onset_candidates.clear();
+		for (auto& candidates : onset_candidates) candidates.clear();
 		region_matches.clear();
 		active_logical = 0;
 		active_cohort_count = 0;
@@ -2112,14 +2185,17 @@ void CohortEngine::reserve_playback(SynthEngine& owner, uint32_t maximum_block_f
 	state.free_cohorts.reserve(capacity);
 	state.logical_batches.reserve(capacity);
 	state.free_logical_batches.reserve(capacity);
-	state.onset_candidates.reserve(capacity);
+	for (auto& candidates : state.onset_candidates)
+		candidates.reserve(capacity / state.onset_candidates.size());
 	state.matching_regions_scratch.reserve(region_count);
 	if (state.parallel_render)
 	{
 		auto& parallel = *state.parallel_render;
 		const size_t samples = static_cast<size_t>(maximum_block_frames) * 2;
 		const size_t chunk_count = parallel.chunks_for(capacity, samples);
-		parallel.audio.resize(chunk_count * CohortEngineState::ParallelRenderState::stride_for(samples));
+		const auto mixing_samples = chunk_count * CohortEngineState::ParallelRenderState::stride_for(samples);
+		if (parallel.audio.size() < mixing_samples)
+			parallel.audio.resize(mixing_samples);
 		parallel.retired.resize(capacity);
 		parallel.chunks.resize(chunk_count);
 	}
@@ -2200,18 +2276,14 @@ void CohortEngine::update_channel_releases(SynthEngine& owner, uint8_t channel) 
 
 void CohortEngine::invalidate_onset_merges(uint8_t channel) noexcept
 {
-	if (state_)
-		for (auto it = state_->onset_candidates.begin(); it != state_->onset_candidates.end();)
-			if (it->first.channel == channel)
-				it = state_->onset_candidates.erase(it);
-			else
-				++it;
+	if (state_ && channel < state_->onset_candidates.size())
+		state_->onset_candidates[channel].clear();
 }
 
 void CohortEngine::invalidate_all_onset_merges() noexcept
 {
 	if (state_)
-		state_->onset_candidates.clear();
+		for (auto& candidates : state_->onset_candidates) candidates.clear();
 }
 
 void CohortEngine::render_audio(SynthEngine& owner, float* out, uint32_t frames) noexcept
