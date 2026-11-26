@@ -1498,15 +1498,16 @@ struct CohortEngineState
 	{
 		const detail::ScopedNoDenormals no_denormals;
 		const size_t samples = static_cast<size_t>(state.frames) * 2;
-		for (;;)
+		// rendering_fades is constant for the entire block; branch once, not per chunk.
+		if (state.rendering_fades)
 		{
-			const size_t chunk = state.next_chunk.fetch_add(1, std::memory_order_relaxed);
-			if (chunk >= state.chunk_count)
-				return;
-			const uint32_t begin = static_cast<uint32_t>(state.chunk_begin(chunk));
-			const uint32_t end = static_cast<uint32_t>(state.chunk_begin(chunk + 1));
-			if (state.rendering_fades)
+			for (;;)
 			{
+				const size_t chunk = state.next_chunk.fetch_add(1, std::memory_order_relaxed);
+				if (chunk >= state.chunk_count)
+					return;
+				const uint32_t begin = static_cast<uint32_t>(state.chunk_begin(chunk));
+				const uint32_t end = static_cast<uint32_t>(state.chunk_begin(chunk + 1));
 				for (auto i = begin; i < end; ++i)
 				{
 					auto& voice = pending_fades[i];
@@ -1515,8 +1516,15 @@ struct CohortEngineState
 					render_voice<true>(*state.owner, voice.cohort, audio, state.frames,
 						voice.increment, voice.amplitude);
 				}
-				continue;
 			}
+		}
+		for (;;)
+		{
+			const size_t chunk = state.next_chunk.fetch_add(1, std::memory_order_relaxed);
+			if (chunk >= state.chunk_count)
+				return;
+			const uint32_t begin = static_cast<uint32_t>(state.chunk_begin(chunk));
+			const uint32_t end = static_cast<uint32_t>(state.chunk_begin(chunk + 1));
 			uint32_t first = begin;
 			while (first < end && !cohorts[first].occupied)
 				++first;
@@ -1868,7 +1876,7 @@ struct CohortEngineState
 
 	// start receives the first position at which the kernel can run (the end of
 	// a protected attack). Null means this cohort always uses the general kernel.
-	VectorKernel select_vector_kernel(const RenderCohort& cohort, double& start, uint32_t frames) const noexcept
+	VectorKernel select_vector_kernel(const RenderCohort& cohort, double& start, uint32_t frames) noexcept
 	{
 		const auto& region = *cohort.region;
 		if (!cohort.loop_dir_fwd || region.loop_mode == LoopMode::PingPong)
@@ -1920,27 +1928,152 @@ struct CohortEngineState
 	void render_range_impl(SynthEngine& owner, float* out, uint32_t frames,
 		uint32_t begin, uint32_t end, RetiredList* retired) noexcept
 	{
+		if constexpr (SingleFrame) frames = 1;
 		for (uint32_t cohort_index = begin; cohort_index < end; ++cohort_index)
 		{
 			auto& slot = cohorts[cohort_index];
 			if (!slot.occupied || !slot.cohort.region)
 				continue;
 			auto& cohort = slot.cohort;
+			const SampleRegion& region = *cohort.region;
 			const auto& channel = owner.channels_[cohort.channel];
-			if (!render_voice<Vectorize, SingleFrame>(owner, cohort, out, frames,
-				cohort.base_inc * channel.pitch_bend_ratio, owner.channel_amplitude(cohort.channel)))
+			const double increment = cohort.base_inc * channel.pitch_bend_ratio;
+			const float amplitude = channel.volume * channel.expression * owner.master_volume_;
+			const bool looping = region.loop_mode == LoopMode::Forward ||
+				region.loop_mode == LoopMode::PingPong ||
+				(region.loop_mode == LoopMode::Sustain && cohort.stage != CohortStage::Release);
+			const bool valid_loop = looping && region.loop_start < region.loop_end &&
+				region.loop_end <= region.pcm_len && region.loop_end - region.loop_start >= 2;
+			const bool coherent_phase = cohort.phase.transformed_count == 0;
+			const double coherent_count = static_cast<double>(cohort.phase.coherent_count);
+			// Ping-pong playback, protected attacks, and loop/sample boundaries
+			// use the general kernel.
+#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+			VectorKernel vector_kernel = nullptr;
+			double vector_start = 0.0;
+			if constexpr (Vectorize)
+				vector_kernel = select_vector_kernel(cohort, vector_start, frames);
+#endif
+			for (uint32_t frame = 0; frame < frames && slot.occupied; ++frame)
 			{
-				if (retired)
-					retired->push_back(cohort_index);
+#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+				if (vector_kernel && frames - frame >= 4 && cohort.pos >= vector_start)
+				{
+					frame += vector_kernel(owner, cohort, out + static_cast<size_t>(frame) * 2,
+						frames - frame, increment, valid_loop, amplitude);
+					if (frame == frames) break;
+				}
+#endif
+				if (cohort.pos < 0.0 || cohort.pos >= region.pcm_len)
+				{
+					if (retired)
+						retired->push_back(cohort_index);
+					else
+						retire_cohort(owner, cohort_index, true);
+					break;
+				}
+				const float envelope = advance_envelope(owner.sample_rate_, cohort);
+				if (cohort.stage == CohortStage::Off)
+				{
+					if (retired)
+						retired->push_back(cohort_index);
+					else
+						retire_cohort(owner, cohort_index, true);
+					break;
+				}
+
+				const uint32_t index0 = static_cast<uint32_t>(cohort.pos);
+				uint32_t index1 = (std::min)(index0 + 1, region.pcm_len - 1);
+				if (valid_loop && cohort.loop_dir_fwd && index1 >= region.loop_end)
+					index1 = region.loop_start;
+				const float fraction = static_cast<float>(cohort.pos - index0);
+				const size_t offset0 = region.pcm_right ? index0 :
+					static_cast<size_t>(index0) * region.channels;
+				const size_t offset1 = region.pcm_right ? index1 :
+					static_cast<size_t>(index1) * region.channels;
+				const float original_l0 = pcm_to_float(region.pcm[offset0]);
+				const float original_l1 = pcm_to_float(region.pcm[offset1]);
+				const float original_r0 = region.channels == 2 ? pcm_to_float(region.pcm_right ?
+					region.pcm_right[index0] : region.pcm[offset0 + 1]) : original_l0;
+				const float original_r1 = region.channels == 2 ? pcm_to_float(region.pcm_right ?
+					region.pcm_right[index1] : region.pcm[offset1 + 1]) : original_l1;
+				float filtered_l;
+				float filtered_r;
+				if (cohort.filter.active())
+				{
+					const auto filtered = cohort.phase.filtered_sample({original_l0, original_r0},
+						{original_l1, original_r1}, index0, index1, fraction, envelope, cohort.filter);
+					filtered_l = filtered[0];
+					filtered_r = filtered[1];
+				}
 				else
-					retire_cohort(owner, cohort_index, true);
+				{
+					const float source_l0 = coherent_phase
+						? static_cast<float>(static_cast<double>(original_l0) * coherent_count)
+						: cohort.phase.sample(original_l0, index0, false);
+					const float source_l1 = coherent_phase
+						? static_cast<float>(static_cast<double>(original_l1) * coherent_count)
+						: cohort.phase.sample(original_l1, index1, false);
+					const float sample_l = source_l0 + (source_l1 - source_l0) * fraction;
+					float sample_r = sample_l;
+					if (region.channels == 2)
+					{
+						const float source_r0 = coherent_phase
+							? static_cast<float>(static_cast<double>(original_r0) * coherent_count)
+							: cohort.phase.sample(original_r0, index0, true);
+						const float source_r1 = coherent_phase
+							? static_cast<float>(static_cast<double>(original_r1) * coherent_count)
+							: cohort.phase.sample(original_r1, index1, true);
+						sample_r = source_r0 + (source_r1 - source_r0) * fraction;
+					}
+					filtered_l = sample_l * envelope;
+					filtered_r = sample_r * envelope;
+				}
+				cohort.filter.advance();
+				if (cohort.gain_ramp.active())
+				{
+					out[static_cast<size_t>(frame) * 2] += filtered_l * cohort.gain_ramp.current[0];
+					out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * cohort.gain_ramp.current[1];
+					cohort.gain_ramp.advance();
+				}
+				else
+				{
+					out[static_cast<size_t>(frame) * 2] += filtered_l * cohort.gain_l * amplitude;
+					out[static_cast<size_t>(frame) * 2 + 1] += filtered_r * cohort.gain_r * amplitude;
+				}
+
+				cohort.pos += cohort.loop_dir_fwd ? increment : -increment;
+				if (valid_loop && (region.loop_mode == LoopMode::Forward ||
+					region.loop_mode == LoopMode::Sustain) && cohort.pos >= region.loop_end)
+				{
+					const double length = region.loop_end - region.loop_start;
+					cohort.pos = region.loop_start + std::fmod(cohort.pos - region.loop_start, length);
+				}
+				else if (valid_loop && region.loop_mode == LoopMode::PingPong)
+				{
+					const double start = region.loop_start;
+					const double span = static_cast<double>(region.loop_end - 1) - start;
+					const double period = span * 2.0;
+					double phase = std::fmod(cohort.pos - start, period);
+					if (phase < 0.0) phase += period;
+					cohort.loop_dir_fwd = phase <= span;
+					cohort.pos = start + (cohort.loop_dir_fwd ? phase : period - phase);
+				}
+				else if (!valid_loop && cohort.pos >= region.pcm_len)
+				{
+					if (retired)
+						retired->push_back(cohort_index);
+					else
+						retire_cohort(owner, cohort_index, true);
+					break;
+				}
 			}
 		}
 	}
 
 	template<bool Vectorize, bool SingleFrame = false>
 	bool render_voice(SynthEngine& owner, RenderCohort& cohort, float* out, uint32_t frames,
-		double increment, float amplitude) const noexcept
+		double increment, float amplitude) noexcept
 	{
 		if constexpr (SingleFrame) frames = 1;
 		const SampleRegion& region = *cohort.region;
